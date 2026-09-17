@@ -364,6 +364,21 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+:::note `recompute_ready` also respects the breaker (t_5fe84da5)
+The auto-promotion path (`recompute_ready` runs every dispatch tick when a
+parent finishes) gates `blocked → ready` transitions on `block_recurrences >=
+BLOCK_RECURRENCE_LIMIT` the same way `block_task` gates `running/ready →
+blocked`. In the steady state `block_task` itself routes trip-wires to
+`triage` (and `triage` is outside the `todo`/`blocked` set so this gate
+never fires), but a row can land in `blocked` with the counter at the limit
+via an operator SQL edit, a recovery script that flipped `status` without
+zeroing the counter, or a future migration. Without the gate those rows
+re-arm the structural loop — `block → unblock → block (trip) → recompute
+_ready → ready → worker → block → …`. The counter is preserved across
+recovery cycles, same as `consecutive_failures` (#35072). Below the limit
+the task recovers normally.
+:::
+
 ## Enabling tools for a chat profile
 
 The Desktop Kanban plugin displays the board; it does not grant the chat agent

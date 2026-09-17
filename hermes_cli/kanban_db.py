@@ -2090,7 +2090,24 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
     ``consecutive_failures`` reached the limit (else the breaker could never
-    trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
+    trip). The unblock-loop breaker counter (``block_recurrences`` at
+    :data:`BLOCK_RECURRENCE_LIMIT`) is also honored here: even though
+    ``block_task`` itself routes same-cause re-blocks past the limit to
+    ``triage`` (and ``triage`` is outside the ``todo``/``blocked`` set so
+    this function never sees the row in the steady state), a task can sit
+    in ``status='blocked'`` with ``block_recurrences`` at the limit via an
+    operator SQL edit (clearing ``hub_escalation`` while leaving the row
+    in ``blocked``), a recovery script that flipped ``status`` without
+    zeroing the counter, or a future migration. Promoting those rows would
+    re-arm the structural loop on t_08b0d2a5 / t_ff548cb7:
+
+        block → unblock → block (trip) → recompute_ready → ready
+        → worker → block → unblock → block (trip) → …
+
+    The fix mirrors the failure-limit guard: ``continue`` past the row
+    and leave the counter untouched so the breaker keeps accumulating
+    across recovery cycles, same as ``consecutive_failures`` (#35072).
+    Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
@@ -2101,7 +2118,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "block_recurrences "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -2110,6 +2128,20 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
+            # Unblock-loop breaker gate (t_5fe84da5): refuse to auto-promote
+            # a ``blocked`` row whose ``block_recurrences`` counter has
+            # already hit ``BLOCK_RECURRENCE_LIMIT``.  ``block_task`` would
+            # have routed the row to ``triage`` and set
+            # ``hub_escalation=1`` at the trip; this gate catches the
+            # cases where the row is still ``status='blocked'`` but the
+            # counter is at the limit (operator SQL edit, recovery script,
+            # manual unblock).  Counter is preserved so the breaker
+            # accumulates across recovery cycles, just like
+            # ``consecutive_failures`` (#35072).
+            if cur_status == "blocked":
+                block_recurrences = int(row["block_recurrences"] or 0)
+                if block_recurrences >= BLOCK_RECURRENCE_LIMIT:
+                    continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
