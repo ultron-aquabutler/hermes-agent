@@ -1109,3 +1109,103 @@ class TestTeamsMediaAttachments:
         adapter._app.send.assert_awaited_once()
 
 
+# ---------------------------------------------------------------------------
+# Tests: target parser / validator / messageid suffix stripping (t_af7445b9)
+# ---------------------------------------------------------------------------
+
+class TestTeamsTargetRef:
+    """``_strip_messageid_suffix`` lets callers pass either ``19:...@thread.tacv2`` or the
+    thread-qualified ``19:...@thread.tacv2;messageid=<n>`` form that ``ConversationReference``
+    round-trips produce. ``_parse_target_ref`` recognizes the three Bot Framework conversation
+    shapes; ``_validate_target_ref`` enforces charset + length and feeds the same suffix tolerance
+    back into the activity POST validator (see ``_standalone_send``).
+    """
+
+    @pytest.mark.parametrize("raw,expected", [
+        # None / empty
+        (None, ""),
+        ("", ""),
+        # Bare conversation ID — passes through unchanged
+        ("19:abc@thread.tacv2", "19:abc@thread.tacv2"),
+        ("a:encrypted-form", "a:encrypted-form"),
+        # ;messageid=… suffix stripped (the actual bug from t_af7445b9)
+        ("19:abc@thread.tacv2;messageid=1779727212632", "19:abc@thread.tacv2"),
+        ("19:abc@thread.skype;messageid=42", "19:abc@thread.skype"),
+        # Multiple semicolons — only the first split wins (defensive)
+        ("19:abc@thread.tacv2;messageid=42;foo=bar", "19:abc@thread.tacv2"),
+    ])
+    def test_strip_messageid_suffix(self, raw, expected):
+        assert _teams_mod._strip_messageid_suffix(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected_chat", [
+        # Standard full form
+        ("19:bUJwk98EdtqSqofDPftIxD9U_aQ7wemwsP7VKANf95k1@thread.tacv2",
+         "19:bUJwk98EdtqSqofDPftIxD9U_aQ7wemwsP7VKANf95k1@thread.tacv2"),
+        # ;messageid= suffix is stripped before validation (the original bug)
+        ("19:bUJwk98EdtqSqofDPftIxD9U_aQ7wemwsP7VKANf95k1@thread.tacv2;messageid=1779727212632",
+         "19:bUJwk98EdtqSqofDPftIxD9U_aQ7wemwsP7VKANf95k1@thread.tacv2"),
+        # /mecd and /skype variants
+        ("19:abc@thread.mecd", "19:abc@thread.mecd"),
+        ("19:abc@thread.skype", "19:abc@thread.skype"),
+        # Encrypted / proxied short form (decryption is server-side)
+        ("a:15thIOb_OzwaPulGIFIgaLLr-8W9hfTPcW5atzl3mQT", "a:15thIOb_OzwaPulGIFIgaLLr-8W9hfTPcW5atzl3mQT"),
+        # Bare 24+ char opaque ID (alternate exposed form)
+        ("IQE6JHYOOL980dNrjAVBOt-us", "IQE6JHYOOL980dNrjAVBOt-us"),
+    ])
+    def test_parse_target_ref_accepts_valid_shapes(self, raw, expected_chat):
+        parsed = _teams_mod._parse_target_ref(raw)
+        assert parsed == (expected_chat, None)
+
+    @pytest.mark.parametrize("raw", [
+        # Empty / whitespace
+        "",
+        "   ",
+        # Human alias — must NOT match (handled by channel-directory lookup)
+        "Bryan Wallace",
+        # Friendly name with colon — falls through
+        "Bryan Wallace:topic",
+        # Single colon outside a valid prefix (defensive)
+        "not:a:real:id",
+        # Too-short opaque id (must be >= 24 chars when bare)
+        "abc",
+        # Tab inside a valid shape → not a Teams id
+        "19:abc\t@thread.tacv2",
+    ])
+    def test_parse_target_ref_rejects_other_shapes(self, raw):
+        assert _teams_mod._parse_target_ref(raw) is None
+
+    @pytest.mark.parametrize("raw", [
+        # Valid bare 19:… ID
+        "19:bUJwk98EdtqSqofDPftIxD9U_aQ7wemwsP7VKANf95k1@thread.tacv2",
+        # ;messageid=… suffix tolerated
+        "19:bUJwk98EdtqSqofDPftIxD9U_aQ7wemwsP7VKANf95k1@thread.tacv2;messageid=1779727212632",
+        # Encrypted short form
+        "a:15thIOb_OzwaPulGIFIgaLLr-8W9hfTPcW5atzl3mQT_q4LOPHhlPuibtdh8gV2trSRDqEoRM2VtrEcxgZ5oWVyEY7HA-apQvp4Uw9uehyWNFrAE-nMyr6p4unB8iv5Z8",
+        # 24+ char opaque
+        "IQE6JHYOOL980dNrjAVBOt-us",
+    ])
+    def test_validate_target_ref_accepts_valid(self, raw):
+        assert _teams_mod._validate_target_ref(raw) is True
+
+    @pytest.mark.parametrize("raw,fragment", [
+        # Empty → False (boolean reject)
+        ("", "empty"),
+        # Bad characters in the chat id (outside the Bot Framework conversation ID set)
+        ("19:abc@thread.tacv2/../escape", "characters outside"),
+        # Too short
+        ("19:a", "too short"),
+        # Wrong prefix (not 19: / a: / 24+ char opaque)
+        ("x:not_a_valid_id_just_long_enough", "must start with"),
+        # Has a colon but doesn't match any prefix
+        ("123456789012345678901234:badprefix", "must start with"),
+    ])
+    def test_validate_target_ref_rejects_invalid(self, raw, fragment):
+        verdict = _teams_mod._validate_target_ref(raw)
+        assert verdict is not True
+        if isinstance(verdict, str):
+            assert fragment in verdict.lower(), f"expected {fragment!r} in {verdict!r}"
+        else:
+            # boolean False (e.g. empty input) — accept any rejection
+            assert verdict is False
+
+

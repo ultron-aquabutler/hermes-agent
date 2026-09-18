@@ -184,6 +184,58 @@ def _env_enablement() -> dict | None:
 
 
 
+def _strip_messageid_suffix(chat_id: str) -> str:
+    """Bot Framework activity POSTs sometimes carry ``;messageid=<n>`` after the conversation ID
+    (the suffix is the activity ID returned by a previous send). The actual conversation ID is the
+    prefix before ``;``. Stripping here lets callers pass either shape without first sanitizing.
+
+    Empty/None safe: returns ``""`` for falsy input so the existing charset check downstream catches it.
+    """
+    if not chat_id:
+        return ""
+    return chat_id.split(";", 1)[0]
+
+
+def _parse_target_ref(target_ref: str) -> Optional[tuple[str, Optional[str]]]:
+    """``send_message_tool`` parser hook — return ``(chat_id, thread_id)`` when ``target_ref``
+    looks like a Bot Framework conversation ID, else ``None`` so the channel-directory resolver
+    gets a turn (handles ``teams:Bryan Wallace`` -> channel-directory alias -> home channel).
+
+    The three shapes that match:
+      * ``19:<base64>@thread.tacv2`` (or ``/mecd`` / ``/skype``) — the standard full form.
+      * ``a:<base64>`` — encrypted/proxied short form (decryption happens server-side).
+      * bare 24+ char opaque string (an alternate exposed form, no prefix) — also accepted.
+
+    A trailing ``;messageid=<n>`` is stripped first. Returns ``None`` for everything else so the
+    generic resolution path (channel-directory then home-channel fallback) still applies."""
+    base = _strip_messageid_suffix(target_ref or "").strip()
+    if not base or not _TEAMS_CONV_ID_RE.match(base):
+        return None
+    # Plausible shapes only — channel-directory does NOT advertise human aliases inside the
+    # plugin, so anything that reaches the parser is expected to be a real ID.
+    if base.startswith(("19:", "a:")):
+        return (base, None)
+    if len(base) >= 24 and ":" not in base:
+        return (base, None)
+    return None
+
+
+def _validate_target_ref(chat_id: str) -> bool | str:
+    """``send_message_tool`` validator hook — ``True`` accept, ``False`` reject, ``str`` reject with
+    diagnostic. Mirrors ``_TEAMS_CONV_ID_RE`` (charset for SSRF/path safety) plus the shape
+    requirements of ``_parse_target_ref``. Same trailing-suffix tolerance as the standalone sender."""
+    base = _strip_messageid_suffix(chat_id or "")
+    if not base:
+        return False
+    if not _TEAMS_CONV_ID_RE.match(base):
+        return "Teams chat_id contains characters outside the Bot Framework conversation ID set"
+    if len(base) < 16:
+        return "Teams chat_id looks too short to be a real conversation ID"
+    if not (base.startswith(("19:", "a:")) or (len(base) >= 24 and ":" not in base)):
+        return "Teams chat_id must start with '19:' or 'a:', or be a 24+ char opaque ID"
+    return True
+
+
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *,
     thread_id: Optional[str] = None, media_files: Optional[list] = None, force_document: bool = False,
@@ -191,22 +243,27 @@ async def _standalone_send(
     """Acquire a Bot Framework bearer token and POST a single message activity; used by
     ``send_message_tool._send_via_adapter`` when the gateway runner is not in this process
     (``hermes cron``). ``TEAMS_SERVICE_URL`` is allowlisted and ``chat_id`` charset-checked
-    (SSRF/path traversal). ``media_files`` / ``force_document`` are signature parity only — text-only."""
+    (SSRF/path traversal). ``media_files`` / ``force_document`` are signature parity only — text-only.
+
+    ``chat_id`` is normalized via ``_strip_messageid_suffix`` so callers may pass either a bare
+    conversation ID (``19:...@thread.tacv2``) or a thread-qualified form (``...;messageid=<n>``)."""
     extra = getattr(pconfig, "extra", {}) or {}
     client_id, client_secret, tenant_id = _credentials(pconfig)
     if not (client_id and client_secret and tenant_id):
         return send_error("Teams standalone send: TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID are all required")
     raw_service_url = extra.get("service_url") or _get_scoped_secret("TEAMS_SERVICE_URL", "") or _DEFAULT_TEAMS_SERVICE_URL
     service_url = _validate_teams_service_url(raw_service_url)
+    normalized_chat_id = _strip_messageid_suffix(chat_id or "")
     for failed, error in (
         (service_url is None, f"TEAMS_SERVICE_URL host is not on the Bot Framework allowlist; "
                               f"expected one of {sorted(_ALLOWED_TEAMS_SERVICE_HOSTS)}"),
-        (not chat_id, "chat_id (conversation ID) is required"),
-        (not _TEAMS_CONV_ID_RE.match(chat_id or ""), "chat_id contains characters outside the Bot Framework conversation ID set"),
+        (not normalized_chat_id, "chat_id (conversation ID) is required"),
+        (not _TEAMS_CONV_ID_RE.match(normalized_chat_id), "chat_id contains characters outside the Bot Framework conversation ID set"),
         (not _TEAMS_CONV_ID_RE.match(tenant_id), "TEAMS_TENANT_ID contains characters outside the expected set"),
         (not AIOHTTP_AVAILABLE, "aiohttp not installed")):
         if failed:
             return send_error(f"Teams standalone send: {error}")
+    chat_id = normalized_chat_id
     token_url, token_form = _bf_token_request(tenant_id, client_id, client_secret)
     activities_url = f"{service_url}v3/conversations/{chat_id}/activities"
     try:
@@ -796,6 +853,11 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,  # env-only setups show up in gateway status
         cron_deliver_env_var="TEAMS_HOME_CHANNEL",  # deliver=teams cron home-channel routing
         standalone_sender_fn=_standalone_send,  # out-of-process cron delivery via Bot Framework REST
+        # Native target parser/validator so ``teams:<chat_id>`` resolves on a Teams-shaped ID
+        # instead of falling through to channel-directory lookup (``Bryan Wallace`` etc. — those
+        # still work, just via the directory path). See t_af7445b9 for the original report.
+        parse_target_ref_fn=_parse_target_ref,
+        validate_target_ref_fn=_validate_target_ref,
         allowed_users_env="TEAMS_ALLOWED_USERS", allow_all_env="TEAMS_ALLOW_ALL_USERS",
         max_message_length=28000,  # Teams supports up to ~28 KB per message
         emoji="💼", allow_update_command=True,

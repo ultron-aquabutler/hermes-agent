@@ -402,3 +402,68 @@ class TestChannelAliases:
                  if e["id"] == "120363@g.us"]
         assert names == ["general"]
 
+
+class TestPluginHomeChannelSeed:
+    """Plugin platforms (e.g. Teams) whose presence is env-driven still need a
+    directory entry so ``hermes send --list <plugin>`` and ``--to <plugin>:<alias>``
+    work before the gateway has enumerated any live channels. The seed only fires
+    when the directory list for that platform is empty AND the plugin's
+    ``env_enablement_fn`` returns a ``home_channel`` payload — ``t_af7445b9``."""
+
+    def _fake_entry(self, name, home_channel=None):
+        return SimpleNamespace(
+            name=name,
+            env_enablement_fn=lambda: ({"home_channel": home_channel} if home_channel else None),
+        )
+
+    def _stub_plugin_entries(self, *entries):
+        return patch("gateway.platform_registry.platform_registry.plugin_entries",
+                     lambda: list(entries))
+
+    def test_env_home_channel_seeds_directory(self, tmp_path):
+        """Teams env config (TEAMS_HOME_CHANNEL + TEAMS_HOME_CHANNEL_NAME) populates
+        the directory under the 'teams' key even when no live adapter is connected."""
+        cache_file = tmp_path / "channel_directory.json"
+        teams_entry = self._fake_entry(
+            "teams",
+            home_channel={"chat_id": "a:15thIOb_OzwaPulGIFIgaLLr-...", "name": "Vision DM"},
+        )
+        # No other plugin entries — keep the loop tight.
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._stub_plugin_entries(teams_entry):
+            directory = asyncio.run(build_channel_directory({}))
+        assert directory["platforms"]["teams"] == [
+            {"id": "a:15thIOb_OzwaPulGIFIgaLLr-...", "name": "Vision DM", "type": "dm"},
+        ]
+        # Round-trip through the on-disk file so we know the seed persists too.
+        on_disk = json.loads(cache_file.read_text())
+        assert on_disk["platforms"]["teams"] == directory["platforms"]["teams"]
+
+    def test_seed_idempotent_across_runs(self, tmp_path):
+        """The env-driven home channel gets baked into the directory on every rebuild;
+        reruns are idempotent (the seeded entry stays a single row, not appended duplicates).
+        """
+        cache_file = tmp_path / "channel_directory.json"
+        teams_entry = self._fake_entry(
+            "teams",
+            home_channel={"chat_id": "a:15thIOb_OzwaPulGIFIgaLLr-...", "name": "Vision DM"},
+        )
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._stub_plugin_entries(teams_entry):
+            for _ in range(2):
+                directory = asyncio.run(build_channel_directory({}))
+        # Two runs but exactly one row per run (the on-disk file shows the last run's state).
+        on_disk = json.loads(cache_file.read_text())
+        assert on_disk["platforms"]["teams"] == [
+            {"id": "a:15thIOb_OzwaPulGIFIgaLLr-...", "name": "Vision DM", "type": "dm"},
+        ]
+
+    def test_seed_skipped_when_env_enablement_returns_none(self, tmp_path):
+        """A plugin registered without env config must not gain a phantom entry."""
+        cache_file = tmp_path / "channel_directory.json"
+        teams_entry = self._fake_entry("teams", home_channel=None)
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._stub_plugin_entries(teams_entry):
+            directory = asyncio.run(build_channel_directory({}))
+        assert "teams" not in directory["platforms"]
+
