@@ -259,3 +259,9 @@ upgrade:
 - 2026-09-23 — Gates restored via surgical edits + 11 regression
   tests + this wiki page (`t_efc7769a`). Branch:
   `fix/kanban-human-gate-and-quarantine-restoration` (this commit).
+- 2026-09-23 — `t_9f3c5d4a` end-to-end dispatcher regression test added
+  (`tests/gateway/test_kanban_auto_decompose_quarantine_regression.py`):
+  3 tests prove `auto_decompose_tick` honors the gate end-to-end against
+  the live SQLite DB (skips `hub_escalation=1` rows, still processes fresh
+  triage, never invokes the auxiliary LLM on a quarantined card). Acceptance
+  criteria from the original card body verified live.
