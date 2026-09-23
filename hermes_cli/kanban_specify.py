@@ -199,6 +199,24 @@ def specify_task(
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
 
+    # Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a):
+    # refuse to specify (and thus to promote to todo -> ready) when the
+    # block-loop breaker tripped and set hub_escalation=1. Direct CLI
+    # invocations on a quarantined card are a footgun — same structural
+    # loop the breaker exists to break. Operators clear the flag by hand:
+    #   UPDATE tasks SET hub_escalation=0 WHERE id='<task-id>';
+    if getattr(task, "hub_escalation", False):
+        logger.warning(
+            "specify: refusing %s — quarantined (hub_escalation=1, "
+            "block_loop circuit breaker tripped). Clear the flag manually "
+            "before retrying.",
+            task_id,
+        )
+        return SpecifyOutcome(
+            task_id, False,
+            "quarantined (hub_escalation=1); clear flag manually to resume",
+        )
+
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(**_task_prompt_fields(task)),
@@ -234,7 +252,18 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Task ids in the triage column; ``tenant`` narrows the sweep.
+
+    Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a):
+    drop ``hub_escalation=1`` rows. Re-introducing them to the auto-specify
+    sweep re-creates the structural loop ``block_loop_detected -> triage
+    -> auto-specify -> ready -> worker re-blocks -> repeat every ~10s``.
+    Operators un-quarantine by hand:
+      UPDATE tasks SET hub_escalation=0 WHERE id='<task-id>';
+    """
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+    return [
+        t.id for t in tasks
+        if not getattr(t, "hub_escalation", False)
+    ]

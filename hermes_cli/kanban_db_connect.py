@@ -837,6 +837,11 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Per-task hub-escalation flag (t_8b48a01f, restored 2026-09-23 by t_efc7769a).
+    # When 1, the auto-decomposer / auto-specify paths refuse to promote the
+    # card (quarantine) so the structural loop cannot re-arm. See
+    # ``hermes_cli.kanban_db.SCHEMA_SQL`` for the canonical column comment.
+    ("hub_escalation", "hub_escalation INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

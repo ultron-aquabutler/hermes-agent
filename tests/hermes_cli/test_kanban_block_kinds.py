@@ -80,6 +80,79 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a)
+# ---------------------------------------------------------------------------
+#
+# When ``block_task`` trips BLOCK_RECURRENCE_LIMIT the row is quarantined:
+# status -> triage AND hub_escalation -> 1 in the same write txn. The
+# auto-decomposer / auto-specify paths then refuse to act on the card,
+# breaking the ``block_loop_detected -> triage -> auto-specify -> ready
+# -> worker blocks-again`` structural loop.
+# ---------------------------------------------------------------------------
+
+
+def test_block_loop_quarantine_sets_hub_escalation(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.hub_escalation is True
+    assert task.block_recurrences >= 2
+
+
+def test_block_loop_quarantine_event_payload_includes_quarantine_flags(
+    kanban_home: Path,
+) -> None:
+    """Payload fields ``quarantined`` + ``hub_escalation_set`` surface
+    the new quarantine in any dashboard / metric filtering on them."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        events = [e for e in kb.list_events(conn, tid)
+                  if e.kind == "block_loop_detected"]
+    assert events
+    payload = events[-1].payload or {}
+    assert payload.get("quarantined") is True
+    assert payload.get("hub_escalation_set") is True
+
+
+def test_block_loop_quarantine_blocks_third_re_block(kanban_home: Path) -> None:
+    """A third re-block must NOT clear hub_escalation — quarantine is
+    persistent across manual unblock cycles, not one-shot."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        # Initial block -> unblock -> re-block trips the breaker.
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.hub_escalation is True
+
+        # Operator manually unblocks (triage -> ???) and re-runs. Even if
+        # block_recurrences stays at limit, the flag must persist so the
+        # auto-decomposer keeps refusing the card.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', hub_escalation=1 WHERE id=?",
+                (tid,),
+            )
+        kb.claim_task(conn, tid, claimer="worker")
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        task = kb.get_task(conn, tid)
+    assert task.hub_escalation is True
+
+
+# ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
 

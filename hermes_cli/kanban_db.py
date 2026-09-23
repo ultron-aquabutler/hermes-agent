@@ -727,6 +727,12 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Quarantine flag (t_8b48a01f, restored 2026-09-23 by t_efc7769a). When True,
+    # the auto-decomposer / auto-specify paths refuse to promote the card so the
+    # structural loop ``block_loop_detected -> triage -> auto-specify -> ready ->
+    # worker blocks-again`` cannot re-arm every ~10s. Set by block_task when
+    # recurrences >= BLOCK_RECURRENCE_LIMIT.
+    hub_escalation: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -744,6 +750,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            hub_escalation=bool(g("hub_escalation")),
         )
 
 
@@ -960,7 +967,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Per-task hub-escalation flag (locked 2026-08-28, t_8b48a01f, restored
+    -- 2026-09-23 by t_efc7769a). When 1, the relay routes block mentions to
+    -- the hub AND the auto-decomposer / auto-specify paths refuse to promote
+    -- the card. Set to 1 by ``block_task`` when recurrences >=
+    -- BLOCK_RECURRENCE_LIMIT — quarantines block-loop cards instead of
+    -- letting them spin in a structural loop (``block_loop_detected ->
+    -- triage -> auto-specify -> ready -> worker blocks-again`` every ~10s).
+    -- Operators clear the flag by hand once they decide:
+    --   UPDATE tasks SET hub_escalation=0 WHERE id='<task-id>';
+    hub_escalation       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3168,6 +3185,22 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        # Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a):
+        # when the unblock-loop breaker trips and the task is routed to
+        # ``triage``, also flip ``hub_escalation=1`` so the auto-decomposer /
+        # auto-specify paths refuse to re-promote this card. Without this,
+        # the ``block_loop_detected -> triage -> auto-specify -> ready ->
+        # worker blocks-again`` structural loop fires every ~10s until the
+        # worker budget is exhausted (verified live on t_08b0d2a5 /
+        # t_ff548cb7). Operators clear the flag by hand once they decide:
+        #   UPDATE tasks SET hub_escalation=0 WHERE id='<task-id>';
+        payload["quarantined"] = True
+        payload["hub_escalation_set"] = True
+        set_sql = (
+            "block_kind    = ?,\n"
+            "                       block_recurrences = ?,\n"
+            "                       hub_escalation    = 1"
+        )
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 

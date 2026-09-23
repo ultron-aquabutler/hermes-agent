@@ -121,6 +121,81 @@ class DecomposeOutcome:
     new_title: Optional[str] = None
 
 
+# Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a): if
+# ``block_task`` set ``hub_escalation=1`` because the unblock-loop breaker
+# tripped, refuse to act on this task from either the CLI or the auto-
+# decomposer. Direct CLI invocations of ``hermes kanban decompose`` /
+# ``hermes kanban specify`` on a quarantined card are an operator footgun —
+# they re-arm the structural loop the breaker was designed to break.
+#
+# Eligibility filter for the auto-decomposer (t_334f608b, restored 2026-09-23
+# by t_efc7769a): skip tasks that are explicitly human-gated. Decomposing a
+# "Bryan hand only" card does not produce agent-executable children — it
+# produces one blocked card plus N children that block identically,
+# regenerating the same wall each cycle.
+#
+# Both gates run BEFORE the auxiliary LLM call (verified by
+# test_decompose_quarantined_card_does_not_call_aux) so a single bad
+# retry never burns a turn of context-budget.
+def _human_gate_match(
+    task: kb.Task,
+    comments: list | None = None,
+) -> tuple[bool, str]:
+    """``(matched, pattern)`` — True when *task* is human-gated and must be
+    skipped by the decomposer/specifier. ``comments`` is the task's comment
+    thread (passed in so we don't double-open the conn); when omitted,
+    pattern 5 (status + vision_flag comment) cannot be evaluated.
+    """
+    if getattr(task, "hub_escalation", False):
+        # Quarantine beat the human-gate title/body check: a quarantine is a
+        # stronger block (loop-detected) than a title-prefix signal.
+        return True, "quarantine:hub_escalation=1"
+    title = (task.title or "").strip()
+    body = task.body or ""
+    lower_title = title.lower()
+    # 1: title begins with literal "Bryan:" (case-insensitive prefix)
+    if lower_title.startswith("bryan:"):
+        return True, "title_prefix:Bryan:"
+    # 2: title begins with literal "BRYAN HAND" (case-sensitive)
+    if title.startswith("BRYAN HAND"):
+        return True, "title_prefix:BRYAN HAND"
+    # 3: body contains the literal phrase "BRYAN HAND ONLY"
+    if "BRYAN HAND ONLY" in body:
+        return True, "body_marker:BRYAN HAND ONLY"
+    # 4: body contains "Bryan hand only" (case-insensitive)
+    if "bryan hand only" in body.lower():
+        return True, "body_marker:Bryan hand only"
+    # 5: status in {blocked, triage, archived} AND a "default"-authored
+    # comment carries the literal phrase "human-gated by design"
+    if task.status in {"blocked", "triage", "archived"} and comments:
+        for c in comments:
+            if c.author == "default" and "human-gated by design" in (c.body or ""):
+                return True, "vision_flag:human-gated by design"
+    return False, ""
+
+
+def _record_decomposer_skip(task_id: str, reason: str, **extra: object) -> None:
+    """Best-effort append of a ``decomposer_skipped`` audit event.
+
+    Silent refusal is a footgun (operators can't tell why a card didn't
+    move); this writes to ``task_events`` so the skip shows up in any
+    ``task_events`` view. Failure is logged at DEBUG and swallowed.
+    """
+    try:
+        with kbc.connect_closing() as conn, kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "decomposer_skipped",
+                {"reason": reason, **extra},
+            )
+    except Exception as exc:
+        logger.debug(
+            "decompose: failed to record decomposer_skipped event on %s: %s",
+            task_id, exc,
+        )
+
+
 def _profile_author() -> str:
     """Mirror of ``hermes_cli.kanban._profile_author``."""
     return _specify_author("decomposer")
@@ -305,6 +380,49 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
+    # Eligibility gates (locked 2026-08-28, t_8b48a01f / t_334f608b;
+    # restored 2026-09-23 by t_efc7769a). Both run BEFORE the auxiliary LLM
+    # call so a bad retry never burns a turn of context. Comments are loaded
+    # here so pattern 5 of the human-gate filter has the data it needs.
+    try:
+        with kbc.connect_closing() as conn:
+            comments = kb.list_comments(conn, task_id)
+    except Exception:
+        comments = []
+    matched, pattern = _human_gate_match(task, comments=comments)
+    if matched:
+        # Quarantine is a stronger skip than a title-marker (loop-detected
+        # by the breaker, not just human-flagged). They share the same
+        # skip-shape; the audit reason distinguishes them.
+        reason = "quarantined" if pattern == "quarantine:hub_escalation=1" else "human_gate"
+        if reason == "quarantined":
+            logger.warning(
+                "decompose: refusing %s — quarantined (hub_escalation=1, "
+                "block_loop circuit breaker tripped). Clear with "
+                "`UPDATE tasks SET hub_escalation=0 WHERE id='%s';` "
+                "after the operator decides.",
+                task_id, task_id,
+            )
+            _record_decomposer_skip(
+                task_id, reason,
+                hub_escalation=1, caller="decompose_task",
+            )
+            return DecomposeOutcome(
+                task_id, False,
+                "quarantined (hub_escalation=1); clear flag manually to resume",
+            )
+        # Plain human-gate skip (title prefix / body marker / vision flag).
+        logger.info(
+            "decompose: skipping %s — human-gated (%s)", task_id, pattern,
+        )
+        _record_decomposer_skip(
+            task_id, reason, matched_pattern=pattern,
+        )
+        return DecomposeOutcome(
+            task_id, False,
+            f"human-gated by design ({pattern}); skipping decomposition",
+        )
+
     routing = _load_routing()
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
@@ -329,10 +447,25 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a):
+    drop ``hub_escalation=1`` rows. Re-introducing them to the
+    auto-decompose sweep re-creates the structural loop
+    ``block_loop_detected -> triage -> auto-specify -> ready -> worker
+    re-blocks -> repeat every ~10s``. Operators un-quarantine by hand:
+      UPDATE tasks SET hub_escalation=0 WHERE id='<task-id>';
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+    # SQLite stores booleans as 0/1; the Task dataclass coerces to bool in
+    # from_row, so ``hub_escalation=True`` on a quarantined card. The
+    # ``getattr`` default protects against older DBs / future renames that
+    # don't yet expose the column.
+    return [
+        row.id for row in rows
+        if not getattr(row, "hub_escalation", False)
+    ]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -139,3 +139,30 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+# ---------------------------------------------------------------------------
+# Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a)
+# ---------------------------------------------------------------------------
+
+
+def test_specify_quarantined_card_refused(kanban_home):
+    """specify_task refuses a hub_escalation=1 triage card; aux is never called."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="loop-breaker-touched", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET hub_escalation=1, block_recurrences=2, "
+                "block_kind='capability' WHERE id=?",
+                (tid,),
+            )
+
+    sentinel = MagicMock(side_effect=AssertionError(
+        "aux LLM should not be called on a quarantined card"
+    ))
+    with patch("agent.auxiliary_client.call_llm", sentinel):
+        outcome = spec.specify_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "quarantined" in outcome.reason.lower()
+    sentinel.assert_not_called()
+
+

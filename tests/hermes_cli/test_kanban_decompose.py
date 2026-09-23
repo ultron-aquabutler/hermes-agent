@@ -175,3 +175,160 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+# ---------------------------------------------------------------------------
+# Quarantine gate (t_8b48a01f, restored 2026-09-23 by t_efc7769a)
+# ---------------------------------------------------------------------------
+#
+# When block_task trips BLOCK_RECURRENCE_LIMIT the row is quarantined
+# (``status=triage, hub_escalation=1``). The auto-decomposer sweep must
+# refuse to act on it so the structural loop cannot re-arm. These tests
+# pin the core invariants:
+#   - decompose_task returns ok=False with a quarantined-card reason
+#   - the auxiliary LLM is NEVER invoked on a quarantined card
+#   - a decomposer_skipped audit event lands
+#   - list_triage_ids() filters quarantined rows out of the auto-sweep
+# ---------------------------------------------------------------------------
+
+
+def _set_quarantine(conn, tid: str) -> None:
+    """Mark a triage row as quarantined (hub_escalation=1) as block_task would."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET hub_escalation=1, block_recurrences=2, "
+            "block_kind='capability' WHERE id=?",
+            (tid,),
+        )
+
+
+def test_decompose_quarantined_card_does_not_call_aux(kanban_home):
+    """Quarantine short-circuits BEFORE the auxiliary LLM call."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="loop-breaker-touched", triage=True)
+        _set_quarantine(conn, tid)
+
+    sentinel = MagicMock(name="aux-sentinel", side_effect=AssertionError(
+        "auxiliary LLM was invoked on a quarantined card"
+    ))
+    with patch("hermes_cli.kanban_specify._call_aux", sentinel), \
+         patch("hermes_cli.kanban_db._append_event", MagicMock()):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "quarantined" in outcome.reason.lower()
+    assert "hub_escalation" in outcome.reason
+    sentinel.assert_not_called()
+
+
+def test_decompose_quarantined_card_records_skip_audit_event(kanban_home):
+    """A silent refusal would be a footgun — prove the audit event lands."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="loop-breaker-touched", triage=True)
+        _set_quarantine(conn, tid)
+
+    with patch("hermes_cli.kanban_specify._call_aux", MagicMock()):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    with kbc.connect() as conn:
+        events = list(kb.list_events(conn, tid))
+    skip_events = [e for e in events if (e.payload or {}).get("reason") == "quarantined"]
+    assert skip_events, "expected a decomposer_skipped reason=quarantined event"
+    payload = skip_events[-1].payload
+    assert payload.get("hub_escalation") == 1
+    assert payload.get("caller") == "decompose_task"
+
+
+def test_list_triage_ids_excludes_quarantined_cards(kanban_home):
+    """Quarantined rows must NOT appear in the auto-decompose sweep."""
+    with kbc.connect() as conn:
+        keep = kb.create_task(conn, title="doomed", triage=True)
+        quarantined = kb.create_task(conn, title="loop-breaker-touched", triage=True)
+        _set_quarantine(conn, quarantined)
+
+    ids = decomp.list_triage_ids()
+    assert keep in ids
+    assert quarantined not in ids
+
+
+# ---------------------------------------------------------------------------
+# Human-gate eligibility filter (t_334f608b, restored 2026-09-23 by t_efc7769a)
+# ---------------------------------------------------------------------------
+
+
+def test_decompose_human_gate_title_prefix_bryan_colon(kanban_home):
+    """Title prefix 'Bryan:' (case-insensitive) blocks decomposition."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="bryan: ship feature X",
+            body="please route this to Bryan",
+            triage=True,
+        )
+
+    sentinel = MagicMock(side_effect=AssertionError("aux LLM should not be called"))
+    with patch("hermes_cli.kanban_specify._call_aux", sentinel):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "human-gated" in outcome.reason.lower()
+    assert "bryan:" in outcome.reason.lower()
+    sentinel.assert_not_called()
+
+
+def test_decompose_human_gate_title_prefix_bryan_hand(kanban_home):
+    """Title prefix 'BRYAN HAND' (case-sensitive) blocks decomposition."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="BRYAN HAND — verify Pi-hole DNS sync", triage=True,
+        )
+
+    sentinel = MagicMock(side_effect=AssertionError("aux LLM should not be called"))
+    with patch("hermes_cli.kanban_specify._call_aux", sentinel):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "human-gated" in outcome.reason.lower()
+
+
+def test_decompose_human_gate_body_marker(kanban_home):
+    """Body marker 'BRYAN HAND ONLY' (literal) blocks decomposition."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ship feature X",
+            body="This is BRYAN HAND ONLY — do not decompose.",
+            triage=True,
+        )
+
+    sentinel = MagicMock(side_effect=AssertionError("aux LLM should not be called"))
+    with patch("hermes_cli.kanban_specify._call_aux", sentinel):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "human-gated" in outcome.reason.lower()
+
+
+def test_decompose_negative_control_no_match_decomposes_normally(kanban_home):
+    """A normal triage card with no human-gate signals still proceeds."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Investigate stuck worker pool",
+            body="Workers are stuck; investigate why.",
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False, "title": "Investigate", "body": "Look at the pool.",
+    })
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert "human-gated" not in outcome.reason.lower()
+
+
