@@ -837,6 +837,17 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Respawn-guard event dedupe: ``last_guard_reason`` is the most recent reason
+    # code (``blocker_auth`` / ``quota_cooldown`` / ``rate_limit_cooldown`` /
+    # ``recent_success`` / ``active_pr``) that ``_dispatch_lane_task`` emitted
+    # a ``respawn_guarded`` event for; ``last_guard_fired_at`` records when.
+    # The dispatcher writes only when the reason CHANGES from the persisted
+    # value, so a card parked on ``blocker_auth`` produces one event per
+    # reason-epoch instead of one per dispatch tick (~36/min). Both columns
+    # are reset to NULL when the guard releases or the task reaches a
+    # terminal status, so the next guard transition fires fresh.
+    ("last_guard_reason", "last_guard_reason TEXT"),
+    ("last_guard_fired_at", "last_guard_fired_at INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
