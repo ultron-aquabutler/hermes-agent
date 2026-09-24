@@ -3,12 +3,21 @@
 > Wiki page for t_8b48a01f (2026-08-28) + t_efc7769a (2026-09-23
 > restoration after the branch-drift regression).
 >
-> **Status:** restored on branch
-> `fix/kanban-human-gate-and-quarantine-restoration` (off the deployed
-> branch `fix/kanban-recompute-ready-blocker-gate @ d437932a74`).
-> Acceptance criteria pass on the deployed head: 73 passed, 1 skipped
-> across `test_kanban_db*` / `test_kanban_decompose` /
-> `test_kanban_specify` / `test_kanban_block_kinds`.
+> **Status (2026-09-24):** merged into the canonical deploy branch
+> `canonical-deploy-t_7161d9a9` @ `4f914e1d23` (alongside t_cfbbb112's
+> quota-cooldown split and the deploy-branch guard itself). The fix
+> lineage — commits `4a18baa139` (t_efc7769a) and `6067b5a712`
+> (t_9f3c5d4a) — is preserved in the merged history.
+> Acceptance criteria pass on the deployed head: 146 passed, 1 skipped
+> across `test_kanban_db*` / `test_kanban_decompose*` /
+> `test_kanban_specify*` / `test_kanban_block_kinds` /
+> `test_kanban_auto_decompose_quarantine_regression` /
+> `test_interrupt_scaffold_echo` / `test_deploy_guard`.
+>
+> Historical note: the original restoration (t_efc7769a) was checked
+> out of the deployed tree on 2026-09-23 17:36Z — see
+> [Canonical Deploy Branch](canonical-deploy-branch.md) for the
+> structural fix that prevents this class of regression.
 >
 > **Doc-in-commit gap:** the Obsidian vault write path on this host has
 > been returning 201 but not persisting since 2026-09-18 (LXC in-process
