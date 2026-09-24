@@ -95,9 +95,14 @@ Three pieces, all in the canonical-deploy branch:
 
    - Supplementary groups are lost inside the user namespace; local
      group-gated sockets (`/var/snap/lxd/common/lxd/unix.socket`,
-     group `lxd`) are unreachable from a sandboxed worker. Remote
-     access is unaffected (docker on this host is already an ssh
-     context).
+     group `lxd`) keep working, but the kernel maps the worker's
+     in-namespace uid 0 back to the host's `serveradmin` via
+     `SO_PEERCRED`, so lxd sees the worker as fully-trusted
+     `serveradmin` (MORE trust than expected, not less). Mitigation
+     if a flow needs lxd-as-another-user: map the gid via
+     `newgidmap`/subgid, or run that one op outside the sandbox.
+     Remote access is unaffected (docker on this host is already an
+     ssh context).
    - `git fetch`/`pull` inside the worker's own worktree fails —
      `FETCH_HEAD` lives in the ro main `.git`. The dispatcher must
      provision the worktree before the sandbox exists; `hermes -w`
@@ -253,14 +258,20 @@ on dev machines that don't ship the agent tree; investigate before
 disabling on a production host. Set `HERMES_WORKER_ISOLATION=off`
 only as a temporary kill switch, never as the steady state.
 
-### Symptom: worker reports `Operation not permitted` on `/var/snap/lxd/...`
+### Note: lxd unix.socket is NOT sandboxed
 
-Inside the sandbox, supplementary groups are lost (`ogroups=` →
-`nogroup` in the new namespace). Local group-gated sockets
-(`/var/snap/lxd/common/lxd/unix.socket`, group `lxd`) are unreachable
-from a sandboxed worker. Remote access (ssh, docker) is unaffected.
-Map the gid via `newgidmap`/subgid, or run that one op outside the
-sandbox by setting `HERMES_WORKER_ISOLATION=off` for the task.
+The lxd unix socket (`/var/snap/lxd/common/lxd/unix.socket`, group `lxd`)
+**keeps working** inside the sandbox. Even though supplementary groups
+are lost (`ogroups=` → `nogroup` in the new namespace), the kernel
+maps the worker's in-namespace uid 0 back to the host's `serveradmin`
+via `SO_PEERCRED`, so lxd's trust check returns fully-trusted
+`serveradmin`. A worker running under `unshare -Urm` therefore has
+MORE lxd trust than a normal host shell would have as a non-root user
+— the opposite of what a casual reading of "groups lost" suggests.
+This is not currently a live flow (no worker uses lxd today), but if
+a future flow needs to invoke lxd as a *lesser* identity, it must
+either map the gid via `newgidmap`/subgid, or run that one op outside
+the sandbox by setting `HERMES_WORKER_ISOLATION=off` for the task.
 
 ## Dependencies
 
