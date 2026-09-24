@@ -161,6 +161,22 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             await _discover(entry.name)
+            # Seed the env-configured home channel so ``hermes send --list <plugin>`` and
+            # ``hermes send --to <plugin>:<friendly name>`` resolve even when no live adapter
+            # has enumerated chats yet. Without this, plugins like Teams (purely env-driven)
+            # appear as "(no channels discovered yet)" forever in --list and human-alias sends
+            # error with "Could not resolve". Discovery via live adapter still wins when it
+            # populates entries — we only seed when the directory list is empty.
+            try:
+                if entry.name not in platforms or not platforms.get(entry.name):
+                    seed = entry.env_enablement_fn() if entry.env_enablement_fn else None
+                    home = (seed or {}).get("home_channel")
+                    if home and home.get("chat_id"):
+                        platforms.setdefault(entry.name, []).append({
+                            "id": home["chat_id"], "name": home.get("name", "Home"), "type": "dm",
+                        })
+            except Exception:
+                logger.debug("Channel directory: home-channel seed failed for %s", entry.name, exc_info=True)
     _apply_channel_aliases(platforms)
     directory = {"updated_at": datetime.now().isoformat(), "platforms": platforms}
     try:

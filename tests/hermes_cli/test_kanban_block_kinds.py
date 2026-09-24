@@ -102,6 +102,97 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# recompute_ready honors the unblock-loop breaker (t_5fe84da5)
+# ---------------------------------------------------------------------------
+
+
+def test_recompute_ready_does_not_promote_blocked_at_recurrence_limit(
+    kanban_home: Path,
+) -> None:
+    """Regression for t_5fe84da5 — ``recompute_ready`` must honour the
+    unblock-loop breaker's counter.
+
+    Before the fix, a task in ``status='blocked'`` with
+    ``block_recurrences >= BLOCK_RECURRENCE_LIMIT`` was still auto-promoted
+    to ``ready`` by ``recompute_ready`` once its parents completed.  In
+    the steady state ``block_task`` itself routes such rows to ``triage``
+    and sets ``hub_escalation=1``, so ``recompute_ready`` never sees them
+    through normal flow.  But a row can land in ``blocked`` with the
+    counter at the limit via an operator SQL edit (clearing
+    ``hub_escalation`` while leaving the row in ``blocked``), a recovery
+    script that flipped status without zeroing the counter, or a future
+    migration.  Without this gate those rows re-arm the structural loop:
+
+        block → unblock → block (trip) → recompute_ready → ready
+        → worker → block → unblock → block (trip) → …
+
+    The promotion path must refuse regardless of *how* the row ended up
+    here.
+    """
+    with kbc.connect_closing() as conn:
+        child = kb.create_task(conn, title="loop-victim", assignee="worker")
+        # Stand up a parent and complete it so the child gate is open.
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        assert kb.claim_task(conn, parent, claimer="worker") is not None
+        kb.complete_task(conn, parent, result="done")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Force the offending state directly.  The block_recurrences
+        # counter is what block_task would have written on the trip wire.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_recurrences=?, "
+                "block_kind='needs_input' WHERE id=?",
+                (kb.BLOCK_RECURRENCE_LIMIT, child),
+            )
+        promoted = kb.recompute_ready(conn)
+        task_after = kb.get_task(conn, child)
+    assert promoted == 0, (
+        "recompute_ready must not auto-promote a task past the unblock-loop "
+        f"breaker; got promoted={promoted}, task={task_after}"
+    )
+    assert task_after is not None
+    assert task_after.status == "blocked", (
+        f"task at the breaker limit must remain blocked; got {task_after.status!r}"
+    )
+    # And the counter must be preserved — the breaker accumulates across
+    # recovery cycles, just like consecutive_failures (#35072).
+    assert task_after.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+
+
+def test_recompute_ready_below_recurrence_limit_still_recovers(
+    kanban_home: Path,
+) -> None:
+    """Counter one below the limit must NOT be a permanent sticky block.
+
+    A legitimate unblock → re-block path that has not tripped the breaker
+    yet (counter < LIMIT) must still recover when parents finish.  The
+    new gate is per-counter, not a permanent ban.
+    """
+    with kbc.connect_closing() as conn:
+        child = kb.create_task(conn, title="recoverer", assignee="worker")
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        assert kb.claim_task(conn, parent, claimer="worker") is not None
+        kb.complete_task(conn, parent, result="done")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_recurrences=?, "
+                "block_kind='needs_input' WHERE id=?",
+                (kb.BLOCK_RECURRENCE_LIMIT - 1, child),
+            )
+        promoted = kb.recompute_ready(conn)
+        task_after = kb.get_task(conn, child)
+    assert promoted == 1
+    assert task_after is not None
+    assert task_after.status == "ready"
+    assert task_after.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT - 1
+
+
+# ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
 
