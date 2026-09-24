@@ -6,12 +6,25 @@
 > Pin the deployed tree to one canonical branch. All fixes merge there
 > before deploy. Workers use separate worktrees.
 >
-> Status: shipped on branch `canonical-deploy-t_7161d9a9` @ `4f914e1d23`.
-> Acceptance pass at the time of writing: 146 passed, 1 skipped across
-> `test_deploy_guard` + `test_kanban_db*` + `test_kanban_decompose*` +
-> `test_kanban_specify*` + `test_kanban_block_kinds` +
-> `test_kanban_auto_decompose_quarantine_regression` +
-> `test_interrupt_scaffold_echo`.
+| Status: shipped on branch `canonical-deploy-t_7161d9a9` @ `4f914e1d23`.
+|> Acceptance pass at the time of writing: 146 passed, 1 skipped across
+|> `test_deploy_guard` + `test_kanban_db*` + `test_kanban_decompose*` +
+|> `test_kanban_specify*` + `test_kanban_block_kinds` +
+|> `test_kanban_auto_decompose_quarantine_regression` +
+|> `test_interrupt_scaffold_echo`.
+|>
+|> **Layer 2 enforcement (t_ff7d30cc):** the convention above is now
+|> mechanically enforced — every kanban-spawned worker is launched inside an
+|> unprivileged user+mount namespace in which the production tree is
+|> read-only at the syscall level (EROFS). The launcher (`hermes_cli.worker_isolate`)
+|> is applied by the dispatcher to the worker argv with the proven nesting
+|> `systemd-run --user --scope` → `unshare -Urm` → launcher → worker. Config
+|> gate: `kanban.worker_isolation` = `off|warn|enforce`, default `enforce`
+|> on Linux+userns; env kill switch `HERMES_WORKER_ISOLATION=off` for
+|> emergencies. See the `Worker isolation` section below for the full carve-out
+|> set and the caveats that ship with the sandbox (lost supplementary groups;
+|> no `git fetch`/`pull` inside a sandboxed worker; cron scheduler is a
+|> second spawn path assessed separately by t_efef6176).
 >
 > **Doc-in-commit gap:** the Obsidian vault write path on this host
 > has been returning 201 but not persisting since 2026-09-18 (LXC
@@ -55,6 +68,57 @@ Three pieces, all in the canonical-deploy branch:
    operate in `git worktree add` siblings under
    `~/.hermes/hermes-agent/.worktrees/<task-id>`. The production
    tree's working directory is NOT shared with workers.
+
+   **As of t_ff7d30cc the isolation is mechanically enforced**: every
+   worker spawned by the dispatcher enters an unprivileged
+   user+mount namespace where the production tree is `EROFS` at the
+   syscall level. A worker attempting `git checkout`, `git switch -c`,
+   `git reset --hard`, `git pull`, `git update-ref canonical-deploy`,
+   `git branch -f canonical-deploy`, `git worktree add`, or a nested
+   `unshare -Urm` + remount-rw escape is denied by the kernel, not by
+   convention. The launcher carves out exactly this rw set (no more):
+
+   - the dispatcher-provisioned worktree (the worker can write here),
+   - `<agent_home>/.git/objects` (shared object store a commit needs),
+   - `<agent_home>/.git/refs/heads/<branch-dir>` (ONLY the directory
+     containing the worker's own branch ref, e.g. `wt` for a branch
+     named `wt/<task-id>`; `refs/heads` as a whole is NOT carved out
+     because a worker that can update arbitrary refs can move
+     `canonical-deploy` to a different commit — the narrow carve-out
+     refuses cross-branch moves while still letting the worker update
+     its own branch ref via the standard git plumbing),
+   - `<agent_home>/.git/logs` (reflog),
+   - `<agent_home>/.git/worktrees/<this-worktree-name>` (this worktree's
+     `index`/`HEAD` — carved out per name, never the whole `.git/worktrees`).
+
+   **Caveats** (measured, not surprises):
+
+   - Supplementary groups are lost inside the user namespace; local
+     group-gated sockets (`/var/snap/lxd/common/lxd/unix.socket`,
+     group `lxd`) keep working, but the kernel maps the worker's
+     in-namespace uid 0 back to the host's `serveradmin` via
+     `SO_PEERCRED`, so lxd sees the worker as fully-trusted
+     `serveradmin` (MORE trust than expected, not less). Mitigation
+     if a flow needs lxd-as-another-user: map the gid via
+     `newgidmap`/subgid, or run that one op outside the sandbox.
+     Remote access is unaffected (docker on this host is already an
+     ssh context).
+   - `git fetch`/`pull` inside the worker's own worktree fails —
+     `FETCH_HEAD` lives in the ro main `.git`. The dispatcher must
+     provision the worktree before the sandbox exists; `hermes -w`
+     from inside a worker is unavailable by design.
+   - The cron scheduler (`cron/scheduler.py`) is a separate spawn
+     path; coverage is owned by `t_efef6176` (verification card).
+   - Sandbox-safe `mount` exits with distinct codes (91=stage bind,
+     92=prod bind, 93=remount-ro, 94=carve bind) so a worker log
+     surfaces the first failing mount immediately.
+
+   Configuration: `kanban.worker_isolation = off|warn|enforce` in the
+   resolved config; `HERMES_WORKER_ISOLATION=off` env var as a kill
+   switch. The gate degrades HONESTLY when the kernel cannot deliver
+   isolation (no unprivileged userns, non-Linux host): the worker
+   still spawns but a single warning fires once per dispatcher
+   process, never a per-spawn flood, never a silent pretend.
 
 3. **Self-enforcing gate.** `hermes_cli.deploy_guard.check_deploy_branch()`
    runs on every dispatcher tick. A wrong branch, detached HEAD, or
@@ -122,6 +186,7 @@ export HERMES_DEPLOY_GUARD=strict
 | `HERMES_DEPLOY_BRANCH` | `canonical-deploy-t_7161d9a9` | The expected branch name. |
 | `HERMES_DEPLOY_GUARD` | `warn` | `off`/`warn`/`strict`. See deploy_guard.py. |
 | `HERMES_AGENT_HOME` | `$HERMES_AGENT` or `/home/serveradmin/.hermes/hermes-agent` | The working tree to inspect. |
+| `HERMES_WORKER_ISOLATION` | `enforce` on Linux+userns | Emergency kill switch for the worker sandbox. `off` falls back to the worktree convention (no kernel-level EROFS). Read `kanban.worker_isolation` from the resolved `config.yaml` to set the steady-state mode. |
 
 The deploy guard reads `HERMES_AGENT_HOME` first, then `HERMES_AGENT`,
 then the default path. This layering keeps the gate usable inside
@@ -183,6 +248,31 @@ default path detection.
 `HERMES_DEPLOY_GUARD=strict` is set. This is intentional (test
 environments only). Production should always use the default `warn`.
 
+### Symptom: worker logs show `[worker_isolate] degraded to off: ...`
+
+The host cannot deliver unprivileged mount-namespace isolation (no
+`unshare --user --map-root-user true`, non-Linux, or already inside a
+user namespace). The worker still spawns and the carve-out convention
+still applies; you lose the kernel-level EROFS backstop. Acceptable
+on dev machines that don't ship the agent tree; investigate before
+disabling on a production host. Set `HERMES_WORKER_ISOLATION=off`
+only as a temporary kill switch, never as the steady state.
+
+### Note: lxd unix.socket is NOT sandboxed
+
+The lxd unix socket (`/var/snap/lxd/common/lxd/unix.socket`, group `lxd`)
+**keeps working** inside the sandbox. Even though supplementary groups
+are lost (`ogroups=` → `nogroup` in the new namespace), the kernel
+maps the worker's in-namespace uid 0 back to the host's `serveradmin`
+via `SO_PEERCRED`, so lxd's trust check returns fully-trusted
+`serveradmin`. A worker running under `unshare -Urm` therefore has
+MORE lxd trust than a normal host shell would have as a non-root user
+— the opposite of what a casual reading of "groups lost" suggests.
+This is not currently a live flow (no worker uses lxd today), but if
+a future flow needs to invoke lxd as a *lesser* identity, it must
+either map the gid via `newgidmap`/subgid, or run that one op outside
+the sandbox by setting `HERMES_WORKER_ISOLATION=off` for the task.
+
 ## Dependencies
 
 - `git` binary on the host (the guard shells out to `git rev-parse`).
@@ -206,6 +296,14 @@ environments only). Production should always use the default `warn`.
   already in use by this card (`fix/respawn-guard-event-storm-t_ea3bc1a1`).
 - t_4ac398f0 — restart card; sequencing corrected to "merge to canonical
   → deploy → verify → restart" by this card.
+- t_f4806674 — design decision: chose `unshare -Urm` + ro bind + rw
+  carve-outs after measuring that `systemd-run --user --scope` refuses
+  `ReadOnlyPaths=` (`Unknown assignment`) and a transient systemd
+  service cannot inherit the dispatcher-built worker env.
+- t_ff7d30cc — implementation: `hermes_cli/worker_isolate.py` +
+  `_isolation_worker_argv` wired into `_default_spawn`; worker argv is
+  now wrapped in `unshare -Urm <launcher> -- <worker argv>` so the
+  production tree is `EROFS` inside the worker.
 - t_7161d9a9 — this card.
 
 ## Doc-in-commit Caveat
