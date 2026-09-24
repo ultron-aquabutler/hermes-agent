@@ -372,19 +372,22 @@ class StreamFallbackMixin:
 
     # Fresh send carried exactly ``text`` — record it so the gateway can reconcile the flag against the
     # completed response (#71643/#95382 content-vs-flag contract).
-    async def _suppress_silence_marker(self) -> None:
+    async def _suppress_silence_marker(self, *, reason: str = "intentional-silence marker") -> None:
         """Retract any streamed preview when the final reply is a bare silence marker.  Flags
-        stay False so the gateway's whole-response filter owns what goes out next: "" for a
-        machinery turn, the visible fallback for a human one."""
+        stay False so the gateway's whole-response filter owns what goes out next: \"\" for a
+        machinery turn, the visible fallback for a human one.
+
+        ``reason`` names what is being retracted in the log; a leaked interrupt-scaffold echo
+        takes the same path (retract, deliver nothing) with its own wording."""
         # A native-stream bubble isn't a deletable message — close an open one
         # (e.g. from an eager re-seed) with an empty finalize so it doesn't hang.
         if self._native_stream_opened:
-            await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
+            await self._close_empty_native_bubble(f"{reason.capitalize()} native stream close failed: %s")
 
-        await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
+        await self._delete_previews(self._stale_preview_ids(), label=reason.capitalize())
         self._preview_message_ids = set()
         self._message_id = None
         self._accumulated = self._stream_ledger = self._last_sent_text = ""
         self._already_sent = False
         self._clear_turn_final_flags()
-        logger.info("Suppressed streamed intentional-silence marker (chat=%s)", self.chat_id)
+        logger.info("Suppressed streamed %s (chat=%s)", reason, self.chat_id)

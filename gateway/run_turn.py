@@ -321,6 +321,43 @@ class GatewayTurnMixin:
         except Exception:
             return False
 
+    @staticmethod
+    def _scrub_interrupt_scaffold(response, session_key):
+        """Strip a leaked interrupt-checkpoint scaffold from an outbound reply.
+
+        The scaffold (``[This response was interrupted by a user correction.]`` + its headers) is
+        replay text the agent loop writes into the NEXT provider request, never user-facing
+        content. A model that has it in context can reproduce it as assistant text, and that echo
+        lands in the chat as a phantom interruption that no user ever caused — peers then answer
+        it and the echo becomes a loop. Returns ``(text, is_stub)``: ``is_stub`` means the reply
+        was scaffolding only, so the caller suppresses it entirely (silence, like the
+        intentional-silence marker) instead of sending a corrected-looking stub.
+        """
+        if not isinstance(response, str) or not response:
+            return response, False
+        try:
+            from gateway.response_filters import strip_interrupt_scaffold
+        except Exception:
+            logger.debug("interrupt-scaffold filter unavailable", exc_info=True)
+            return response, False
+        cleaned = strip_interrupt_scaffold(response)
+        if cleaned == response:
+            return response, False
+        if cleaned.strip():
+            logger.warning(
+                "Dropped a leaked interrupt-scaffold header from the reply for session %s "
+                "(the marker is replay text; the payload after it is delivered)",
+                session_key or "?",
+            )
+            return cleaned, False
+        logger.warning(
+            "Suppressing a leaked interrupt-scaffold echo for session %s: the reply was "
+            "scaffold-only, so no phantom '[This response was interrupted by a user correction.]' "
+            "reaches the chat",
+            session_key or "?",
+        )
+        return "", True
+
     async def _hmwa_resolve_session(self, event, source):
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
@@ -1456,6 +1493,16 @@ class GatewayTurnMixin:
             )
             _intentional_silence = False
             response = _UNEXPECTED_SILENCE_REPLY
+
+        # A scaffold-only reply is a leaked interrupt checkpoint, not an answer: suppress it the
+        # way a silence marker is suppressed (the alternative — sending it — is the phantom
+        # "[This response was interrupted by a user correction.]" stub). A reply that carries real
+        # payload keeps the payload and loses only the misleading header. A FAILED turn (crashed or
+        # signalled worker) is not silenced: blanking the echoes leaves the normal failure copy to
+        # fire, so the phantom stub is replaced by the honest error instead of by nothing.
+        response, _scaffold_stub = self._scrub_interrupt_scaffold(response, session_key)
+        if _scaffold_stub and not agent_result.get("failed"):
+            _intentional_silence = True
 
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
@@ -3614,6 +3661,11 @@ class GatewayTurnMixin:
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
         first_response = _delivery_result.get("final_response", "")
+        # Same scaffold guard as the normal path, and BEFORE the stream reconciliation: a leaked
+        # interrupt checkpoint is replay text, never a reply, and the stream consumer already
+        # scrubbed the same bytes — reconciling the raw copy against it would look like a mismatch
+        # and re-send an answer the chat just received.
+        first_response, _scaffold_stub = self._scrub_interrupt_scaffold(first_response, session_key)
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
@@ -3632,6 +3684,10 @@ class GatewayTurnMixin:
                 )
                 first_response = _UNEXPECTED_SILENCE_REPLY
                 _already_streamed = False
+        if _scaffold_stub:
+            # Scaffolding only: the turn has nothing to say, so send nothing (the silence
+            # treatment) rather than a stub whose whole content is a phantom interruption.
+            first_response = ""
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -3884,6 +3940,22 @@ class GatewayTurnMixin:
         if not isinstance(response, dict) or response.get("failed"):
             return
         _final = response.get("final_response") or ""
+        # The stream consumer scrubbed a leaked interrupt scaffold from the bytes it displayed, so
+        # the raw copy in the result must be scrubbed before the reconciliation below compares the
+        # two — otherwise the difference reads as a stale finalize and re-sends the reply. The
+        # matching shape-side guard (_hmwa_shape_agent_response) already warned for this turn.
+        if _final:
+            try:
+                from gateway.response_filters import strip_interrupt_scaffold
+                _clean_final = strip_interrupt_scaffold(_final)
+            except Exception:
+                _clean_final = _final
+            if _clean_final != _final:
+                logger.debug(
+                    "Scrubbed a leaked interrupt scaffold from the turn result for session %s",
+                    session_key or "?",
+                )
+                response["final_response"] = _final = _clean_final
         _is_empty_sentinel = not _final or _final == "(empty)"
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).
