@@ -63,6 +63,47 @@ def test_kanban_comment_body_scrubbed_github_pat(worker_env):
     assert stored  # something was stored
 
 
+def test_kanban_comment_body_scrubbed_cloudflare_token(worker_env):
+    """cfut_ Cloudflare API token in comment body must be masked before DB write.
+
+    Regression for t_cbdaeae3: workers pasting live ``CF_DNS_API_TOKEN`` /
+    ``CLOUDFLARE_VISION_CF_TOKEN`` diagnostics into kanban comments let those
+    tokens accumulate in ``task_comments.body``. The write-side scrub on the
+    kanban tool path catches the ``cfut_`` prefix the same way it already
+    handles ``ghp_`` / ``sk-``, so the token never reaches the DB in the clear.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    secret = "cfut_" + "X" * 40  # 45 chars total — above the 20-char floor
+    import json as _json
+    result = _json.loads(kt._handle_comment({"task_id": worker_env,
+                                             "body": f"verifying CF token {secret} live"}))
+    conn = kbc.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+    finally:
+        conn.close()
+    assert comments, "expected at least one comment"
+    stored = comments[-1].body
+    assert secret not in stored, (
+        f"cfut_ token leaked to DB; stored body was {stored!r}"
+    )
+    # And the worker should learn via the notice field on the tool result.
+    assert result.get("notice"), "expected a redact notice in the tool result"
+
+
+def test_kanban_comment_body_scrubbed_includes_notice_field(worker_env):
+    """When no credential-shaped material is present, ``notice`` must be None."""
+    from tools import kanban_tools as kt
+    import json as _json
+    result = _json.loads(kt._handle_comment({"task_id": worker_env,
+                                             "body": "plain prose, no secrets"}))
+    assert result.get("notice") in (None, ""), (
+        f"unexpected notice on clean body: {result.get('notice')!r}"
+    )
+
+
 def test_kanban_block_reason_scrubbed_jwt(worker_env):
     """JWT in block reason must be masked before DB write."""
     from tools import kanban_tools as kt
