@@ -608,6 +608,179 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Respawn-guard event dedupe (#t_ea3bc1a1)
+# ---------------------------------------------------------------------------
+
+
+def _count_events(conn, task_id, kind):
+    return conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+        (task_id, kind),
+    ).fetchone()[0]
+
+
+def _seed_task(conn, *, title, status, error_text, run_outcome="crashed"):
+    """Create a task with a known failure-text and run outcome. Returns the id."""
+    tid = kb.create_task(conn, title=title, assignee="a")
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    conn.execute(
+        "UPDATE task_runs SET outcome=?, status=?, ended_at=? WHERE id=?",
+        (run_outcome, run_outcome, 5_000_000 - 60, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+        (status, error_text, tid),
+    )
+    conn.commit()
+    return tid
+
+
+def test_emit_respawn_guarded_dedupes_same_reason(kanban_home):
+    """Same guard reason across 3 emits => exactly 1 task_event row.
+
+    Pre-fix the dispatcher fired unconditionally on every tick (~36 events
+    per minute per parked card; ~103k events in 48h on the homelab board —
+    see #t_ea3bc1a1).
+    """
+    with kbc.connect() as conn:
+        tid = _seed_task(
+            conn, title="auth-storm", status="ready",
+            error_text="HTTP 403 forbidden: invalid api key",
+        )
+        for _ in range(3):
+            kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        assert _count_events(conn, tid, "respawn_guarded") == 1
+
+        # Persisted state reflects the single fired reason.
+        row = conn.execute(
+            "SELECT last_guard_reason, last_guard_fired_at FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["last_guard_reason"] == "blocker_auth"
+        assert isinstance(row["last_guard_fired_at"], int)
+        assert row["last_guard_fired_at"] > 0
+
+
+def test_emit_respawn_guarded_fires_on_reason_transition(kanban_home):
+    """A reason change (rate_limit_cooldown -> blocker_auth) emits a second
+    event so operators see the new state, while identical emits are silent.
+    """
+    with kbc.connect() as conn:
+        tid = _seed_task(
+            conn, title="transition", status="ready",
+            error_text="HTTP 429 out of credits",
+            run_outcome="rate_limited",
+        )
+        kbd._emit_respawn_guarded(conn, tid, "rate_limit_cooldown")
+        assert _count_events(conn, tid, "respawn_guarded") == 1
+
+        # Now a different reason arrives - second event fires.
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        assert _count_events(conn, tid, "respawn_guarded") == 2
+
+        # A repeat on the new reason emits nothing further.
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        assert _count_events(conn, tid, "respawn_guarded") == 2
+
+
+def test_clear_guard_dedupe_state_clears_on_guard_release(kanban_home):
+    """When the guard releases the dedupe state must clear so a later
+    re-trip on the same reason fires fresh.
+    """
+    with kbc.connect() as conn:
+        tid = _seed_task(
+            conn, title="release", status="ready",
+            error_text="HTTP 403 forbidden: invalid api key",
+        )
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        assert _count_events(conn, tid, "respawn_guarded") == 1
+        row = conn.execute(
+            "SELECT last_guard_reason FROM tasks WHERE id=?", (tid,),
+        ).fetchone()
+        assert row["last_guard_reason"] == "blocker_auth"
+
+        # Guard releases - dedupe state must reset.
+        kbd._clear_guard_dedupe_state(conn, tid)
+        row = conn.execute(
+            "SELECT last_guard_reason, last_guard_fired_at FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["last_guard_reason"] is None
+        assert row["last_guard_fired_at"] is None
+
+        # Re-trip on the SAME reason now fires a fresh event.
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        assert _count_events(conn, tid, "respawn_guarded") == 2
+
+
+def test_check_respawn_guard_skips_terminal_status_rows(kanban_home):
+    """done / cancelled / archived rows cannot be re-spawned.
+    check_respawn_guard must return None even when last_failure_error
+    matches a blocker pattern - emitting a guard event for a closed card
+    is pure noise (#t_ea3bc1a1).
+    """
+    for status in ("done", "cancelled", "archived"):
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title=f"{status}-card", assignee="a")
+            kb.claim_task(conn, tid)
+            conn.execute(
+                "UPDATE tasks SET status=?, last_failure_error="
+                "'HTTP 403 forbidden: invalid api key' WHERE id=?",
+                (status, tid),
+            )
+            conn.commit()
+            assert kbd.check_respawn_guard(conn, tid) is None, status
+
+
+def test_emit_respawn_guarded_dedupe_state_persists_across_reconnect(kanban_home):
+    """A hub restart must not re-fire a guard event whose state was already
+    persisted. Re-opening the connection (simulating restart) still sees
+    last_guard_reason on the row.
+    """
+    with kbc.connect() as conn:
+        tid = _seed_task(
+            conn, title="restart", status="ready",
+            error_text="HTTP 403 forbidden: invalid api key",
+        )
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        assert _count_events(conn, tid, "respawn_guarded") == 1
+
+    # Fresh connection - same file - simulates the dispatcher reconnecting
+    # after a restart. last_guard_reason must survive AND a follow-up emit
+    # on the same DB must NOT re-fire the event.
+    with kbc.connect() as conn2:
+        kbd._emit_respawn_guarded(conn2, tid, "blocker_auth")
+        row = conn2.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE kind='respawn_guarded'",
+        ).fetchone()
+        assert row["n"] == 1, "guard event re-fired across reconnect"
+
+
+def test_emit_respawn_guarded_event_payload_includes_reason(kanban_home):
+    """The single fired event still carries the reason code in its payload
+    (no regression on the diagnostic contract).
+    """
+    with kbc.connect() as conn:
+        tid = _seed_task(
+            conn, title="payload", status="ready",
+            error_text="HTTP 403 forbidden: invalid api key",
+        )
+        kbd._emit_respawn_guarded(conn, tid, "blocker_auth")
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='respawn_guarded'",
+            (tid,),
+        ).fetchone()
+        assert json.loads(event["payload"]) == {"reason": "blocker_auth"}
+
+
+
+
 # ---------------------------------------------------------------------------
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------

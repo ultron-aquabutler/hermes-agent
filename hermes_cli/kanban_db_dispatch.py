@@ -1488,6 +1488,58 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _emit_respawn_guarded(
+    conn: sqlite3.Connection, task_id: str, guard_reason: str,
+) -> None:
+    """Append a ``respawn_guarded`` task_event only when the (task_id, reason)
+    pair is new — and persist the new state on the row so restarts don't
+    re-fire (#t_ea3bc1a1).
+
+    Pre-fix this fired unconditionally on every dispatch tick (~36 events/min
+    per parked card, ~103k events in 48h on the homelab board). ``DispatchResult
+    .respawn_guarded`` (in-memory, dashboards, ``dispatch --json``) is
+    populated separately by the caller — that bucket still surfaces every tick
+    so live state stays visible. Only the durable ``task_events`` row is
+    deduped.
+
+    The caller must already hold the dispatch transaction's write intent;
+    this helper takes its own ``write_txn`` so the dedupe read + the event
+    write + the row update atomically commit.
+    """
+    with _kb.write_txn(conn):
+        prior_row = conn.execute(
+            "SELECT last_guard_reason FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        prior = prior_row["last_guard_reason"] if prior_row else None
+        if prior == guard_reason:
+            return  # already fired for this (card, reason) — skip
+        _kb._append_event(
+            conn, task_id, "respawn_guarded", {"reason": guard_reason},
+        )
+        conn.execute(
+            "UPDATE tasks SET last_guard_reason = ?, last_guard_fired_at = ? "
+            "WHERE id = ?",
+            (guard_reason, int(time.time()), task_id),
+        )
+
+
+def _clear_guard_dedupe_state(conn: sqlite3.Connection, task_id: str) -> None:
+    """Reset the per-row guard dedupe columns when the guard releases.
+
+    Called from ``_dispatch_lane_task`` on the healthy (no-guard) branch: the
+    row just passed the guard scan, so any prior ``last_guard_reason`` is
+    stale — clearing it lets the NEXT guard transition fire fresh instead of
+    being suppressed by leftover state from a previous reason-epoch. Cheap:
+    one indexed UPDATE guarded by ``last_guard_reason IS NOT NULL``.
+    """
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET last_guard_reason = NULL, last_guard_fired_at = NULL "
+            "WHERE id = ? AND last_guard_reason IS NOT NULL",
+            (task_id,),
+        )
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1508,12 +1560,24 @@ def check_respawn_guard(
     PR). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
+
+    Terminal statuses (``done`` / ``cancelled`` / ``archived``) return None
+    immediately — they cannot be re-spawned, so a guard event for them is
+    pure noise (``_lane_rows`` already filters the dispatcher; this is
+    defense in depth for other call sites — see #t_ea3bc1a1).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, status FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
+        return None
+    # Terminal statuses are inert for dispatch: nothing the guard returns can
+    # resurrect the row. Returning None keeps callers (and any test that
+    # exercises a closed card) from logging a guard event that no operator
+    # can act on. ``_lane_rows`` already filters by ``status='ready'`` for
+    # the dispatcher; this is defense in depth against future call sites.
+    if row["status"] in ("done", "cancelled", "archived"):
         return None
 
     now = int(time.time())
@@ -2026,17 +2090,21 @@ def _dispatch_lane_task(
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
+        # Event so ``hermes kanban tail`` shows why the task looks stuck —
+        # deduped via ``_emit_respawn_guarded`` so a parked card fires once
+        # per (task_id, reason) epoch instead of once per dispatch tick
+        # (~36/min) (#t_ea3bc1a1). ``DispatchResult.respawn_guarded`` above
+        # stays per-tick so dashboards and ``dispatch --json`` keep seeing
+        # live state; only the durable ``task_events`` row is deduped.
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            _emit_respawn_guarded(conn, task_id, guard_reason)
         return False
+
+    # Guard released — clear any prior dedupe state so the next guard
+    # transition fires fresh instead of being suppressed by leftover state
+    # from a previous reason-epoch (#t_ea3bc1a1).
+    if not dry_run:
+        _clear_guard_dedupe_state(conn, task_id)
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
