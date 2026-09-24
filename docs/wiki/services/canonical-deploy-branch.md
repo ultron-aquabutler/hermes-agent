@@ -23,8 +23,9 @@
 |> on Linux+userns; env kill switch `HERMES_WORKER_ISOLATION=off` for
 |> emergencies. See the `Worker isolation` section below for the full carve-out
 |> set and the caveats that ship with the sandbox (lost supplementary groups;
-|> no `git fetch`/`pull` inside a sandboxed worker; cron scheduler is a
-|> second spawn path assessed separately by t_efef6176).
+|> no `git fetch`/`pull` inside a sandboxed worker; the cron scheduler's
+|> external-worker spawn path is now covered by the same launcher
+|> see `t_102333c4` below).
 >
 > **Doc-in-commit gap:** the Obsidian vault write path on this host
 > has been returning 201 but not persisting since 2026-09-18 (LXC
@@ -102,8 +103,22 @@ Three pieces, all in the canonical-deploy branch:
      `FETCH_HEAD` lives in the ro main `.git`. The dispatcher must
      provision the worktree before the sandbox exists; `hermes -w`
      from inside a worker is unavailable by design.
-   - The cron scheduler (`cron/scheduler.py`) is a separate spawn
-     path; coverage is owned by `t_efef6176` (verification card).
+   - **Cron spawn path is now covered (t_102333c4).** The cron's
+     `subprocess.Popen` at `cron/scheduler.py:3281` is wrapped in
+     the same `unshare -Urm` launcher the dispatcher uses. The
+     carve-out set is computed against the agent home's own
+     `.git/HEAD` instead of a per-task worktree's HEAD (cron has no
+     worktree): `<agent_home>/.git/objects` (shared object store),
+     `<agent_home>/.git/logs` (reflog), and either the branch ref
+     FILE (top-level branch like `canonical-deploy-t_7161d9a9`) or
+     the branch ref PARENT DIR (nested branch). The full
+     `refs/heads` directory is **never** carved out — sibling refs
+     stay ro, so `git update-ref refs/heads/<other-branch>` is
+     denied even from cron. The agent home's working tree
+     (`<agent_home>/app.py` etc) stays ro: a cron agent attempting
+     `git switch -c cron-evil`, `echo x >> app.py`, or
+     `git reset --hard` against the production tree is denied by
+     the kernel (EROFS / EACCES).
    - Sandbox-safe `mount` exits with distinct codes (91=stage bind,
      92=prod bind, 93=remount-ro, 94=carve bind) so a worker log
      surfaces the first failing mount immediately.
@@ -293,6 +308,14 @@ sandbox by setting `HERMES_WORKER_ISOLATION=off` for the task.
   `_isolation_worker_argv` wired into `_default_spawn`; worker argv is
   now wrapped in `unshare -Urm <launcher> -- <worker argv>` so the
   production tree is `EROFS` inside the worker.
+- t_21e9f9d6 — correct the lxd-socket caveat: the worker is
+  fully-trusted `serveradmin` via `SO_PEERCRED`, not blocked.
+- t_102333c4 — extend the launcher to the cron subprocess path:
+  `build_isolated_cron_worker_argv` + `--cron` launcher flag + the
+  cron's `_cron_isolation_argv` wrapping `subprocess.Popen` at
+  `cron/scheduler.py:3281`. Carve-out uses the agent home's own
+  `.git/HEAD` (cron has no per-task worktree); working tree stays
+  ro.
 - t_7161d9a9 — this card.
 
 ## Doc-in-commit Caveat
