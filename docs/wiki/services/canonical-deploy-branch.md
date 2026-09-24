@@ -6,12 +6,25 @@
 > Pin the deployed tree to one canonical branch. All fixes merge there
 > before deploy. Workers use separate worktrees.
 >
-> Status: shipped on branch `canonical-deploy-t_7161d9a9` @ `4f914e1d23`.
-> Acceptance pass at the time of writing: 146 passed, 1 skipped across
-> `test_deploy_guard` + `test_kanban_db*` + `test_kanban_decompose*` +
-> `test_kanban_specify*` + `test_kanban_block_kinds` +
-> `test_kanban_auto_decompose_quarantine_regression` +
-> `test_interrupt_scaffold_echo`.
+| Status: shipped on branch `canonical-deploy-t_7161d9a9` @ `4f914e1d23`.
+|> Acceptance pass at the time of writing: 146 passed, 1 skipped across
+|> `test_deploy_guard` + `test_kanban_db*` + `test_kanban_decompose*` +
+|> `test_kanban_specify*` + `test_kanban_block_kinds` +
+|> `test_kanban_auto_decompose_quarantine_regression` +
+|> `test_interrupt_scaffold_echo`.
+|>
+|> **Layer 2 enforcement (t_ff7d30cc):** the convention above is now
+|> mechanically enforced — every kanban-spawned worker is launched inside an
+|> unprivileged user+mount namespace in which the production tree is
+|> read-only at the syscall level (EROFS). The launcher (`hermes_cli.worker_isolate`)
+|> is applied by the dispatcher to the worker argv with the proven nesting
+|> `systemd-run --user --scope` → `unshare -Urm` → launcher → worker. Config
+|> gate: `kanban.worker_isolation` = `off|warn|enforce`, default `enforce`
+|> on Linux+userns; env kill switch `HERMES_WORKER_ISOLATION=off` for
+|> emergencies. See the `Worker isolation` section below for the full carve-out
+|> set and the caveats that ship with the sandbox (lost supplementary groups;
+|> no `git fetch`/`pull` inside a sandboxed worker; cron scheduler is a
+|> second spawn path assessed separately by t_efef6176).
 >
 > **Doc-in-commit gap:** the Obsidian vault write path on this host
 > has been returning 201 but not persisting since 2026-09-18 (LXC
@@ -55,6 +68,46 @@ Three pieces, all in the canonical-deploy branch:
    operate in `git worktree add` siblings under
    `~/.hermes/hermes-agent/.worktrees/<task-id>`. The production
    tree's working directory is NOT shared with workers.
+
+   **As of t_ff7d30cc the isolation is mechanically enforced**: every
+   worker spawned by the dispatcher enters an unprivileged
+   user+mount namespace where the production tree is `EROFS` at the
+   syscall level. A worker attempting `git checkout`, `git switch -c`,
+   `git reset --hard`, `git pull`, `git update-ref canonical-deploy`,
+   `git branch -f canonical-deploy`, `git worktree add`, or a nested
+   `unshare -Urm` + remount-rw escape is denied by the kernel, not by
+   convention. The launcher carves out exactly this rw set (no more):
+
+   - the dispatcher-provisioned worktree (the worker can write here),
+   - `<agent_home>/.git/objects` (shared object store a commit needs),
+   - `<agent_home>/.git/refs/heads` (the worker's branch ref),
+   - `<agent_home>/.git/logs` (reflog),
+   - `<agent_home>/.git/worktrees/<this-worktree-name>` (this worktree's
+     `index`/`HEAD` — carved out per name, never the whole `.git/worktrees`).
+
+   **Caveats** (measured, not surprises):
+
+   - Supplementary groups are lost inside the user namespace; local
+     group-gated sockets (`/var/snap/lxd/common/lxd/unix.socket`,
+     group `lxd`) are unreachable from a sandboxed worker. Remote
+     access is unaffected (docker on this host is already an ssh
+     context).
+   - `git fetch`/`pull` inside the worker's own worktree fails —
+     `FETCH_HEAD` lives in the ro main `.git`. The dispatcher must
+     provision the worktree before the sandbox exists; `hermes -w`
+     from inside a worker is unavailable by design.
+   - The cron scheduler (`cron/scheduler.py`) is a separate spawn
+     path; coverage is owned by `t_efef6176` (verification card).
+   - Sandbox-safe `mount` exits with distinct codes (91=stage bind,
+     92=prod bind, 93=remount-ro, 94=carve bind) so a worker log
+     surfaces the first failing mount immediately.
+
+   Configuration: `kanban.worker_isolation = off|warn|enforce` in the
+   resolved config; `HERMES_WORKER_ISOLATION=off` env var as a kill
+   switch. The gate degrades HONESTLY when the kernel cannot deliver
+   isolation (no unprivileged userns, non-Linux host): the worker
+   still spawns but a single warning fires once per dispatcher
+   process, never a per-spawn flood, never a silent pretend.
 
 3. **Self-enforcing gate.** `hermes_cli.deploy_guard.check_deploy_branch()`
    runs on every dispatcher tick. A wrong branch, detached HEAD, or
