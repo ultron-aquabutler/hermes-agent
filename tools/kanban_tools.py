@@ -732,16 +732,35 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_comment")
 def _handle_comment(args: dict, **kw) -> str:
-    """Append a comment to a task's thread."""
+    """Append a comment to a task's thread.
+
+    ``body`` is scrubbed through ``redact_sensitive_text(force=True)`` BEFORE
+    the comment is persisted. ``commented`` events (``_append_event``) keep
+    only ``len``/``author`` metadata, not the body — the scrub on the body is
+    the single boundary that matters. When a scrub actually fires we
+    surface a notice in the tool result so the worker that pasted the body
+    learns the pattern instead of being silently corrected.
+    """
     _reject_delegated_child_mutation("kanban_comment")
     tid = args.get("task_id")
     _check(tid, "task_id is required (use the current task id if that's what "
                 "you mean — pulls from env but kept explicit here)")
-    body = _redact(_require_text(args, "body"))
+    raw_body = _require_text(args, "body")
+    body = _redact(raw_body)
+    scrub_notice: Optional[str] = None
+    if body != raw_body:
+        scrub_notice = (
+            "notice: credential-shaped material was redacted from this comment "
+            "before it was stored (cfut_, ghp_, sk-, etc.). Future workers see "
+            "the masked body — paste tokens only into agent-vault, never into "
+            "comment bodies."
+        )
+        logger.warning(
+            "kanban_comment body scrubbed on task %s (author=%s); "
+            "credential-shaped material was masked before INSERT",
+            tid, os.environ.get("HERMES_PROFILE") or "worker",
+        )
     # Author comes from the worker's runtime identity, never caller args: comments are
-    # injected into future workers' system prompts, so an args["author"] override could
-    # forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted —
-    # it is the handoff channel between tasks.
     # Comments are injected into the next worker's system prompt by ``build_worker_context`` as
     # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
@@ -749,7 +768,7 @@ def _handle_comment(args: dict, **kw) -> str:
     author = os.environ.get("HERMES_PROFILE") or "worker"
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
-        return _ok(task_id=tid, comment_id=cid)
+        return _ok(task_id=tid, comment_id=cid, notice=scrub_notice)
 
 
 def _store_attachment(board, tid, filename, data, content_type) -> str:
