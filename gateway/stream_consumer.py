@@ -29,7 +29,9 @@ from gateway.config import (
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR)
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
-    is_partial_silence_marker as _is_partial_silence_marker)
+    is_interrupt_scaffold_echo as _is_interrupt_scaffold_echo,
+    is_partial_silence_marker as _is_partial_silence_marker,
+    strip_interrupt_scaffold as _strip_interrupt_scaffold)
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -559,6 +561,21 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
                         await self._suppress_silence_marker()
                         return
+                    # A leaked interrupt-checkpoint scaffold (the model reproducing the
+                    # "[This response was interrupted by a user correction.]" replay text it
+                    # saw in its own context) is not a reply. Retract it like a silence marker;
+                    # if it had payload after the scaffold, scrub the header instead so neither
+                    # the preview nor the finalize shows a phantom interruption.
+                    if _is_interrupt_scaffold_echo(self._clean_for_display(self._accumulated)):
+                        await self._suppress_silence_marker(reason="leaked interrupt-scaffold echo")
+                        return
+                    _scrubbed = _strip_interrupt_scaffold(self._accumulated)
+                    if _scrubbed != self._accumulated:
+                        logger.warning(
+                            "Stripped a leaked interrupt-scaffold header from the streamed reply (chat=%s)",
+                            self.chat_id,
+                        )
+                        self._accumulated = self._stream_ledger = _scrubbed
 
                 if self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)

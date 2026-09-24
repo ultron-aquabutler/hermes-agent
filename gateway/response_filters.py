@@ -6,6 +6,7 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -135,6 +136,96 @@ def is_partial_silence_marker(text: Any) -> bool:
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
         for c in _canonical_silence_candidates(text)
     )
+
+
+# The interrupt checkpoint scaffold the agent loop builds when a mid-flight user correction
+# lands (``agent/conversation_loop`` — marker + two headers). It is REPLAY text for the next
+# provider request: the user row carries the human's words in ``content`` and the scaffold only
+# in ``api_content``. A model holding the scaffold in context can reproduce it as its own
+# assistant text (#81841), and that echo reaches the chat verbatim — a phantom
+# "[This response was interrupted by a user correction.]" reporting an interruption that never
+# happened and carrying no user payload. Peers read it as a real turn and re-answer it, so one
+# echo becomes a loop.
+#
+# Only the scaffold's own casing matches, and the block must open with a BRACKETED marker or
+# context header: a sentence that merely says the response was interrupted is prose and must be
+# delivered. The optional ``]``/``.`` cover a streamed echo seen before the marker finished; each
+# header is optional so a partially-reached checkpoint (marker only, or marker + one header) is
+# still caught. Copies of these literals live in ``agent/conversation_loop`` and are kept in
+# lock-step by test_interrupt_scaffold_echo.py — importing the agent package here would drag the
+# whole loop into every gateway import.
+_INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+_INTERRUPT_SCAFFOLD_CONTEXT_HEADER = "[Context from the interrupted assistant response]"
+_INTERRUPT_SCAFFOLD_VISIBLE_HEADER = "Visible response before the interruption:"
+
+_SCAFFOLD_CONTEXT_RE = re.compile(
+    r"\[Context from the interrupted assistant response\.?]?"
+)
+_SCAFFOLD_VISIBLE_RE = re.compile(r"Visible response before the interruption:?")
+_SCAFFOLD_MARKER_RE = re.compile(
+    r"\[This response was interrupted by a user correction\.?]?"
+)
+_SCAFFOLD_BLANK_RE = re.compile(r"[ \t\r\n]+")
+
+
+def _scaffold_prefix_end(text: str) -> int:
+    """Length of the leading interrupt-checkpoint block in ``text`` (0 when it has none).
+
+    Walks the scaffold atoms (marker, either header) in any order, then requires the marker
+    to have been seen: a stray header with no marker is not scaffolding, it is broken output
+    the gateway should leave alone rather than silently eat.
+    """
+    blank = _SCAFFOLD_BLANK_RE.match(text)
+    pos = blank.end() if blank else 0
+    saw_marker = False
+    while True:
+        rest = text[pos:]
+        for atom, is_marker in (
+            (_SCAFFOLD_MARKER_RE, True),
+            (_SCAFFOLD_CONTEXT_RE, False),
+            (_SCAFFOLD_VISIBLE_RE, False),
+        ):
+            match = atom.match(rest)
+            if match is None:
+                continue
+            pos += match.end()
+            saw_marker = saw_marker or is_marker
+            break
+        else:
+            break
+        # Blank lines separate the scaffold's own paragraphs: they stay inside the block, and
+        # the next pass decides whether another atom (or the payload) follows.
+        blank = _SCAFFOLD_BLANK_RE.match(text[pos:])
+        if blank:
+            pos += blank.end()
+    return pos if saw_marker else 0
+
+
+def strip_interrupt_scaffold(response: Any) -> str:
+    """Drop a leading interrupt-checkpoint block from ``response``.
+
+    Returns ``response`` unchanged unless it OPENS with the scaffold, so prose that merely
+    mentions an interruption survives; returns ``""`` when the response was nothing but
+    scaffolding (see :func:`is_interrupt_scaffold_echo`). Text after the dropped block is real
+    assistant output and is returned as the delivered body.
+    """
+    if not isinstance(response, str):
+        return response
+    end = _scaffold_prefix_end(response)
+    return response[end:].lstrip() if end else response
+
+
+def is_interrupt_scaffold_echo(response: Any) -> bool:
+    """True when ``response`` is only a leaked interrupt scaffold — no assistant payload.
+
+    This is the phantom-interruption stub: deliverable text that exists because the scaffold
+    leaked, not because the agent had anything to say. An echo that DOES carry payload after
+    the scaffold is not a stub and must still be delivered — use
+    :func:`strip_interrupt_scaffold` to drop the misleading header from it instead.
+    """
+    if not isinstance(response, str) or not response.strip():
+        return False
+    return not strip_interrupt_scaffold(response).strip()
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
