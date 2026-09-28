@@ -2722,6 +2722,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    actor: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2735,6 +2736,16 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    ``actor`` is the *caller-attested* identity (CLI's ``--as`` / ``HERMES_PROFILE``,
+    agent tool's ``HERMES_PROFILE``). It lands on the ``completed`` event payload
+    alongside ``run_profile`` (the row-resident ``task_runs.profile``, authoritative
+    when present). The two intentionally diverge is captured as
+    ``actor_mismatch_run_profile=True`` so the cross-profile diagnostic can spot a
+    forged/forced close vs. a normal worker close without conflating them. An
+    unattributed close is recorded as ``actor=None`` — explicitly blank, never
+    silently missing — so audits can distinguish "we don't know" from "we have no
+    record".
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2800,12 +2811,25 @@ def complete_task(
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
             )
+        # Compute the actor-attribution payload here (inside the txn so we see
+        # the run row the closure just ended). Actor mismatch with the run's
+        # recorded profile is recorded explicitly so a forged/forced close is
+        # distinguishable from a worker closing its own assigned task — same
+        # data drives kanban_diagnostics._rule_cross_profile_completion.
+        run_row = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone() if run_id else None
+        run_profile = run_row["profile"] if run_row else None
+        actor_clean = (str(actor).strip() if actor else None) or None
+        attr: dict = {"actor": actor_clean, "run_profile": run_profile}
+        if actor_clean is not None and run_profile is not None and actor_clean != run_profile:
+            attr["actor_mismatch_run_profile"] = True
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            {**_completed_event_payload(result, event_summary, verified_cards, metadata), **attr},
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)

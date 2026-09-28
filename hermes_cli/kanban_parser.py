@@ -255,6 +255,11 @@ _SPECS = [
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
+    _cmd("cross-profile-closes", [
+        _arg("--limit", type=int, default=50,
+             help="Cap the number of rows reported (default: 50; 0 = unlimited)"),
+        _json_flag(help="Emit JSON (structured) instead of the default human table"),
+    ], help="Read-only audit: completed events whose task_runs.profile != tasks.assignee"),
     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [
@@ -284,6 +289,11 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--as", dest="actor",
+             help="Override the actor recorded on the completed event payload. "
+                  "Defaults to $HERMES_PROFILE (then the active profile). Recorded as "
+                  "actor=None when neither is set, so audits can distinguish "
+                  "'unattributed' from 'missing'."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),

@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import sqlite3
 import time
 
 
@@ -678,6 +679,171 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_cross_profile_completion(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Fire when the closing run's ``task_runs.profile`` is not None AND
+    differs from ``tasks.assignee`` for any ``completed`` event on this task.
+
+    The diagnostic answers "who closed this card and were they the assignee?"
+    when the card is read out of context. It is a *post-hoc auditability*
+    signal, not a gate (deliberately — see kanban-workflow
+    'Cross-Profile Card Closure' rule: enforcement was scoped to attribution +
+    visibility, not refusal).
+
+    Natural carve-outs (no rule code needed — they fall out of the join):
+    - Hub review approvals land via a synthesized run with ``profile =
+      tasks.assignee`` (see ``_synthesize_ended_run``), so ``r.profile ==
+      t.assignee`` and the SQL does not match.
+    - Hub ``hub_bypass_done`` force-promotes + closes claimless; if a prior
+      worker run exists its profile is the assignee; if not, the synthesized
+      run's profile is the assignee. Either way the join doesn't match.
+    - A dispatcher-spawned worker closing its own assigned task has
+      ``r.profile == t.assignee`` and the join doesn't match.
+    - A never-claimed manual close (no run row) has ``r.profile IS NULL`` and
+      is filtered by the WHERE clause.
+
+    Mismatch path: a card was transferred (assignee rewritten) while a worker
+    was mid-run, and the hub force-closed the old worker's run. That IS a
+    cross-profile close, and surfacing it here is the right behavior — the
+    reviewer can confirm intent via the relay channel / comment thread.
+    """
+    task_id = _task_field(task, "id")
+    assignee = _task_field(task, "assignee") or ""
+    if not task_id or not assignee:
+        return []
+    findings: list[Diagnostic] = []
+    # Newest-first so the most recent event renders first on ties.
+    for ev in sorted(events, key=lambda e: -(_event_ts(e) or 0)):
+        if _event_kind(ev) != "completed":
+            continue
+        ev_run_id = _task_field(ev, "run_id")
+        if ev_run_id is None:
+            continue
+        run = next((r for r in runs if _task_field(r, "id") == ev_run_id), None)
+        if run is None:
+            continue
+        run_profile = _task_field(run, "profile")
+        if not run_profile or run_profile == assignee:
+            continue
+        payload = _parse_payload(ev)
+        actor = payload.get("actor")
+        mismatch_flag = bool(payload.get("actor_mismatch_run_profile"))
+        when = _event_ts(ev)
+        age_seconds = max(0, int(now) - int(when)) if when else 0
+        # Severity ladder:
+        #   warning = cross-profile close happened (r.profile != assignee). This
+        #     is the auditability signal alone — informational, no implied fault.
+        #   error = cross-profile close AND actor differs from BOTH assignee
+        #     and run_profile. That is a third party who claims to have closed
+        #     the card while the run was someone else — the only true anomaly
+        #     the audit can detect from the kernel side, and the case the hub
+        #     rule explicitly wants surfaced (see kanban-workflow
+        #     'Cross-Profile Card Closure').
+        severity = "warning"
+        if (actor is not None
+                and actor != assignee
+                and actor != run_profile):
+            severity = "error"
+        title = (
+            f"Closed by {run_profile!r}, not the assignee ({assignee!r})"
+        )
+        detail = (
+            f"Task {task_id} (assignee={assignee!r}) was completed by the run "
+            f"recorded as profile={run_profile!r}. Caller-attested actor="
+            f"{actor!r}"
+            f"{' (mismatched the run profile)' if mismatch_flag else ''}. "
+            f"This is informational unless an unexpected actor is at play; "
+            f"verify the close was authorized via the task's comment thread."
+        )
+        actions: list[DiagnosticAction] = []
+        if task_id:
+            actions.append(_log_hint_action(task_id))
+            # Operator-facing action: drop a quick audit comment that the relay
+            # / reviewer thread can grep for. Suggested=False because the
+            # primary intent is awareness; the comment is optional unless the
+            # operator wants an explicit acknowledgment on the card.
+            audit_cmd = (
+                f'hermes kanban comment {task_id} '
+                f'"audit: closed by profile={run_profile!r} (assignee={assignee!r}); '
+                f'ack the close here if it was authorized"'
+            )
+            actions.append(_cli_hint(
+                label="Drop an audit comment on the card",
+                command=audit_cmd, suggested=False,
+            ))
+        findings.append(Diagnostic(
+            kind="cross_profile_completion", severity=severity,
+            title=title, detail=detail, actions=actions,
+            first_seen_at=when, last_seen_at=when, count=1,
+            data={"task_id": task_id, "assignee": assignee,
+                  "run_profile": run_profile, "actor": actor,
+                  "actor_mismatch_run_profile": mismatch_flag,
+                  "completed_at": when, "age_seconds": age_seconds,
+                  "event_id": _task_field(ev, "id")},
+        ))
+    return findings
+
+
+# --- Board-wide diagnostic (separate from the per-task rule engine) ---
+
+
+CROSS_PROFILE_COMPLETIONS_SQL = """
+SELECT datetime(e.created_at, 'unixepoch') AS ts,
+       e.task_id,
+       t.title,
+       t.assignee,
+       r.profile AS run_profile,
+       e.payload,
+       e.run_id
+FROM task_events e
+JOIN tasks t ON t.id = e.task_id
+LEFT JOIN task_runs r ON r.id = e.run_id
+WHERE e.kind = 'completed'
+  AND r.profile IS NOT NULL
+  AND r.profile != t.assignee
+ORDER BY e.created_at DESC
+"""
+
+
+def board_cross_profile_completions(conn: sqlite3.Connection) -> list[dict]:
+    """Board-wide audit of run-scoped cross-profile completions.
+
+    Returns one row per finding as a dict (``ts``, ``task_id``, ``title``,
+    ``assignee``, ``run_profile``, ``actor``, ``actor_mismatch_run_profile``,
+    ``run_id``). Read-only; never mutates state. Mirrors the SQL the hub
+    pre-verified for t_15748fe5 — the per-task rule above fires per affected
+    task, this function emits the full cross-board audit. The two together
+    let a reviewer answer both "does this task have a finding?" (rule) and
+    "what's the board-wide posture?" (this).
+
+    Empty list is the expected result today: the hub measured 0 rows across
+    5 boards over 30 days on 2026-09-28. Returns are read straight from
+    ``task_events`` / ``task_runs`` / ``tasks``; no heuristics.
+    """
+    rows = list(conn.execute(CROSS_PROFILE_COMPLETIONS_SQL).fetchall())
+    out: list[dict] = []
+    for row in rows:
+        # task_events.payload is JSON in TEXT; tolerate dict or str.
+        payload = row["payload"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload) or {}
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        out.append({
+            "ts": row["ts"],
+            "task_id": row["task_id"],
+            "title": row["title"],
+            "assignee": row["assignee"],
+            "run_profile": row["run_profile"],
+            "run_id": row["run_id"],
+            "actor": payload.get("actor"),
+            "actor_mismatch_run_profile": bool(payload.get("actor_mismatch_run_profile")),
+        })
+    return out
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -689,6 +855,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_cross_profile_completion,
 ]
 
 

@@ -693,6 +693,56 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cross_profile_closes(args: argparse.Namespace) -> int:
+    """Board-wide read-only audit of completed events whose closing
+    ``task_runs.profile`` is not the task's ``assignee``. Read straight off
+    ``task_events`` / ``task_runs`` / ``tasks``; never mutates state.
+
+    Carve-outs that *should* fall out of the join (verified before scoping
+    this card on 2026-09-28 — see kanban-workflow 'Cross-Profile Card
+    Closure'):
+
+    - Hub review approvals land via ``_synthesize_ended_run`` with profile =
+      task assignee, so the join does not match.
+    - Hub ``hub_bypass_done`` force-promotes + closes claimless; if a prior
+      worker run exists its profile is the assignee; if not, the synthesized
+      run's profile is the assignee. Either way the join does not match.
+    - A dispatcher-spawned worker closing its own assigned task has
+      ``r.profile == t.assignee``; join does not match.
+    - A never-claimed manual close (no run row) has ``r.profile IS NULL``;
+      filtered by the WHERE clause.
+
+    The expected result today is the empty list — the hub measured 0 rows
+    across 5 boards over 30 days on 2026-09-28. When this surface lights up,
+    treat the rows as findings and route them through the assignee for
+    acknowledgment.
+    """
+    from hermes_cli import kanban_diagnostics as kd
+    limit = int(getattr(args, "limit", 50) or 0)
+    with kbc.connect_closing() as conn:
+        rows = kd.board_cross_profile_completions(conn)
+    if limit > 0:
+        rows = rows[:limit]
+    if getattr(args, "json", False):
+        _print_json(rows)
+        return 0
+    if not rows:
+        print("No run-scoped cross-profile completions on this board.")
+        return 0
+    print(f"{len(rows)} run-scoped cross-profile completion(s):\n")
+    for row in rows:
+        title = row.get("title") or "(untitled)"
+        ts = row.get("ts") or "?"
+        actor = row.get("actor")
+        actor_mismatch = row.get("actor_mismatch_run_profile")
+        actor_str = f" actor={actor!r}" + (
+            " (mismatched run_profile)" if actor_mismatch else ""
+        ) if actor else " actor=<unattributed>"
+        print(f"  {ts}  {row['task_id']}  @{row['assignee']} <- @{row['run_profile']}{actor_str}")
+        print(f"    {title}")
+    return 0
+
+
 def _cmd_link(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         gated = kb.link_tasks(conn, args.parent_id, args.child_id)
@@ -874,6 +924,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    # Actor attribution: --as (explicit override; empty means "no actor") ->
+    # $HERMES_PROFILE -> active profile. None is recorded explicitly on the
+    # completed event so an unattributed close is auditable as such, never
+    # silently blank. A bare "" via --as is the explicit "no actor" choice.
+    raw_actor = getattr(args, "actor", None)
+    actor: Optional[str]
+    if raw_actor is not None:
+        actor = str(raw_actor).strip() or None
+    elif os.environ.get("HERMES_PROFILE"):
+        actor = os.environ["HERMES_PROFILE"].strip() or None
+    else:
+        actor = _profile_author()
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
@@ -888,7 +950,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        actor=actor)
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -1258,6 +1321,7 @@ _HANDLERS = {
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "cross-profile-closes": _cmd_cross_profile_closes,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
