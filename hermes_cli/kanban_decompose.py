@@ -25,6 +25,7 @@ from typing import Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_block_loop_guard as block_loop_guard
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
     _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
@@ -124,6 +125,21 @@ class DecomposeOutcome:
 def _profile_author() -> str:
     """Mirror of ``hermes_cli.kanban._profile_author``."""
     return _specify_author("decomposer")
+
+
+def _decompose_refusal_to_outcome(
+    task_id: str, state: block_loop_guard.BlockLoopState,
+) -> DecomposeOutcome:
+    """Translate a refused :class:`BlockLoopState` into a ``DecomposeOutcome``
+    so ``decompose_task`` can early-return. ``specify_task`` calls
+    :func:`hermes_cli.kanban_block_loop_guard.maybe_refuse` directly and
+    translates the same state into ``SpecifyOutcome`` — this helper lives
+    here only to keep the decompose-side early-return in one line."""
+    if state.block_kind == "<guard_error>":
+        return DecomposeOutcome(
+            task_id, False, "block_loop_active (guard error)",
+        )
+    return DecomposeOutcome(task_id, False, "block_loop_active")
 
 
 def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = None) -> str:
@@ -312,6 +328,19 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # Block-loop guard (see hermes_cli/kanban_block_loop_guard.py): the
+    # ``block_loop_detected`` -> triage route is meant for human ops, not for
+    # the decomposer to rewrite the same spec three more times. Refuse when
+    # the task is mid-loop and the operator has not re-engaged; surfaces a
+    # comment + structured event + throttled hub card so a poisoned task
+    # stops consuming LLM tokens.
+    refusal_author = author or _profile_author()
+    refusal_state = block_loop_guard.maybe_refuse(
+        task_id=task_id, surface="decompose", author=refusal_author,
+    )
+    if refusal_state is not None:
+        return _decompose_refusal_to_outcome(task_id, refusal_state)
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

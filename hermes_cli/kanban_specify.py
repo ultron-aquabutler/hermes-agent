@@ -21,6 +21,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_block_loop_guard as block_loop_guard
 
 from utils import env_int
 
@@ -199,6 +200,20 @@ def specify_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+
+    # Block-loop guard: shared with decompose_task (see
+    # hermes_cli/kanban_block_loop_guard.py). Refuse to re-spec a task whose
+    # most recent ``block_loop_detected`` is inside the lookback window and
+    # no human has commented / unblocked since — the LLM rewrite is the
+    # exact bug the spec-loop card was filed to fix.
+    refusal_author = author or _profile_author()
+    refusal_state = block_loop_guard.maybe_refuse(
+        task_id=task_id, surface="specify", author=refusal_author,
+    )
+    if refusal_state is not None:
+        if refusal_state.block_kind == "<guard_error>":
+            return SpecifyOutcome(task_id, False, "block_loop_active (guard error)")
+        return SpecifyOutcome(task_id, False, "block_loop_active")
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,

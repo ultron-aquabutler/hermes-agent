@@ -1944,6 +1944,24 @@ DEFAULT_CONFIG = {
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
+        # When a triage task was routed there by `block_loop_detected` (the
+        # unblock/re-block loop detector in kanban_db._route_block), refuse to
+        # call the decomposer LLM and emit a `decompose_refused` event + comment
+        # + throttled hub card instead. The decomposer used to silently
+        # re-spec the same card every dispatch tick (the spec-loop bug that
+        # surfaced t_832840f6). Flip to False to deliberately allow a
+        # re-decompose on a long-stale blocked card.
+        "auto_decompose_respect_block_loop": True,
+        # Symmetric knob for `hermes kanban specify` / the auto-specifier. Both
+        # defaults are ON; turn one off in isolation when only one of the two
+        # surfaces is causing a problem.
+        "auto_specify_respect_block_loop": True,
+        # Lookback window (seconds) for the most recent `block_loop_detected`
+        # event. A loop older than this falls off and the next LLM call
+        # proceeds normally; the operator can also extend this if a real
+        # blocker genuinely needs more than a day to clear. Default 24h
+        # matches operator intuition of "still blocked today".
+        "block_loop_lookback_seconds": 86400,
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,

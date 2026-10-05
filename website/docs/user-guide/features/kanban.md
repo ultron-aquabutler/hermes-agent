@@ -431,6 +431,35 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+:::note Why the auto-decomposer / auto-specifier stops re-touching a triage card
+The unblock-loop breaker sends the card to `triage`, but the *decomposer* and
+*specifier* used to read every triage card and call the LLM to re-write it on
+the next tick — restarting the spec-loop even though the underlying blocker
+was unchanged. A shared guard in `hermes_cli/kanban_block_loop_guard.py`
+short-circuits both surfaces before the LLM round-trip:
+
+  - If the task has no `block_kind` (organic triage) the guard is inactive —
+    the LLM call proceeds normally.
+  - If the most recent `block_loop_detected` event for the task's current
+    `block_kind` is within the lookback window
+    (`kanban.block_loop_lookback_seconds`, default 24h) AND no `commented`
+    / `unblocked` event has followed it, the call refuses:
+    `ok=False, reason='block_loop_active'`. No LLM call, no children
+    created, no promotion to `todo`.
+  - The refusal writes a comment, a structured `decompose_refused` /
+    `specify_refused` event, and one throttled
+    `assignee='default'` hub-triage card per task per 6 hours so the
+    per-tick cron does not file one every tick.
+
+Both knobs (`kanban.auto_decompose_respect_block_loop` and
+`kanban.auto_specify_respect_block_loop`) default to `True`; flip either
+to `False` to deliberately allow a re-spec on a long-stale blocked card.
+The guard fails closed — a DB or schema error during the check refuses
+the call rather than re-triggering the spec-loop. See
+`Hermes/Memory/Shared/2026-10-05-auto-decompose-block-loop-guard.md` for
+the full rationale.
+:::
+
 ## Enabling tools for a chat profile
 
 The Desktop Kanban plugin displays the board; it does not grant the chat agent
