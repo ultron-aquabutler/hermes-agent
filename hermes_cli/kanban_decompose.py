@@ -235,7 +235,23 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
 
 
 def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
-    """``fanout=false``: single-task spec promotion (same effect as specify)."""
+    """``fanout=false``: single-task spec promotion (same effect as specify).
+
+    The block-loop guard is checked again here — the early call at the top of
+    :func:`decompose_task` runs BEFORE we know whether the LLM reply is
+    fanout=true or fanout=false. The fanout=false branch then calls
+    :func:`hermes_cli.kanban_db.specify_triage_task` directly, which emits
+    the ``specified`` event and would bypass the guard's specify-side hook
+    if we did not re-check. Re-checking here closes the integration gap that
+    produced t_503815ed's spec-loop: a triage card routed by
+    ``block_loop_detected`` was being re-specified by the auto-decomposer's
+    fanout=false path even with the guard armed. See t_399f6b0a.
+
+    The re-check honours the same knob the early check did
+    (``auto_decompose_respect_block_loop``) so an operator who flipped the
+    decompose knob OFF for a long-stale blocked card does not get the fanout
+    branch re-refused via the specify knob.
+    """
     title_val, body_val = _title_body(parsed)
     assignee_val = None
     if not task.assignee:
@@ -244,6 +260,18 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         )
     if title_val is None and body_val is None:
         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
+    # Re-check the block-loop guard: the LLM round-trip we just spent may
+    # have taken long enough for a fresh ``block_loop_detected`` to land on
+    # the task (an agent or a per-tick procedure), and the fanout=false
+    # branch would otherwise write a ``specified`` event without the guard
+    # ever seeing it. Use the decompose surface so the decompose knob owns
+    # the decision (symmetric with the early check at the top of
+    # ``decompose_task``).
+    refusal_state = block_loop_guard.maybe_refuse(
+        task_id=task.id, surface="decompose", author=author,
+    )
+    if refusal_state is not None:
+        return _decompose_refusal_to_outcome(task.id, refusal_state)
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
@@ -324,7 +352,26 @@ def decompose_task(
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
+    as ``ok=False``.
+
+    Block-loop guard runs BEFORE the triage-status check (see t_399f6b0a):
+    a task can be mid ``block_loop_detected`` while parked in ``running``
+    (after the hub's auto-revert), in ``triage`` (the canonical route), or
+    briefly in any other state during the unblock/re-block race. The guard
+    refuses regardless of current status so the dispatcher cron cannot
+    re-spec the card via a sibling path while the human-input blocker is
+    still unresolved. ``_load_triage_task`` still rejects non-triage tasks
+    for the LLM round-trip — the early guard is only there to surface
+    ``block_loop_active`` for running cards the cron is asking us to
+    rewrite.
+    """
+    refusal_author = author or _profile_author()
+    refusal_state = block_loop_guard.maybe_refuse(
+        task_id=task_id, surface="decompose", author=refusal_author,
+    )
+    if refusal_state is not None:
+        return _decompose_refusal_to_outcome(task_id, refusal_state)
+
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
@@ -335,12 +382,8 @@ def decompose_task(
     # the task is mid-loop and the operator has not re-engaged; surfaces a
     # comment + structured event + throttled hub card so a poisoned task
     # stops consuming LLM tokens.
-    refusal_author = author or _profile_author()
-    refusal_state = block_loop_guard.maybe_refuse(
-        task_id=task_id, surface="decompose", author=refusal_author,
-    )
-    if refusal_state is not None:
-        return _decompose_refusal_to_outcome(task_id, refusal_state)
+    # (Re-checked in ``_apply_single`` because the fanout=false path bypasses
+    # this hook by routing through ``kb.specify_triage_task`` directly.)
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

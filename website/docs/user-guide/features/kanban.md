@@ -458,6 +458,16 @@ The guard fails closed — a DB or schema error during the check refuses
 the call rather than re-triggering the spec-loop. See
 `Hermes/Memory/Shared/2026-10-05-auto-decompose-block-loop-guard.md` for
 the full rationale.
+
+The guard runs **before the triage-status check** in both
+`decompose_task` and `specify_task` — so a card parked in `running` or
+`ready` after a `block_loop_detected` event (e.g. the hub's
+auto-revert path) returns `block_loop_active` rather than `"task is
+not in triage"`. This was the gap t_503815ed exposed: the
+auto-decomposer's `fanout=false` branch (single-task spec promotion)
+called `kanban_db.specify_triage_task` directly and emitted the
+`specified` event without going through the specify guard. The
+`_apply_single` re-check closes that integration gap.
 :::
 
 ## Enabling tools for a chat profile

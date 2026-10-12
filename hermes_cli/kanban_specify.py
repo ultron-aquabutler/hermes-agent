@@ -196,11 +196,15 @@ def specify_task(
 ) -> SpecifyOutcome:
     """Specify one triage task and promote it to ``todo``. Expected failures
     (not in triage, no aux client, API error, malformed reply) surface as
-    ``ok=False`` so an ``--all`` sweep continues."""
-    task, reason = _load_triage_task(task_id)
-    if task is None:
-        return SpecifyOutcome(task_id, False, reason)
+    ``ok=False`` so an ``--all`` sweep continues.
 
+    Block-loop guard runs BEFORE the triage-status check (see t_399f6b0a):
+    a task can be mid ``block_loop_detected`` while parked in ``running``
+    (after the hub's auto-revert), in ``triage`` (the canonical route), or
+    briefly in any other state during the unblock/re-block race. The guard
+    refuses regardless of current status so the auto-specify cron cannot
+    re-spec the card while the human-input blocker is still unresolved.
+    """
     # Block-loop guard: shared with decompose_task (see
     # hermes_cli/kanban_block_loop_guard.py). Refuse to re-spec a task whose
     # most recent ``block_loop_detected`` is inside the lookback window and
@@ -214,6 +218,10 @@ def specify_task(
         if refusal_state.block_kind == "<guard_error>":
             return SpecifyOutcome(task_id, False, "block_loop_active (guard error)")
         return SpecifyOutcome(task_id, False, "block_loop_active")
+
+    task, reason = _load_triage_task(task_id)
+    if task is None:
+        return SpecifyOutcome(task_id, False, reason)
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,

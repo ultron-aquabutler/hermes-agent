@@ -3,6 +3,9 @@ title: "FIX: auto-decompose / auto-specify must not re-spec on a recent block_lo
 created: 2026-10-05
 task: t_832840f6
 hub_card: t_2746e801
+extends: t_832840f6
+extension_task: t_399f6b0a
+extension_hub_card: t_503815ed
 status: shipped
 tags: [kanban, dispatcher, decomposer, specifier, block-loop, fix]
 ---
@@ -169,3 +172,117 @@ continue to pass.
 - `hermes_cli/kanban_db.py:_route_block` — the unblock-loop detector that
   the guard is the propagation partner for.
 - `website/docs/user-guide/features/kanban.md` — user-facing docs.
+
+---
+
+## Extension (t_399f6b0a) — Running-card coverage + fanout=false re-check
+
+Shipped in commit `a5929ad89c...` follow-up on branch
+`fix/running-card-block-loop-guard-t_399f6b0a` (still on branch, not yet
+on `main`).
+
+### Observation
+
+`t_503815ed` (the durable gate card holding the 4 denisew Syncthing
+children non-claimable) accumulated 5+ `block_loop_detected` events and
+5+ `specified` events in a single hour on 2026-10-12 — the spec-loop
+reached a new layer. The original `t_832840f6` spec assumed the spec-loop
+only hits `triage` cards; in practice the auto-decomposer was also
+re-writing a `running`/`ready` card via the dispatcher cron path.
+
+### Two bugs were conflated
+
+**Bug A — integration gap on the `fanout=false` branch.**
+
+`kanban_decompose.decompose_task` (`hermes_cli/kanban_decompose.py:248`)
+calls `kb.specify_triage_task` directly when the LLM replies with
+`fanout=false` (single-task spec promotion). That call path emits the
+`specified` event WITHOUT going through `kanban_specify.specify_task`,
+so the early guard hook at the top of `decompose_task` could refuse but
+the fanout=false branch would still emit the `specified` event with the
+loop active. On `t_503815ed` the dispatch cron hit this branch every tick.
+
+**Bug B — guard ran AFTER the status gate.**
+
+The original ordering was `_load_triage_task` → `maybe_refuse`. So a
+`running`/`ready` card (the status the dispatcher cron was given) returned
+`"task is not in triage"` BEFORE the guard got a look at it. The task
+body explicitly required `decompose_task` and `specify_task` to return
+`block_loop_active` for a running card with active block-loop.
+
+### Fix
+
+**Bug A: re-check inside `_apply_single`.**
+
+`hermes_cli/kanban_decompose.py:_apply_single` now calls
+`block_loop_guard.maybe_refuse(surface="decompose", ...)` again
+immediately before calling `kb.specify_triage_task`. The re-check uses
+`surface="decompose"` so the `auto_decompose_respect_block_loop` knob
+owns the decision (an operator who flipped the decompose knob OFF for a
+long-stale blocked card does not get the fanout branch re-refused via
+the specify knob). The re-check writes a `decompose_refused` event and
+the same throttled hub card as the early guard.
+
+**Bug B: reorder both entry points.**
+
+`decompose_task` and `specify_task` now call `maybe_refuse(...)` BEFORE
+`_load_triage_task`. The triage-status gate still rejects non-triage
+tasks for the LLM round-trip — the early guard exists to give a running
+card a clean `block_loop_active` refusal instead of `"task is not in
+triage"`. The `running`/`ready`/`triage` distinction does not change
+the guard's logic — `check_block_loop` is status-agnostic — but it
+means the guard refusal surfaces on the right surface for the caller.
+
+### Tests added
+
+6 new tests in `tests/hermes_cli/test_kanban_block_loop_guard.py`:
+
+- `test_running_card_refused_by_decompose` and
+  `test_running_card_refused_by_specify` — acceptance criterion 1.
+  Running card with active loop, no follow-up `commented`/`unblocked`,
+  both surfaces return `block_loop_active`. Kept in separate functions
+  so the decompose-side refusal comment doesn't release the guard for
+  the specify-side caller.
+- `test_fanout_false_decompose_path_also_refuses` — the bug-A integration
+  gap. Loop event is placed at the moment between the early guard and the
+  fanout-write step (simulates a fresh `block_loop_detected` landing
+  during the LLM round-trip). Outcome `block_loop_active`, no
+  `specified` event, `decompose_refused` event recorded.
+- `test_fanout_true_decompose_still_refuses_via_early_guard` — symmetric
+  guard coverage for the fanout=true path; the early guard refuses
+  before any LLM call, no children are created.
+- `test_running_card_proceeds_when_operator_unblocked` — `unblocked`
+  event after the loop is re-engagement; guard stays inactive even on
+  a `running` card. Documents the symmetric release path.
+- `test_running_card_guard_active_against_running_status` — the guard
+  module itself returns `active=True` for a `running` card with
+  `block_kind` set; this is the load-bearing assertion for
+  `decompose_task`/`specify_task` to translate it.
+
+### Dispatch-pump integration note
+
+The auto-decompose cron path (`gateway/kanban_watchers_dispatcher.py:
+auto_decompose_tick`) calls `decompose_task(tid)` per task in
+`list_triage_ids()`. With this fix in place:
+
+- A card transitioning from `running` → `triage` via
+  `block_loop_detected` is enumerated by `list_triage_ids()` on the
+  next tick. The early guard refuses; no LLM round-trip; no children
+  created; one throttled hub card.
+- A card staying in `running`/`ready` (e.g. t_503815ed after the
+  hub's auto-revert, where the `unblocked` event flipped it back) is
+  NOT enumerated by `list_triage_ids()` (status filter) — but if a
+  future cron path DOES hand the dispatcher a running task (e.g. a
+  per-tick Vision worker calling `decompose_task` directly), the early
+  guard refuses it BEFORE the status gate. That is the second layer
+  this commit adds.
+
+### Out of scope (unchanged from a5929ad89c)
+
+- No change to `BLOCK_RECURRENCE_LIMIT` (the detection threshold is
+  fine).
+- No change to `kanban_decompose._SYSTEM_PROMPT` rules.
+- No change to the cron-unblock re-block path.
+- The 4 denisew children of `t_503815ed` stay held via the structural
+  parent-child gate; this card does not unblock them — only the
+  operator-merge-to-main + Bryan iMac handoff can do that.
