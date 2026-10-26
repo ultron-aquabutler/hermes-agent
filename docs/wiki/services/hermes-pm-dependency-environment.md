@@ -53,9 +53,10 @@ Resolution chain at process boot (`pm/environments.py::activate_dependencies`):
 1. `install_state_dir(project_root)` — `<installs>/<install_key(project_root)>`.
 2. If that directory exists → read `facts.json` → the recorded generation is selected,
    under the install's runtime lock.
-3. If it does **not** exist → a sealed payload's own venv, else the process keeps whatever
-   packages it booted with — and a bare store Python (which owns no dependencies) **refuses**
-   with `no dependency environment is committed for this install`.
+3. If it does **not** exist → a linked worktree borrows its owner's committed generation
+   (the code-level borrow); otherwise a sealed payload's own venv, else the process keeps
+   whatever packages it booted with — and a bare store Python (which owns no dependencies)
+   **refuses** with `no dependency environment is committed for this install`.
 
 ### The install key is the checkout path
 
@@ -82,6 +83,11 @@ print(install_key(Path('/home/serveradmin/.hermes/hermes-agent')))"
 python3 -c "import sys; sys.path.insert(0,'/home/serveradmin/.hermes/hermes-agent'); \
 from pathlib import Path; from pm.environments import worktree_owner_root; \
 print(worktree_owner_root(Path('<worktree-path>')))"
+
+# Does this checkout BORROW another install's generation?
+python3 -c "import sys; sys.path.insert(0,'/home/serveradmin/.hermes/hermes-agent'); \
+from pathlib import Path; from pm.environments import borrowed_install_owner; \
+print(borrowed_install_owner(Path('<checkout>')))"
 ```
 
 ### Health check
@@ -159,11 +165,14 @@ must select a committed generation, or PM refuses rather than run on whatever
    ```
 
    - **WORKTREE** → the worktree has no install state of its own. It must **borrow the owner
-     checkout's committed generation**. As of 2026-10-26 this is automatic (`pm/environments.py`
-     `worktree_owner_root` + the borrowed-activation path) **provided the worktree's branch
-     contains that fix**. If the worktree's branch predates it, merge/rebase the fix into
-     that branch — the fix must live in the code the worker *imports*, which is the
-     worktree's own checkout (see below).
+     checkout's committed generation**. As of 2026-10-26 this is automatic at two layers, so
+     it works whether or not the worktree's branch carries the fix:
+     - **the code-level borrow** (`pm/environments.py` `worktree_owner_root` + the
+       borrowed-activation path) — the worktree's own `pm` resolves the owner's generation;
+     - **the data-level borrow** (`pm/environments.py` `provision_borrowed_install_state`,
+       called by the kanban dispatcher before it spawns the worker) — the worktree's install
+       state is written to point at the owner's generation, which an older `pm` reads like
+       any other selection record.
    - **main checkout** → continue to step 2.
 
 2. Does `~/.hermes/installs/<install_key>/facts.json` exist?
@@ -179,9 +188,50 @@ must select a committed generation, or PM refuses rather than run on whatever
      (or `hermes pm repair`) *from that checkout*.
    - **present but `packages.venv.environment` is null** → the install has a record but no
      committed generation. Same remedy: `hermes pm repair` from that checkout.
+   - **present, and `packages.venv` names a generation under ANOTHER install's
+     `environments/`** → this checkout borrows. See "Borrowed install state" below.
 
 3. `packages.venv.environment` points at a tree that no longer exists → the generation was
    collected or the record is stale. `hermes pm repair` from that checkout.
+
+### Borrowed install state
+
+A linked worktree borrows the owner checkout's committed generation. Two shapes of that
+borrow exist, and both resolve to the same tree — the same interpreter, the same
+dependencies, one lease directory:
+
+| Layer | Written by | Where it lives | Reaches |
+|---|---|---|---|
+| Code-level | the worktree's own `pm` at boot | nowhere (nothing is written) | worktrees whose branch carries the fix |
+| Data-level | the dispatcher, before spawning the worker | `~/.hermes/installs/<worktree-key>/` | every worktree, whatever `pm` it carries |
+
+The data-level borrow is two entries under the worktree's install key:
+
+```
+~/.hermes/installs/<worktree-key>/
+├── environments -> ~/.hermes/installs/<owner-key>/environments   # symlink
+└── facts.json                                                     # names the owner's generation
+```
+
+The symlink is what makes the borrow legible to an older `pm`: `_recorded_venv` resolves
+the recorded generation and requires it to sit under `<install>/environments`, and with
+the symlink both sides resolve into the owner's tree.
+
+`facts.json` carries one extra key, `packages.venv.borrowed_from`, naming the owner
+checkout. It is what `borrowed_install_owner()` reads, and it is what lets PM refuse to
+build into a borrowed tree (see below).
+
+**A borrowed checkout must not sync its own dependencies.** A sync would write a new
+generation into the OWNER's `environments/` directory — and the owner's collector would
+later delete it as unreferenced. `pm/packages.py` refuses it:
+
+```
+venv: this checkout borrows the dependency environment of /home/serveradmin/.hermes/hermes-agent;
+run `hermes pm install` in /home/serveradmin/.hermes/hermes-agent instead
+```
+
+Sync the OWNER checkout instead; the worktree picks the new generation up on its next
+boot.
 
 ### Why the worker's *own* checkout wins over the dispatcher's pin
 
@@ -204,7 +254,8 @@ case.
 
 Practical consequence: **a fix to PM only helps a worktree if the fix is in the worktree's
 own branch.** Fixing the owner checkout alone changes nothing for a worker that imports
-from the worktree.
+from the worktree — which is why the borrow is written as DATA as well as code: the
+dispatcher writes the data-level borrow, so the worktree boots whatever `pm` it carries.
 
 ### `hermes pm doctor` reports the install as damaged
 
@@ -260,7 +311,12 @@ Note pip's own ordering rule: `--python` must come **before** the subcommand
 | `.worktrees/t_15748fe5` | `949d9d29ac8b8fd7` | no |
 
 **Ten worktrees had no install state.** The path prefix `202****0901` in older notes is a
-redaction of the build date; the real directory is `python-3.14.7+20260901-linux-x64`.
+redaction of the build date; the real directory is `python-3.14.7+202****0901-linux-x64`.
+
+Since the fix, a worktree that has no state of its own gets the **data-level borrow** the
+first time the dispatcher spawns a worker for it: `installs/<worktree-key>/environments`
+becomes a symlink into the owner's tree, and `installs/<worktree-key>/facts.json` names the
+owner's generation. A worktree with a state of its own keeps it.
 
 ## Dependencies & Topology
 
@@ -288,5 +344,9 @@ service, no port, no VLAN.
 - [[Homelab/50-Agent-Memory/Friday/index|Friday — Memory Index]] — Friday's durable lessons.
 - `pm/environments.py` in `ultron-aquabutler/hermes-agent` — the implementation.
 - `tests/pm/test_worktree_install_state.py` — the behaviour contract for worktree borrowing.
+- `tests/pm/test_worktree_borrowed_install_state.py` — the behaviour contract for the
+  data-level borrow and the refusal to build into one.
+- `tests/hermes_cli/test_kanban_worker_worktree_install_state.py` — the dispatcher's
+  provisioning of that borrow.
 - Kanban `t_boot_defect_619cbb` — the fix card; `t_86e4721f` comment 6897 — the original
   root-cause write-up.

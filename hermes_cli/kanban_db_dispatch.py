@@ -2837,6 +2837,44 @@ def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
     pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
 
 
+def _provision_worktree_install_state(task: Task, workspace: str) -> None:
+    """Give a worktree worker the dependency environment its worktree lacks.
+
+    A worktree worker imports ``hermes_cli`` from its OWN worktree: for
+    ``python -m``, ``sys.path[0]`` is the cwd, and the cwd outranks the pinned
+    ``PYTHONPATH``. The install key hashes the checkout path, so the worktree is a
+    distinct install with no ``facts.json`` of its own, and PM's store Python --
+    which owns no dependencies -- refuses the process: "no dependency environment is
+    committed for this install". The worker dies before it does any work
+    (t_boot_defect_619cbb; ~64 burned spawns on the isolation probe).
+
+    Two layers close that, and this is the one that reaches a worktree cut before
+    the other:
+
+    * the CODE-level borrow -- the worktree's own ``pm`` resolves its owner's
+      committed generation -- which only a worktree carrying that fix has;
+    * the DATA-level borrow written HERE, by the dispatcher, which works whatever
+      ``pm`` the worktree carries: the worktree's install state points at the
+      owner's generation.
+
+    Never fatal: a worktree that cannot be provisioned still starts, and fails at
+    boot with PM's own message -- which is the behaviour this fixes, not a worse one.
+    """
+    if getattr(task, "workspace_kind", None) != "worktree":
+        return
+    if not workspace:
+        return
+    root = Path(workspace)
+    if not root.is_dir():
+        return
+    try:
+        from pm.environments import provision_borrowed_install_state
+
+        provision_borrowed_install_state(root)
+    except Exception as exc:  # pragma: no cover - a failed provision is not a failed dispatch
+        logger.warning("kanban worker: could not provision install state for %s: %s", root, exc)
+
+
 def _absolute_hermes_path(path: str) -> str:
     """Return an absolute filesystem path for a resolved Hermes shim."""
     expanded = os.path.expanduser(path)
@@ -3263,6 +3301,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
+    # A worktree worker imports hermes_cli from its OWN worktree (sys.path[0] is the
+    # cwd, and cwd outranks the pinned PYTHONPATH). A worktree cut before the pm
+    # borrow fix therefore resolves an install key with no facts.json, and PM's store
+    # Python refuses the process: "no dependency environment is committed for this
+    # install" -- the worker dies before it does any work (t_boot_defect_619cbb).
+    # Provision the borrow as DATA so the worker boots whatever pm its worktree
+    # carries.
+    _provision_worktree_install_state(task, workspace)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

@@ -398,13 +398,25 @@ class Venv(StatePackage):
         is left out (the caller reports it) instead of refusing the whole graph.
         """
         import uuid
-        from pm.environments import install_state_dir, runtime_facts_path
+        from pm.environments import borrowed_install_owner, install_state_dir, runtime_facts_path
         from pm.environment import managed_environment
         from pm.lock import Facts
         from pm.native_build import source_build_environment
         from pm.workspace import enabled_member_dirs, lock_and_sync
 
         project = self.project_root()
+        owner = borrowed_install_owner(project)
+        if owner is not None:
+            # This install borrows the owner's committed generation; its ``environments``
+            # is a symlink into the owner's tree. Building here would write a generation
+            # into the OWNER's tree -- and the owner's collector would later delete it as
+            # unreferenced. A borrowed install has no tree of its own to build into:
+            # sync the owner instead.
+            raise InstallError(
+                self.name,
+                f"this checkout borrows the dependency environment of {owner}; "
+                f"run `hermes pm install` in {owner} instead",
+            )
         generation = install_state_dir(project) / "environments" / uuid.uuid4().hex
         candidate = generation / "venv"
         environment = managed_environment(candidate, env=source_build_environment(project),
