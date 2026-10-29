@@ -2426,14 +2426,32 @@ def _claim_and_open_run(
     *, event_extra: Optional[dict] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn.
+
+    ``started_at`` is set to ``now`` on EVERY claim, not preserved
+    across claims. It marks the start of the CURRENT run, and it must
+    agree with the ``task_runs`` row this call opens (same ``now``).
+
+    It used to be ``COALESCE(started_at, ?)`` — set only when NULL.
+    Because ``started_at`` was written once at task creation and never
+    cleared, that made every re-claim of an old card keep its original
+    creation timestamp. A card first claimed on day 1 and re-claimed on
+    day 38 still reported ``started_at`` = day 1.
+
+    Downstream that was actively harmful: Mission Control's
+    ``card_stuck_4h`` detector measures run age from
+    ``COALESCE(started_at, created_at)``, so such a card satisfied
+    "running for more than 4h" the instant it was claimed, no matter
+    how fresh its heartbeat was. It produced 57 critical Telegram
+    alerts in 24h across 19 cards on 2026-10-29.
+    """
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+               started_at    = ?
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
