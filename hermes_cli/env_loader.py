@@ -122,6 +122,19 @@ def get_secret_source(env_var: str) -> str | None:
     return _SECRET_SOURCES.get(env_var)
 
 
+def _profile_dotenv_values(home_path: Path) -> dict[str, str]:
+    """Return this profile's explicit ``.env`` values for source-precedence handling.
+
+    ``_hydrate_profile_secret_sources`` already makes the profile's own ``.env`` win over
+    a cluster-level source. The process-global path must use the same precedence: a shared
+    helper can return a sibling's Telegram token, and ``override_existing: true`` must not
+    replace the identity explicitly configured by this profile.
+    """
+    from agent.secret_scope import load_env_file
+
+    return load_env_file(Path(home_path) / ".env")
+
+
 def _record_supplied_names(report) -> set[str]:
     """Every name *report*'s sources supplied — applied, or skipped because a value already existed —
     recorded into ``_SOURCE_SUPPLIED_NAMES`` so the routed-child scrub knows the source owns it."""
@@ -694,56 +707,62 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     if active is not None:
         _revoke_secret_source_writes(home_path, keep=lambda _name, source: source in active)
     environ_before = dict(os.environ)
+    profile_env = _profile_dotenv_values(home_path)
 
     try:
         report = apply_all(cfg, home_path)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
+        os.environ.update(profile_env)
         return
 
-    if not report.sources:  # no source enabled: keep retrying cheaply so flipping one on takes effect
-        return
+    try:
+        if not report.sources:  # no source enabled: keep retrying cheaply so flipping one on takes effect
+            return
 
-    # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
-    # startup don't re-fetch / re-print (error retries are opt-in via reset_secret_source_cache()).
-    # Marking AFTER the attempt keeps the earlier failure paths retryable.
-    _APPLIED_HOMES.add(home_key)
+        # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
+        # startup don't re-fetch / re-print (error retries are opt-in via reset_secret_source_cache()).
+        # Marking AFTER the attempt keeps the earlier failure paths retryable.
+        _APPLIED_HOMES.add(home_key)
 
-    if report.applied_any:
-        _sanitize_loaded_credentials()  # vault values carry the same copy-paste corruption risk as .env
-        for name, applied in report.provenance.items():
-            _SECRET_SOURCES[name] = applied.source
+        if report.applied_any:
+            _sanitize_loaded_credentials()  # vault values carry the same copy-paste corruption risk as .env
+            for name, applied in report.provenance.items():
+                _SECRET_SOURCES[name] = applied.source
 
-    # Snapshot EVERY name a source supplied, not just the newly applied ones. A name the source supplied
-    # but the pre-existing process value won (``skipped_existing``) is still this home's effective value
-    # for it — and on the unscoped path os.environ IS this home's environment. Skipping those names
-    # latched an EMPTY snapshot whenever the key was already in the env: after the first cron/plugin
-    # re-pull (the previous apply's own write-back shadows every key) or from boot under systemd
-    # ``EnvironmentFile=``. Under multiplex the scope is the only credential source, so an empty
-    # snapshot failed every default-profile turn for the process lifetime (#102041).
-    values: dict[str, str] = {}
-    supplied = _record_supplied_names(report)
-    for name in supplied:
-        if name in os.environ:
-            values[name] = os.environ[name]
-    _record_secret_source_writes(home_key, report, supplied, environ_before)
-    if values:
-        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
-    _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
-        n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
+        # Snapshot EVERY name a source supplied, not just the newly applied ones. A name the source supplied
+        # but the pre-existing process value won (``skipped_existing``) is still this home's effective value
+        # for it — and on the unscoped path os.environ IS this home's environment. Names explicitly defined
+        # by this profile's .env keep that value, matching the routed hydration path.
+        values: dict[str, str] = {}
+        supplied = _record_supplied_names(report)
+        for name in supplied:
+            if name in profile_env:
+                values[name] = profile_env[name]
+            elif name in os.environ:
+                values[name] = os.environ[name]
+        _record_secret_source_writes(home_key, report, supplied, environ_before)
+        if values:
+            _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
+            n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
 
-    for src in report.sources:
-        if src.applied:
-            print(f"  {src.label}: applied {len(src.applied)} "
-                  f"secret{'s' if len(src.applied) != 1 else ''}", file=sys.stderr)
-        if src.result.error:
-            print(f"  {src.label}: {src.result.error}", file=sys.stderr)
-            hint = _remediation_hint(src.name, src.result.error_kind, cfg, scope=home_key)
-            if hint:
-                print(f"  {src.label}: → {hint}", file=sys.stderr)
-        for warn in src.result.warnings:
-            print(f"  {src.label}: {warn}", file=sys.stderr)
-    for conflict in report.conflicts:
-        print(f"  Secret sources: {conflict}", file=sys.stderr)
+        for src in report.sources:
+            if src.applied:
+                print(f"  {src.label}: applied {len(src.applied)} "
+                      f"secret{'s' if len(src.applied) != 1 else ''}", file=sys.stderr)
+            if src.result.error:
+                print(f"  {src.label}: {src.result.error}", file=sys.stderr)
+                hint = _remediation_hint(src.name, src.result.error_kind, cfg, scope=home_key)
+                if hint:
+                    print(f"  {src.label}: → {hint}", file=sys.stderr)
+            for warn in src.result.warnings:
+                print(f"  {src.label}: {warn}", file=sys.stderr)
+        for conflict in report.conflicts:
+            print(f"  Secret sources: {conflict}", file=sys.stderr)
+    finally:
+        # ``override_existing: true`` must not let a cluster-wide source replace a credential this
+        # profile explicitly owns. Restore even if a later bookkeeping/status step fails.
+        os.environ.update(profile_env)
 
 
 def _record_secret_source_writes(home_key: str, report, supplied: set[str], environ_before: dict) -> None:

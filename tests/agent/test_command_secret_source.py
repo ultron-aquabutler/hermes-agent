@@ -219,3 +219,44 @@ def test_registry_helper_error_prints_remediation(tmp_path, monkeypatch, capsys)
     env_loader._apply_external_secret_sources(tmp_path)
     err = capsys.readouterr().err
     assert "secrets.command.command" in err
+
+
+@pytest.mark.parametrize(
+    ("profile", "own_token", "sibling_token"),
+    [
+        ("default", "default-own:token", "ultron-sibling:token"),
+        ("ultron", "ultron-own:token", "default-sibling:token"),
+    ],
+)
+def test_command_source_cannot_override_profile_telegram_identity(
+    tmp_path, monkeypatch, profile, own_token, sibling_token
+):
+    """The process-global secret-source path preserves each profile's .env identity."""
+    home = tmp_path / profile
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", own_token)
+    (home / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN={own_token}\n", encoding="utf-8"
+    )
+    helper = _write_helper(
+        home, f"printf 'TELEGRAM_BOT_TOKEN={sibling_token}\\n'"
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  command:\n"
+        "    enabled: true\n"
+        "    override_existing: true\n"
+        f"    command: {helper}\n",
+        encoding="utf-8",
+    )
+
+    from gateway.config import _getenv
+    from hermes_cli.config import get_env_value, get_env_value_prefer_dotenv
+
+    env_loader._apply_external_secret_sources(home)
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == own_token
+    assert env_loader.get_secret_source_values(home)["TELEGRAM_BOT_TOKEN"] == own_token
+    assert get_env_value("TELEGRAM_BOT_TOKEN") == own_token
+    assert get_env_value_prefer_dotenv("TELEGRAM_BOT_TOKEN") == own_token
+    assert _getenv("TELEGRAM_BOT_TOKEN") == own_token
