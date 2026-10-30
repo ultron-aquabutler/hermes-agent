@@ -245,14 +245,27 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
 
 def _telegram_format(message):
     """``(formatted, parse_mode, has_html)``: text already containing HTML tags is sent as
-    HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``."""
+    HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``.
+
+    The HTML detection is the SHARED helper (``telegram_format.has_html_tags``), the
+    same one the gateway reply path uses — so the two paths cannot diverge again.
+    Previously this path used its own copy of a looser regex
+    (``<[a-zA-Z/][^>]*>``), which misfired on prose containing '<' (e.g. ``a < b``)
+    and on unknown tags (e.g. ``x <y> z``, which Telegram would reject with a 400
+    because ``<y>`` is not a supported tag).
+    """
     from telegram.constants import ParseMode
-    if re.search(r'<[a-zA-Z/][^>]*>', message):
-        return message, ParseMode.HTML, True
+    try:
+        from plugins.platforms.telegram.telegram_format import has_html_tags
+    except ImportError:
+        return message, ParseMode.MARKDOWN_V2, False  # helper unavailable: send as-is
+    if has_html_tags(message):
+        from plugins.platforms.telegram.telegram_format import escape_html_text
+        return escape_html_text(message), ParseMode.HTML, True
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter
         return TelegramAdapter.__new__(TelegramAdapter).format_message(message), ParseMode.MARKDOWN_V2, False
-    except Exception:
+    except (ImportError, AttributeError):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 

@@ -24,6 +24,20 @@ from gateway.platforms._shared import (
     platform_gate_env as _scoped_gate_env,
 )
 
+# Shared send-format detection (HTML vs Markdown). Imported here so the gateway
+# reply path and the ``_send_telegram`` tool use ONE detection routine and cannot
+# drift apart again. The MarkdownV2 escaper and the markdown->MarkdownV2
+# conversion live in the same module, so the adapter stays a thin caller.
+# See plugins/platforms/telegram/telegram_format.py.
+from plugins.platforms.telegram.telegram_format import (
+    _MDV2_ESCAPE_RE as _re_escape_mdv2,
+    escape_html_text as _escape_html_text,
+    escape_markdownv2 as _escape_markdownv2,
+    has_html_tags as _has_html_tags,
+    markdown_to_markdownv2 as _markdown_to_markdownv2,
+    strip_html_tags as _strip_html,
+)
+
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
@@ -369,13 +383,27 @@ def check_telegram_requirements() -> bool:
     return True
 
 
-# Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
-_MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
-
-
-def _escape_mdv2(text: str) -> str:
-    """Escape Telegram MarkdownV2 special characters with a preceding backslash."""
-    return _MDV2_ESCAPE_RE.sub(r'\\\1', text)
+# Every char MarkdownV2 requires backslash-escaped outside code spans/fences, and the
+# escaper itself, now live in telegram_format.py — the shared send-format module that
+# also owns the HTML-vs-Markdown decision. They are re-exported here so the existing
+# ``from ...adapter import _escape_mdv2`` importers keep working.
+#
+# NOTE: '<' is deliberately NOT in that character class. Telegram's MarkdownV2 reserved
+# set is ``_*[]()~`>#+-=|{}.!`` — it contains '>' but NOT '<'. The escaper is therefore
+# technically correct as written.
+#
+# DO NOT "fix" this by adding '<'. That is NOT the bug behind hand-written '<b>'
+# showing up as literal tags in a gateway reply. The escaper escapes the '>' of
+# '</b>' and leaves the '<' alone, so Telegram renders '<b\\>Bold</b\\>' — the
+# user sees the raw tags. The real defect was the MISSING HTML DETECTION in the
+# reply path (the reply path hard-coded ParseMode.MARKDOWN_V2 with no tag
+# sniff, while the _send_telegram tool sniffed for tags and switched to HTML).
+# That is fixed in ``telegram_format.has_html_tags`` + ``TelegramAdapter.format_for_send``.
+# Escaping '<' would only hide the tags; it would also corrupt legitimate
+# Markdown output (e.g. a code block containing '<html>' would gain a stray
+# backslash). See telegram_format.py for the full case table.
+_MDV2_ESCAPE_RE = _re_escape_mdv2
+_escape_mdv2 = _escape_markdownv2
 
 
 def _strip_mdv2(text: str) -> str:
@@ -399,8 +427,11 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
+# convert_table_to_bullets is re-exported for the existing importers (and the adapter's own
+# markdown->MarkdownV2 conversion, which now lives in telegram_format.py, uses it there).
 from gateway.platforms.helpers import (
-    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, convert_table_to_bullets as _wrap_markdown_tables)
+    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns,
+    convert_table_to_bullets as _wrap_markdown_tables)
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
@@ -3718,23 +3749,32 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any]):
-        """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+    async def _send_chunk_markdown_or_plain(
+        self, chunk: str, send_kwargs: Dict[str, Any], parse_mode: Any = ParseMode.MARKDOWN_V2):
+        """Send one chunk with *parse_mode*; on a parse/markdown rejection resend as plain text.
+
+        ``parse_mode`` is ``ParseMode.HTML`` when the message carried real HTML tags
+        and ``ParseMode.MARKDOWN_V2`` otherwise. The plain-text fallback strips
+        whichever markup was in play, so a rejected HTML message still reaches the
+        user as readable text rather than dropping out entirely.
+        """
         try:
             return await _await_with_thread_deadline(
-                self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
+                self._bot.send_message(text=chunk, parse_mode=parse_mode, **send_kwargs),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         except Exception as md_error:
             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                logger.warning("[%s] %s parse failed, falling back to plain text: %s", self.name, parse_mode, md_error)
+                plain = _strip_mdv2(chunk) if parse_mode == ParseMode.MARKDOWN_V2 else _strip_html(chunk)
                 return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
+                    self._bot.send_message(text=plain, parse_mode=None, **send_kwargs),
                     timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
             raise
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple,
+        parse_mode: Any = ParseMode.MARKDOWN_V2):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3755,7 +3795,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs, parse_mode=parse_mode), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3931,14 +3971,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            formatted, send_parse_mode = self.format_for_send(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                    for chunk in chunks
-               ]
-            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
+                # truncate_message appends a raw " (1/2)" suffix. In MarkdownV2 the
+                # parentheses are special and must be escaped; in HTML mode they are
+                # literal, so the raw form is correct.
+                if send_parse_mode == ParseMode.MARKDOWN_V2:
+                    chunks = [
+                        _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
+                        for chunk in chunks
+                    ]
+                else:
+                    chunks = [_separate_chunk_indicator_from_fence(chunk) for chunk in chunks]
+            return await self._send_chunks(
+                chat_id, chunks, delivered, reply_to, metadata, error_types, parse_mode=send_parse_mode)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
@@ -3964,17 +4011,23 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     async def _send_chunks(
         self, chat_id: str, chunks: List[str], delivered: List[str], reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]], error_types: tuple) -> SendResult:
+        metadata: Optional[Dict[str, Any]], error_types: tuple,
+        parse_mode: Any = ParseMode.MARKDOWN_V2) -> SendResult:
         """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
         (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
-        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
+        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result.
+
+        ``parse_mode`` is the Telegram parse mode the chunks were formatted for
+        (``ParseMode.HTML`` for a message that carried real HTML tags, else
+        ``ParseMode.MARKDOWN_V2``)."""
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
         for chunk in chunks:
             outcome = await self._send_chunk_with_retries(
-                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types,
+                parse_mode=parse_mode)
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
@@ -4064,11 +4117,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         await _await_with_thread_deadline(
             self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
-    async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
-        """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
-        skip further work); the fallback edit's exceptions propagate."""
+    async def _edit_markdown_or_plain(
+        self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str,
+        parse_mode: Any = ParseMode.MARKDOWN_V2,
+    ) -> bool:
+        """Edit with *parse_mode* and a plain-text fallback. Returns True on a "not modified" no-op
+        (caller may skip further work); the fallback edit's exceptions propagate.
+
+        ``parse_mode`` is ``ParseMode.HTML`` when the edited content carried real HTML
+        tags, else ``ParseMode.MARKDOWN_V2`` — the same decision the send path makes.
+        """
         try:
-            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2)
+            await self._edit_text(chat_id, message_id, formatted, parse_mode)
         except Exception as fmt_err:
             if "not modified" in str(fmt_err).lower():
                 return True
@@ -4146,9 +4206,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
+            formatted, edit_parse_mode = self.format_for_send(content)
+            plain = (_strip_mdv2(content) if edit_parse_mode == ParseMode.MARKDOWN_V2
+                     else _strip_html(formatted)) if content else content
             await self._edit_markdown_or_plain(
-                chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
-                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+                chat_id, message_id, formatted, plain,
+                "[%s] MarkdownV2 edit failed, falling back to plain text: %s", parse_mode=edit_parse_mode)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -4226,13 +4289,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         for use_markdown in (True, False) if finalize else (False,):
             try:
                 if use_markdown:
-                    text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
+                    formatted, cont_parse_mode = self.format_for_send(chunk)
+                    text = _separate_chunk_indicator_from_fence(formatted)
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
+                    cont_parse_mode = ParseMode.MARKDOWN_V2
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
-                    chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
+                    chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=cont_parse_mode if use_markdown else None,
                     reply_to_message_id=reply_to_id, **thread_kwargs, **base),
                     timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
             except Exception as send_err:
@@ -4268,9 +4333,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         first_chunk = chunks[0]
         try:
             if finalize:
+                formatted, split_parse_mode = self.format_for_send(first_chunk)
+                plain = (_strip_mdv2(first_chunk) if split_parse_mode == ParseMode.MARKDOWN_V2
+                         else _strip_html(formatted))
                 await self._edit_markdown_or_plain(
-                    chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
-                    "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
+                    chat_id, message_id, _separate_chunk_indicator_from_fence(formatted), plain,
+                    "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s",
+                    parse_mode=split_parse_mode)
             else:
                 await self._edit_text(chat_id, message_id, first_chunk)
         except Exception as e:
@@ -4348,12 +4417,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
+        draft_text, draft_parse_mode = self.format_for_send(text)
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
+                "text": draft_text if use_markdown else text}
             if use_markdown:
-                kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
+                kwargs["parse_mode"] = draft_parse_mode
             kwargs.update(draft_thread_kwargs)
             try:
                 if await _await_with_thread_deadline(
@@ -5866,130 +5936,29 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 e), exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
+    def format_for_send(self, content: str) -> tuple[str, Any]:
+        """Return ``(text, parse_mode)`` for an outbound message.
+
+        A message that already contains well-formed HTML tags is sent with
+        ``ParseMode.HTML`` (tags preserved, stray ``<`` escaped); anything else
+        is converted to MarkdownV2 and sent with ``ParseMode.MARKDOWN_V2``.
+
+        This is the shared decision point for every Telegram send path. Before
+        it existed, the gateway reply path hard-coded ``ParseMode.MARKDOWN_V2``:
+        hand-written ``<b>`` was escaped to ``<b\\>Bold</b\\>`` (MarkdownV2 escapes
+        '>' but not '<') and reached the user as literal tags — accepted with
+        HTTP 200, so no error was ever logged. See telegram_format.py.
+        """
+        if not content:
+            return content, ParseMode.MARKDOWN_V2
+        if _has_html_tags(content):
+            return _escape_html_text(content), ParseMode.HTML
+        return self.format_message(content), ParseMode.MARKDOWN_V2
+
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2: code is stashed behind placeholders first (never
         modified), markdown constructs become MarkdownV2 syntax, everything else is escaped."""
-        if not content:
-            return content
-        placeholders: dict = {}
-        counter = [0]
-
-        def _ph(value: str) -> str:
-            """Stash *value* behind a placeholder token that survives escaping."""
-            key = f"\x00PH{counter[0]}\x00"
-            counter[0] += 1
-            placeholders[key] = value
-            return key
-
-        def _ph_wrap(open_: str, close: str):
-            return lambda m: _ph(f"{open_}{_escape_mdv2(m.group(1))}{close}")
-
-        # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
-        #    before the normal MarkdownV2 conversions run.
-        text = _wrap_markdown_tables(content)
-
-        # 1) Protect fenced code blocks (``` ... ```)
-        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
-        #    A fence still opens on its own line — the opening ``` must be the
-        #    first triple-backtick run on that line and must end it — but the
-        #    line may carry arbitrary leading whitespace (list/blockquote-
-        #    nested code indents fences by 4+ spaces) or lead-in prose
-        #    ("Here is the code: ```"), both of which the line-start-only
-        #    anchor silently downgraded from <pre> to escaped literal text.
-        #    Requiring the rest of the opening line to be backtick-free is
-        #    what keeps *inline* triple backticks (e.g. "the syntax is
-        #    ```x``` inline") out of the match: a closing run can never sit
-        #    on the same line as the opener, and the tempered prefix cannot
-        #    skip past an earlier run to a later one.  The closing fence must
-        #    sit on its own line (any indent), with optional trailing
-        #    whitespace and an optional ``\r`` so CRLF-terminated fences
-        #    (Windows-authored content) match too.
-        def _protect_fenced(m):
-            prefix = m.group(1)   # lead-in text / indent before the opening fence
-            opening = m.group(2)  # opening ``` (with optional language) and newline
-            body = m.group(3)     # code body (may be empty)
-            closing = m.group(4)   # closing fence (with its indent)
-            body = body.replace('\\', '\\\\').replace('`', '\\`')
-            return prefix + _ph(opening + body + closing)
-
-        text = re.sub(
-            r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$',
-            _protect_fenced,
-            text,
-        )
-
-        # 2) Protect inline code (`...`)
-        #    Escape \ inside inline code per MarkdownV2 spec.
-        text = re.sub(
-            r'(`[^`]+`)',
-            lambda m: _ph(m.group(0).replace('\\', '\\\\')),
-            text,
-        )
-
-        # 3) Convert markdown links – escape the display text; inside the URL
-        #    only ')' and '\' need escaping per the MarkdownV2 spec.
-        def _convert_link(m):
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
-            return _ph(f'[{_escape_mdv2(m.group(1))}]({url})')
-
-        text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
-        # 4) Headers (## Title) → bold *Title*, stripping redundant ** inside the header
-        def _convert_header(m):
-            inner = re.sub(r'\*\*(.+?)\*\*', r'\1', m.group(1).strip())
-            return _ph(f'*{_escape_mdv2(inner)}*')
-
-        text = re.sub(r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE)
-        # 5) Bold **text** → *text*; 6) Italic *text* → _text_ ([^*\n]+ keeps matches on one line, or *
-        # bullet lists corrupt); 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
-        text = re.sub(r'\*\*(.+?)\*\*', _ph_wrap('*', '*'), text)
-        text = re.sub(r'\*([^*\n]+)\*', _ph_wrap('_', '_'), text)
-        text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
-        text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
-        # 9) Blockquotes: protect leading > from escaping; expandable quotes (**> starts, trailing || ends).
-        def _convert_blockquote(m):
-            prefix, content = m.group(1), m.group(2)  # prefix: >, >>, >>>, **>, **>> …
-            if prefix.startswith('**') and content.endswith('||'):
-                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
-            return _ph(f'{prefix} {_escape_mdv2(content)}')
-
-        text = re.sub(r'^((?:\*\*)?>{1,3}) (.+)$', _convert_blockquote, text, flags=re.MULTILINE)
-        # 10) Escape remaining special characters in plain text
-        text = _escape_mdv2(text)
-        # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
-        for key in reversed(list(placeholders.keys())):
-            text = text.replace(key, placeholders[key])
-        # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans.
-        _safe_parts = []
-        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|`[^`]+`)', text)):
-            if _idx % 2 == 1:
-                _safe_parts.append(_seg)  # inside code — untouched
-            else:
-                _safe_parts.append(re.sub(r'[(){}]', lambda m, _seg=_seg: TelegramAdapter._escape_bare_bracket(m, _seg), _seg))
-        return ''.join(_safe_parts)
-
-    @staticmethod
-    def _escape_bare_bracket(m, seg: str) -> str:
-        """Escape a bare ( ) { } unless it is already escaped or delimits a ``[text](url)`` link."""
-        s = m.start()
-        ch = m.group(0)
-        if s > 0 and seg[s - 1] == '\\':  # already escaped
-            return ch
-        if ch == '(' and s > 0 and seg[s - 1] == ']':  # opens a link [text](url)
-            return ch
-        if ch == ')':  # closes a link URL? walk back matching depth
-            before = seg[:s]
-            if '](http' in before or '](' in before:
-                depth = 0
-                for j in range(s - 1, max(s - 2000, -1), -1):
-                    if seg[j] == '(':
-                        depth -= 1
-                        if depth < 0:
-                            if j > 0 and seg[j - 1] == ']':
-                                return ch
-                            break
-                    elif seg[j] == ')':
-                        depth += 1
-        return '\\' + ch
+        return _markdown_to_markdownv2(content)
 
     # ── Group mention gating ──────────────────────────────────────────────
 
