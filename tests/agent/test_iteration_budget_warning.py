@@ -1,10 +1,12 @@
 """Iteration checkpoints preserve the transcript and the hard budget."""
 from copy import deepcopy
+from unittest.mock import patch
 
 import pytest
 
 
-def _agent(tmp_path, monkeypatch, ratio):
+def _agent(tmp_path, monkeypatch, ratio, max_iterations=4):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         f"agent:\n  budget_warning_ratio: {ratio}\n", encoding="utf-8"
@@ -20,7 +22,7 @@ def _agent(tmp_path, monkeypatch, ratio):
     _clear_tool_defs_cache()
     return AIAgent(session_db=SessionDB(db_path=tmp_path / "proof.db"),
                    model="test-model", provider="openai-compat", api_key="test",
-                   base_url="http://127.0.0.1:1/v1", max_iterations=4,
+                   base_url="http://127.0.0.1:1/v1", max_iterations=max_iterations,
                    quiet_mode=True, skip_context_files=True, skip_memory=True)
 
 
@@ -58,3 +60,63 @@ def test_checkpoint_rearms_per_turn_without_changing_budget_or_durable_rows(
             assert not agent.iteration_budget.consume()
     finally:
         agent._session_db.close()
+
+
+def test_kanban_checkpoint_is_early_and_does_not_reduce_hard_cap(monkeypatch):
+    """The dispatcher worker gets a 75% checkpoint, not a smaller turn limit."""
+    from types import SimpleNamespace
+
+    from agent.iteration_budget import IterationBudget
+    from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
+
+    agent = SimpleNamespace(
+        budget_warning_ratio=None,
+        iteration_budget=IterationBudget(500),
+        valid_tool_names={"kanban_complete"},
+        _iteration_budget_warning_injected=False,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
+    messages = [{"role": "tool", "content": "fixture result"}]
+    with patch("agent.delegation_context.is_dispatcher_owned_worker_context", return_value=True):
+        for _ in range(374):
+            assert agent.iteration_budget.consume()
+        assert not _maybe_inject_iteration_budget_warning(agent, messages)
+        assert agent.iteration_budget.consume()
+        assert _maybe_inject_iteration_budget_warning(agent, messages)
+
+    assert "375 of 500" in messages[-1]["content"]
+    assert "not a lower hard cap" in messages[-1]["content"]
+    assert agent.iteration_budget.max_total == 500
+    assert agent.iteration_budget.remaining == 125
+
+    # No worker identity means no Kanban-specific default checkpoint.
+    ordinary = SimpleNamespace(
+        budget_warning_ratio=None,
+        iteration_budget=IterationBudget(500),
+        valid_tool_names={"kanban_complete"},
+        _iteration_budget_warning_injected=False,
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    for _ in range(450):
+        assert ordinary.iteration_budget.consume()
+    with patch("agent.delegation_context.is_dispatcher_owned_worker_context", return_value=True):
+        assert not _maybe_inject_iteration_budget_warning(
+            ordinary, [{"role": "tool", "content": "fixture result"}]
+        )
+
+    # An explicit profile ratio remains authoritative (the previous 90% behavior is opt-in here).
+    configured = SimpleNamespace(
+        budget_warning_ratio=0.9,
+        iteration_budget=IterationBudget(500),
+        valid_tool_names={"kanban_complete"},
+        _iteration_budget_warning_injected=False,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
+    messages = [{"role": "tool", "content": "fixture result"}]
+    with patch("agent.delegation_context.is_dispatcher_owned_worker_context", return_value=True):
+        for _ in range(449):
+            assert configured.iteration_budget.consume()
+        assert not _maybe_inject_iteration_budget_warning(configured, messages)
+        assert configured.iteration_budget.consume()
+        assert _maybe_inject_iteration_budget_warning(configured, messages)
+    assert "450 of 500" in messages[-1]["content"]

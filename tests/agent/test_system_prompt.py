@@ -84,6 +84,14 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
     assert (agent._kanban_worker_guidance == KANBAN_GUIDANCE) is expected
 
 
+def test_kanban_guidance_documents_progress_budget():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "## Progress and budget" in KANBAN_GUIDANCE
+    assert "do not start optional follow-ups" in KANBAN_GUIDANCE
+    assert "bounded reads and concise fact lists" in KANBAN_GUIDANCE
+
+
 @pytest.mark.parametrize("task_id, owner, expected", [
     (None, True, False),        # interactive session with the kanban toolset enabled
     ("t_worker", True, True),   # the dispatcher-owned worker

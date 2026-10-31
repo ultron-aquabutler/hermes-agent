@@ -61,7 +61,7 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
         and "kanban_complete" in getattr(agent, "valid_tool_names", ())
     )
     if ratio is None and kanban_worker:
-        ratio = 0.9
+        ratio = 0.75
     budget = getattr(agent, "iteration_budget", None)
     if (
         ratio is None
@@ -77,10 +77,12 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
     )
     if kanban_worker:
         notice += (
-            " While tools are still available, call kanban_complete only if all task "
-            "requirements are verified, or kanban_request_review if it is ready for "
-            "review; otherwise persist a kanban_comment handoff and "
-            "continue. A diff or commit alone is not completion evidence."
+            " At this checkpoint, compare remaining acceptance criteria with the task scope: do not start optional "
+            "follow-ups. For independent overlarge remainder, preserve workspace progress and create a linked child "
+            "task; do not drop required or interdependent work. If required work is still progressing, continue — this "
+            "is not a lower hard cap. If a safe approach is blocked, persist a concise kanban_comment with completed and "
+            "pending criteria before escalating. Call kanban_complete only when every required criterion is verified, "
+            "or kanban_request_review if it is ready for review."
         )
     # Only the current tool-result tail is mutable; an older turn may already be cached.
     from agent.context_compressor import _DB_PERSISTED_MARKER
