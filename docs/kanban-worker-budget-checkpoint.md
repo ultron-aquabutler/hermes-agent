@@ -57,4 +57,4 @@ No new configuration field is introduced. `agent.budget_warning_ratio` continues
 
 ## Change History
 
-- 2026-10-31 — Added the 75% Kanban worker checkpoint and bounded progress guidance; code and this document ship together in the `fix/kanban-worker-budget-checkpoint` change.
+- 2026-10-31 — Added the 75% Kanban worker checkpoint and bounded progress guidance; code and this document are in commit `ecdd4edef2`.
