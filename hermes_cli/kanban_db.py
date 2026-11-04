@@ -2444,6 +2444,25 @@ def _claim_and_open_run(
     "running for more than 4h" the instant it was claimed, no matter
     how fresh its heartbeat was. It produced 57 critical Telegram
     alerts in 24h across 19 cards on 2026-10-29.
+
+    ``last_heartbeat_at`` is cleared to NULL for the same reason. It
+    belongs to the CURRENT run — it is written only by that run's own
+    worker (``heartbeat_worker``) — so a heartbeat left behind by a
+    previous run describes a worker that is no longer on the card.
+    Carrying it across a re-claim made the card look orphaned: MC's
+    "orphan worker" branch fires when ``started_at`` is recent AND
+    ``last_heartbeat_at`` is older than the threshold, and it reports
+    the age of the STALE HEARTBEAT, not the age of the run. On
+    2026-11-04 that produced a critical "running for 1566m" alert for
+    a card that had been running for 114 seconds (kanban
+    t_dba354a4 / t_d8d6c78f): the run claimed at 02:14:38 kept the
+    heartbeat from a run that ended the previous day, and the alert
+    measured from it.
+
+    NULL is the honest value here — it says "no worker has reported
+    yet for this run", which is exactly what is true at claim time.
+    The first heartbeat of the new run replaces it. MC's detector
+    already treats a NULL heartbeat as "not orphaned".
     """
     cur = conn.execute(
         f"""
@@ -2451,7 +2470,8 @@ def _claim_and_open_run(
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = ?
+               started_at    = ?,
+               last_heartbeat_at = NULL
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
