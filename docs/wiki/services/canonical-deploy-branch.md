@@ -88,7 +88,10 @@ Three pieces, all in the canonical-deploy branch:
      because a worker that can update arbitrary refs can move
      `canonical-deploy` to a different commit — the narrow carve-out
      refuses cross-branch moves while still letting the worker update
-     its own branch ref via the standard git plumbing),
+     its own branch ref via the standard git plumbing). On the cron path
+     the branch is top-level, so the carve-out is the branch ref FILE
+     and `refs/heads` stays read-only all the same — see the staging
+     note below),
    - `<agent_home>/.git/logs` (reflog),
    - `<agent_home>/.git/worktrees/<this-worktree-name>` (this worktree's
      `index`/`HEAD` — carved out per name, never the whole `.git/worktrees`).
@@ -103,6 +106,83 @@ Three pieces, all in the canonical-deploy branch:
    resolve OUTSIDE `<agent_home>` (the fleet layout puts it at
    `~/.hermes/kanban/boards/<board>/workspaces/<id>`, a sibling of the code
    tree).
+
+   **The staging bind is per carve-out, not whole-parent (t_034e4912).**
+   A carve-out must be sourced from an rw bind, because a bind of an
+   already-ro source inherits `MS_RDONLY`. The launcher used to take ONE
+   rw bind of the whole parent directory and use it as the source for
+   every carve-out. That left a writable view of the ENTIRE production
+   tree — including the code tree — inside the worker's mount namespace
+   for the whole lifetime of the worker, so a worker could write the
+   production tree and move a protected ref cross-branch through the
+   staging path even though the canonical path was `EROFS`:
+
+   ```
+   touch /tmp/hermes-isolate-stage.XXXX/hermes-agent/probe      # succeeded
+   git --git-dir /tmp/hermes-isolate-stage.XXXX/hermes-agent/.git \
+       update-ref refs/heads/canonical-deploy <sha>              # succeeded
+   ```
+
+   That is the silent-fix-loss the `ro` bind exists to prevent. The
+   launcher now takes a DEDICATED rw staging bind of only each carve-out
+   SUBTREE, flips the tree ro, binds each staged subtree over its
+   carve-out target, and unmounts the staging bind immediately. The
+   carve-out keeps its own mount reference, so it stays writable after
+   the staging bind is gone. Net effect: **no writable view of the
+   production tree exists anywhere in the worker's namespace, and the
+   worker never sees a staging mount at all.**
+
+   The staging directory (`/tmp/hermes-isolate-stage.XXXX`) is also
+   removed when the launcher finishes. It used to leak one directory per
+   worker spawn — 3550 had piled up in `/tmp` on the production host,
+   one per dispatch tick.
+
+   **A file carve-out is staged as the FILE ITSELF — never through its
+   parent directory.** On the **cron** path the branch is top-level
+   (e.g. `canonical-deploy-t_7161d9a9`), so the carve-out is the branch
+   ref FILE, not a directory. The launcher stages that file and binds it
+   over the real file; `refs/heads` itself is NEVER bound rw.
+
+   This matters because the staged view is an rw bind taken BEFORE the
+   tree is flipped ro — it carries `rw`, not `ro`. An earlier iteration
+   of the per-carve-out design staged the file's PARENT DIRECTORY and
+   bound that staged parent back over the real parent, which made the
+   whole `refs/heads` directory writable. A cron worker could then
+   create and move arbitrary sibling refs:
+
+   ```
+   git update-ref refs/heads/attacker <real-commit>   # succeeded
+   touch .git/refs/heads/attacker                     # succeeded
+   ```
+
+   The pre-existing cron probe missed it because it targeted a
+   nonexistent object (`deadbeef...`), which git rejects regardless of
+   filesystem permissions — the probe passed for the wrong reason. The
+   probe now uses a real commit object, and
+   `test_cron_file_carve_out_does_not_widen_to_refs_heads` covers the
+   cron path explicitly (the dispatch path was already covered).
+
+   **The mount sequence is the direct tell.** Instrumented against the real
+   launcher, the difference is a single bind:
+
+   ```
+   b4afd04233 (the bug)              78f1d76666 (the fix)
+   MOUNT --bind <repo>/.git/refs/heads   MOUNT --bind <repo>/.git/refs/heads/
+       <stage>/c002                          <branch>  <stage>/c002
+   MOUNT --bind <stage>/c002            MOUNT --bind <stage>/c002
+       <repo>/.git/refs/heads                 <repo>/.git/refs/heads/<branch>
+       <- WIDENS the directory to rw
+   ```
+
+   From inside a cron worker, `mountinfo` shows the hole directly — the
+   buggy tree has a `refs/heads` **directory** row with `rw`, the fixed
+   tree has only the one ref **file** row:
+
+   ```
+   awk '$5 ~ /refs\/heads/ {print "opts="$6, "path="$5}' /proc/self/mountinfo
+   #   BUGGY: opts=rw  path=<agent_home>/.git/refs/heads        <- the hole
+   #   FIXED: opts=ro  path=<agent_home>/.git/refs/heads
+   ```
 
    **Caveats** (measured, not surprises):
 
