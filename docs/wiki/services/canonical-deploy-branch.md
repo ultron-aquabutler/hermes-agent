@@ -162,6 +162,28 @@ Three pieces, all in the canonical-deploy branch:
    `test_cron_file_carve_out_does_not_widen_to_refs_heads` covers the
    cron path explicitly (the dispatch path was already covered).
 
+   **The mount sequence is the direct tell.** Instrumented against the real
+   launcher, the difference is a single bind:
+
+   ```
+   b4afd04233 (the bug)              78f1d76666 (the fix)
+   MOUNT --bind <repo>/.git/refs/heads   MOUNT --bind <repo>/.git/refs/heads/
+       <stage>/c002                          <branch>  <stage>/c002
+   MOUNT --bind <stage>/c002            MOUNT --bind <stage>/c002
+       <repo>/.git/refs/heads                 <repo>/.git/refs/heads/<branch>
+       <- WIDENS the directory to rw
+   ```
+
+   From inside a cron worker, `mountinfo` shows the hole directly — the
+   buggy tree has a `refs/heads` **directory** row with `rw`, the fixed
+   tree has only the one ref **file** row:
+
+   ```
+   awk '$5 ~ /refs\/heads/ {print "opts="$6, "path="$5}' /proc/self/mountinfo
+   #   BUGGY: opts=rw  path=<agent_home>/.git/refs/heads        <- the hole
+   #   FIXED: opts=ro  path=<agent_home>/.git/refs/heads
+   ```
+
    **Caveats** (measured, not surprises):
 
    - Supplementary groups are lost inside the user namespace; local
