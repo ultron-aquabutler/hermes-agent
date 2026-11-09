@@ -39,11 +39,16 @@ Carve-out set (exactly this, no more):
   carve-out refuses cross-branch moves while still letting the worker
   commit on its own branch via the standard git plumbing.
 
-Two traps (both measured):
+Three traps (all measured):
 
-* Carve-outs must be sourced from an **rw staging bind of the parent taken
-  before the tree is flipped ro** -- a bind from an already-ro mount inherits
-  ``MS_RDONLY``.
+* Carve-outs must be sourced from an **rw staging bind taken before the
+  tree is flipped ro** -- a bind from an already-ro mount inherits
+  ``MS_RDONLY``. The staging bind is **per carve-out subtree**, never a
+  bind of the whole parent: a whole-parent rw staging view is a writable
+  path into the production code tree, and the worker can use it to write
+  the tree and move protected refs cross-branch even though the canonical
+  path is read-only (``t_034e4912``). The staging bind is unmounted as
+  soon as the carve-out bind lands, so the worker never sees it.
 * ``.git/worktrees`` must be carved out **per worktree name**, not as a whole
   directory.
 * ``.git/refs/heads`` must be carved out **per branch directory**, not as a
@@ -593,13 +598,57 @@ def _enter_isolation(
     Errors return distinct exit codes (91=stage bind, 92=prod read-only bind,
     94=carve bind) so the launcher's first failing mount is identifiable from
     a worker log without re-running.
-    """
-    import tempfile
 
+    The staging bind is PER-CARVE-OUT, not whole-parent (t_034e4912)
+    ------------------------------------------------------------------
+    The previous design took ONE rw bind of the whole parent directory and
+    used it as the source for every carve-out bind. That worked, but it
+    left a writable view of the ENTIRE production tree -- including the
+    code tree -- sitting in the worker's mount namespace for the whole
+    lifetime of the worker. A worker could therefore write the production
+    tree through the staging path even though the canonical path was
+    read-only, and move a protected ref cross-branch through it:
+
+        touch /tmp/hermes-isolate-stage.XXXX/hermes-agent/probe   # succeeded
+        git --git-dir /tmp/hermes-isolate-stage.XXXX/hermes-agent/.git \\
+            update-ref refs/heads/canonical-deploy <sha>           # succeeded
+
+    which is exactly the silent-fix-loss the ``ro`` bind exists to
+    prevent. The staging mount also outlived the worker (the launcher
+    ``exec``s the worker, so nothing unmounted it), leaving thousands of
+    stale staging dirs behind in ``/tmp``.
+
+    The fix is a three-phase dance that never exposes the code tree:
+
+    * **Phase A** -- for each carve-out subtree, take a DEDICATED rw
+      staging bind of *only that subtree* into a scratch directory. This
+      must happen BEFORE the tree is flipped ro, because a bind of an
+      already-ro source inherits ``MS_RDONLY``.
+    * **Phase B** -- flip the production tree read-only.
+    * **Phase C** -- bind each staged subtree over its carve-out target
+      (restoring rw there), then UNMOUNT the staging bind immediately.
+      The carve-out keeps its own mount reference, so it stays writable
+      after the staging bind is gone -- and the staging path is no longer
+      a way into the code tree.
+
+    Phase A + C are what make the staging area safe: at no point does a
+    writable bind of the production code tree exist, and by the time the
+    worker runs, every staging bind has been torn down.
+    """
     parent = os.path.dirname(agent_home)
     if not os.path.isdir(parent):
         sys.stderr.write(f"hermes worker isolation: parent {parent!r} not a directory\n")
         return 90
+
+    carve, rc = _carve_out_set(
+        agent_home=agent_home,
+        worktree=worktree,
+        extra_rw=extra_rw,
+        cron=cron,
+        scratch=scratch,
+    )
+    if rc != 0:
+        return rc
 
     stage = _make_staging_dir(parent)
     if stage is None:
@@ -608,13 +657,17 @@ def _enter_isolation(
             "could be created\n"
         )
         return 91
+
+    # ``staged`` holds (carve-out target, staged path, staging slot) for
+    # every carve-out whose rw copy was successfully staged. Populated in
+    # phase A, drained in phase C.
+    staged: List[tuple] = []
     try:
-        # 1. rw staging view of the parent, taken BEFORE the tree is flipped
-        #    ro. The carve-out sources bind from this rw staging view because
-        #    a bind from an already-ro mount inherits MS_RDONLY.
-        rc = _mount(["--bind", parent, stage])
-        if rc != 0:
-            return 91
+        # ------------------------------------------------------------------
+        # Phase A -- per-subtree rw staging binds, taken BEFORE the flip.
+        # ------------------------------------------------------------------
+        staged = _stage_carve_outs(carve, stage)
+
         # 2. the production tree -> read-only.
         #
         # Single-step ``mount -o bind,ro <src> <dst>`` -- NOT the two-step
@@ -643,104 +696,207 @@ def _enter_isolation(
         rc = _mount(["-o", "bind,ro", agent_home, agent_home])
         if rc != 0:
             return 92
-        # 3. carve-outs, sourced from the rw staging bind.
-        #    ``.git/refs/heads`` is intentionally NOT included (see docstring);
-        #    the worker's own branch carve-out is added below when worktree
-        #    is provided (dispatch path) or when cron=True reads the agent
-        #    home's HEAD (cron path, t_102333c4).
-        carve: List[str] = [f"{agent_home}/.git/objects", f"{agent_home}/.git/logs"]
-        if cron:
-            # Cron: no per-task worktree. The branch ref dir is computed
-            # from the agent home's own .git/HEAD (this is the actual
-            # checkout branch, not a worker's branch). Working tree at
-            # agent_home stays ro.
-            worker_ref_dir = _agent_home_branch_ref_dir(agent_home)
-            if worker_ref_dir:
-                _ensure_dir_in_stage(stage, parent, worker_ref_dir)
-                carve.append(worker_ref_dir)
-        elif worktree:
-            carve.append(worktree)
-            carve.append(f"{agent_home}/.git/worktrees/{os.path.basename(worktree)}")
-            # The worker's own branch ref lives under ``refs/heads/<branch>``.
-            # We resolve the branch name from the worktree's HEAD so the
-            # carve-out matches what git will actually try to update. If
-            # the worktree has no HEAD yet (e.g. fresh worktree before any
-            # checkout), the carve-out is skipped and the worker will get
-            # the standard ro denial on its first ref write -- still safe.
-            worker_ref_dir = _worker_branch_ref_dir(agent_home, worktree)
-            if worker_ref_dir:
-                # ``mkdir -p`` in the rw staging bind so the carve-out
-                # path EXISTS (mount --bind onto a non-existent path
-                # would fail, and even if it succeeded git can't create
-                # ref files in a directory that doesn't exist on disk).
-                _ensure_dir_in_stage(stage, parent, worker_ref_dir)
-                carve.append(worker_ref_dir)
-        elif scratch:
-            # Scratch workspace: the per-task directory is the worker's
-            # writable area. It lives OUTSIDE the agent home (the
-            # dispatcher proves that with ``_is_outside_agent_home``), so
-            # the agent home stays read-only while the scratch dir is
-            # bound back in read-write from the staging view.
-            #
-            # A scratch task has no git worktree, so there is no branch ref
-            # to carve out -- the worker's git writes against the
-            # production checkout get the standard ro denial, which is the
-            # intended behaviour for a scratch worker.
-            if not os.path.isdir(scratch):
-                sys.stderr.write(
-                    f"hermes worker isolation: scratch path {scratch!r} is not a directory\n"
-                )
-                return 95
-            carve.append(scratch)
-        for extra in extra_rw:
-            carve.append(extra)
-        for sub in carve:
-            if not os.path.lexists(sub):
-                # The carve-out path may legitimately not exist on this host
-                # (e.g. .git/logs on a fresh worktree); skip silently.
-                continue
-            rel = sub
-            if sub.startswith(parent + "/"):
-                rel = sub[len(parent) + 1:]
-            src = os.path.join(stage, rel)
-            if not os.path.lexists(src):
-                continue
-            rc = _mount(["--bind", src, sub])
-            if rc != 0:
-                return 94
+        # ------------------------------------------------------------------
+        # Phase C -- bind the staged copies over their carve-out targets,
+        # then tear the staging bind down immediately.
+        #
+        # The carve-out keeps its own mount reference, so it stays writable
+        # after the staging bind is unmounted. That leaves NO writable view
+        # of the production tree anywhere in the namespace: the staging
+        # path is gone before the worker ever runs.
+        # ------------------------------------------------------------------
+        rc = _bind_carve_outs(staged)
+        if rc != 0:
+            return rc
         return 0
     finally:
-        # The staging dir was only a mount source -- leave it; nothing inside
-        # is exposed.
-        pass
+        # ------------------------------------------------------------------
+        # Tear down every staging bind that is still mounted and remove
+        # the staging directory. The launcher ``exec``s the worker, so
+        # nothing else would ever unmount these -- and a leftover rw
+        # staging bind of a carve-out subtree is still a writable view of
+        # production that outlives the worker that was confined by it.
+        #
+        # Before t_034e4912 this ``finally`` was a no-op and each worker
+        # spawn leaked one ``/tmp/hermes-isolate-stage.*`` directory (3550
+        # of them had accumulated on the production host).
+        # ------------------------------------------------------------------
+        for _sub, _src, stage_slot in staged:
+            _umount(stage_slot)
+        _rmtree_staging(stage)
 
 
-def _ensure_dir_in_stage(stage: str, parent: str, target: str) -> None:
-    """Create ``target``'s parent directories inside the rw staging bind.
+def _carve_out_set(
+    *,
+    agent_home: str,
+    worktree: Optional[str],
+    extra_rw: Sequence[str],
+    cron: bool,
+    scratch: Optional[str],
+) -> tuple:
+    """Compute the carve-out set for this launch.
 
-    Carve-out targets must exist as paths inside the staging bind BEFORE
-    we bind them over the (then-ro) production path. For directories
-    holding ref files, that means we need to mkdir the path on the
-    staging side first; otherwise git's ``fopen(<refpath>, 'w')`` would
-    fail with ENOENT under the sandbox even though the file's directory
-    itself was rw.
+    Returns ``(carve, rc)``. ``rc`` is non-zero when the caller must
+    abort: 95 means the scratch path is not a directory.
 
-    No-op if ``target`` does not start with ``parent/`` (defensive).
+    The set is computed BEFORE any mount happens, because the per-subtree
+    staging binds (phase A) have to be taken before the tree is flipped
+    ro -- so the set must be known up front.
+
+    ``.git/refs/heads`` is intentionally NOT included (see the module
+    docstring); the worker's own branch carve-out is added below when a
+    worktree is provided (dispatch path) or when ``cron`` reads the agent
+    home's HEAD (cron path, t_102333c4).
     """
-    if not target.startswith(parent + "/"):
-        return
-    rel = target[len(parent) + 1:]
-    stage_path = os.path.join(stage, rel)
-    if os.path.exists(stage_path):
-        return
-    try:
-        os.makedirs(stage_path, exist_ok=True)
-    except OSError:
-        # Best effort -- if mkdir fails, the bind will silently skip the
-        # missing source path. The worker's first ref write will then be
-        # denied by the ro bind on the parent dir, which is the safe
-        # default.
-        pass
+    carve: List[str] = [f"{agent_home}/.git/objects", f"{agent_home}/.git/logs"]
+    if cron:
+        # Cron: no per-task worktree. The branch ref dir is computed
+        # from the agent home's own .git/HEAD (this is the actual
+        # checkout branch, not a worker's branch). Working tree at
+        # agent_home stays ro.
+        worker_ref_dir = _agent_home_branch_ref_dir(agent_home)
+        if worker_ref_dir:
+            carve.append(worker_ref_dir)
+    elif worktree:
+        carve.append(worktree)
+        carve.append(f"{agent_home}/.git/worktrees/{os.path.basename(worktree)}")
+        # The worker's own branch ref lives under ``refs/heads/<branch>``.
+        # We resolve the branch name from the worktree's HEAD so the
+        # carve-out matches what git will actually try to update. If
+        # the worktree has no HEAD yet (e.g. fresh worktree before any
+        # checkout), the carve-out is skipped and the worker will get
+        # the standard ro denial on its first ref write -- still safe.
+        worker_ref_dir = _worker_branch_ref_dir(agent_home, worktree)
+        if worker_ref_dir:
+            carve.append(worker_ref_dir)
+    elif scratch:
+        # Scratch workspace: the per-task directory is the worker's
+        # writable area. It lives OUTSIDE the agent home (the
+        # dispatcher proves that with ``_is_outside_agent_home``), so
+        # the agent home stays read-only while the scratch dir is
+        # bound back in read-write.
+        #
+        # A scratch task has no git worktree, so there is no branch ref
+        # to carve out -- the worker's git writes against the
+        # production checkout get the standard ro denial, which is the
+        # intended behaviour for a scratch worker.
+        if not os.path.isdir(scratch):
+            sys.stderr.write(
+                f"hermes worker isolation: scratch path {scratch!r} is not a directory\n"
+            )
+            return [], 95
+        carve.append(scratch)
+    for extra in extra_rw:
+        carve.append(extra)
+
+    # De-duplicate while preserving order -- the same path can arrive
+    # twice (e.g. a worktree that is also passed as extra_rw).
+    seen: set = set()
+    ordered: List[str] = []
+    for sub in carve:
+        if sub in seen:
+            continue
+        seen.add(sub)
+        ordered.append(sub)
+    return ordered, 0
+
+
+def _stage_carve_outs(carve: Sequence[str], stage: str) -> List[tuple]:
+    """Phase A -- take a dedicated rw staging bind of each carve-out subtree.
+
+    Returns a list of ``(carve-out target, staged source, staging slot)``
+    triples, one per carve-out whose rw copy was staged.
+
+    Only the carve-out SUBTREES are staged -- never the code tree. This
+    is the whole point of the per-carve-out design (t_034e4912): the old
+    whole-parent staging bind was a writable view of the entire production
+    tree that the worker could use to write the tree and move protected
+    refs cross-branch.
+
+    A carve-out that cannot be staged is skipped, which leaves the worker
+    with the standard ro denial on that path -- the safe default.
+    """
+    staged: List[tuple] = []
+    for idx, sub in enumerate(carve):
+        src_for_stage = sub
+        if not os.path.lexists(sub):
+            # The carve-out path does not exist yet on this host -- the
+            # usual case is the worker's own branch ref dir for a branch
+            # that has not been created yet (git creates the ref file, and
+            # its directory has to be writable for that).
+            #
+            # There is nothing to stage from, but the carve-out is still
+            # wanted: stage an EMPTY directory for it and bind that over
+            # the target. The bind needs the target path to exist, so
+            # create the missing chain first.
+            #
+            # ``refs/heads/<branch>`` is a directory of ref files, so an
+            # empty staged dir is exactly right. The old whole-parent
+            # staging design got this for free by mkdir-ing the path
+            # inside the staging view; the per-carve-out design has to do
+            # it explicitly.
+            if not os.path.isdir(os.path.dirname(sub)):
+                continue
+            try:
+                os.makedirs(sub, exist_ok=True)
+            except OSError:
+                # Cannot create the target (ro tree, or a path whose
+                # parent is not a directory). Skip -- the worker gets the
+                # standard ro denial, which is the safe default.
+                continue
+        elif os.path.isfile(sub):
+            # A FILE carve-out (the cron single-ref-file case) is staged
+            # through its parent directory: a bind of a file needs a file
+            # target, and the carve-out target must keep its own shape.
+            src_for_stage = os.path.dirname(sub)
+            if not os.path.lexists(src_for_stage):
+                continue
+        stage_slot = os.path.join(stage, "c%03d" % idx)
+        try:
+            os.makedirs(stage_slot, exist_ok=True)
+        except OSError:
+            continue
+        if _mount(["--bind", src_for_stage, stage_slot]) != 0:
+            # Could not stage this carve-out rw. Leaving it out means the
+            # worker gets the standard ro denial on it -- the safe default
+            # (same as the pre-existing "path does not exist" skip).
+            continue
+        staged.append((sub, src_for_stage, stage_slot))
+    return staged
+
+
+def _bind_carve_outs(staged: Sequence[tuple]) -> int:
+    """Phase C -- bind each staged subtree over its carve-out target.
+
+    Each staging bind is unmounted as soon as the carve-out bind lands.
+    The carve-out keeps its own mount reference to the underlying inode,
+    so it stays writable after the staging bind is gone -- and the staging
+    path stops being a way into the production tree.
+
+    Returns 0 on success, 94 when a carve-out bind fails.
+    """
+    for sub, _src_for_stage, stage_slot in staged:
+        if os.path.isfile(sub):
+            # File carve-out (the cron single-ref-file case): the staged
+            # slot holds the ref file's PARENT directory, so bind that
+            # parent over the real parent first, then bind the staged
+            # FILE over the real file. The parent's other entries stay
+            # read-only because the staged parent is a bind of the (now
+            # ro) real parent.
+            real_parent = os.path.dirname(sub)
+            if _mount(["--bind", stage_slot, real_parent]) != 0:
+                return 94
+            file_slot = os.path.join(stage_slot, os.path.basename(sub))
+            if os.path.lexists(file_slot):
+                if _mount(["--bind", file_slot, sub]) != 0:
+                    return 94
+        else:
+            if _mount(["--bind", stage_slot, sub]) != 0:
+                return 94
+        # Tear the staging bind down NOW. The carve-out holds its own
+        # reference to the underlying inode, so it stays writable.
+        _umount(stage_slot)
+    return 0
 
 
 def _worker_branch_ref_dir(agent_home: str, worktree: str) -> Optional[str]:
@@ -956,6 +1112,69 @@ def _mount(args: List[str]) -> int:
         # blocking the worker spawn indefinitely.
         return 1
     return completed.returncode
+
+
+def _umount(path: str) -> int:
+    """Unmount ``path``, returning 0 on success and 1 on failure.
+
+    Used to tear down the per-carve-out staging binds (t_034e4912). The
+    timeout matches ``_mount``'s: an ``umount`` that blocks would stall the
+    launcher, and the launcher's job is to hand the worker a namespace
+    promptly.
+
+    A failure here is not fatal to the worker: the carve-out bind that the
+    staging mount backed keeps its own reference to the underlying inode,
+    so an unmount that fails leaves the carve-out writable but leaves a
+    stale staging mount behind. The ``finally`` block retries, and the
+    staging directory removal below is what actually bounds the leak.
+    """
+    import subprocess as _sp
+    binary = shutil.which("umount") or "/usr/bin/umount"
+    try:
+        completed = _sp.run(
+            [binary, path],
+            stdin=_sp.DEVNULL,
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+            timeout=_MOUNT_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        return 1
+    except _sp.TimeoutExpired:
+        return 1
+    return completed.returncode
+
+
+def _rmtree_staging(stage: str) -> None:
+    """Remove the staging directory created by ``_make_staging_dir``.
+
+    Before t_034e4912 the staging directory was left behind on every
+    worker spawn -- 3550 of them had piled up in ``/tmp`` on the
+    production host, one per dispatch. Each is a plain empty directory
+    now (the bind that made it dangerous is gone), but they are still an
+    inode leak that grows with every dispatch tick.
+
+    The directory may still contain mounted slots if an ``umount`` failed,
+    so the directory removal is best-effort per entry: a slot that is
+    still mounted cannot be ``rmdir``-ed, and that is exactly the case
+    worth leaving behind rather than failing the launcher's exit code.
+    """
+    try:
+        for entry in os.listdir(stage):
+            slot = os.path.join(stage, entry)
+            try:
+                if os.path.ismount(slot):
+                    _umount(slot)
+                os.rmdir(slot)
+            except OSError:
+                # Still mounted, or not empty. Leave it; the next dispatch
+                # will not reuse this path (mkdtemp is unique).
+                pass
+        os.rmdir(stage)
+    except OSError:
+        # The staging dir is best-effort cleanup -- never fail the worker
+        # spawn over it.
+        pass
 
 
 # ----------------------------------------------------------------------

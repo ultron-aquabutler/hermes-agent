@@ -456,6 +456,198 @@ def test_acceptance_harness_isolates_synthetic_repo(tmp_path):
     assert "ACCEPTANCE: PASS" in out, out
 
 
+# ---------------------------------------------------------------------------
+# Staging-mount escape (t_034e4912)
+#
+# The launcher used to take ONE rw bind of the whole parent directory and
+# use it as the source for every carve-out bind. That left a writable view
+# of the ENTIRE production tree -- including the code tree -- inside the
+# worker's mount namespace, so a worker could write the tree and move a
+# protected ref cross-branch through the staging path even though the
+# canonical path was read-only.
+#
+# The staging bind is now per carve-out subtree and is unmounted as soon as
+# the carve-out bind lands, so the worker never sees a staging mount of the
+# production tree at all.
+#
+# This harness measures the staging mounts from /proc/self/mountinfo --
+# ``os.path.ismount()`` cannot be used here: a BIND mount has the same
+# device+inode as its source, so ismount() returns False for exactly the
+# mounts this test cares about.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.platforms("linux")
+@pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare not on PATH")
+@pytest.mark.skipif(
+    subprocess.run(
+        ["unshare", "--user", "--map-root-user", "true"],
+        capture_output=True, timeout=5,
+    ).returncode != 0,
+    reason="unprivileged user namespace unavailable on this host",
+)
+def test_staging_mount_is_not_a_writable_view_of_the_production_tree(tmp_path):
+    """The staging path must not be a writable path into the production tree.
+
+    Regression for the escape found while deploying the watchdog-feeder fix
+    (t_034e4912): the launcher's whole-parent rw staging bind let a worker
+    write the production tree and move ``refs/heads/canonical-deploy``
+    cross-branch through ``/tmp/hermes-isolate-stage.*/hermes-agent/.git``.
+    """
+    from hermes_cli.worker_isolate import _launcher_module_target
+
+    repo_dir = tmp_path / "tree"
+    repo = repo_dir / "agent"
+    repo.mkdir(parents=True)
+    (repo / "app.py").write_text("print('hi')\n")
+
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "canonical-deploy", "."],
+                   check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "--allow-empty", "-q", "-m", "initial"],
+        check=True,
+    )
+    # A real linked worktree, so the launcher computes a real branch-ref
+    # carve-out (``refs/heads/wt``) the way it does in production.
+    worktree = repo_dir / "wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(worktree), "-b", "wt/t_x"],
+        check=True,
+    )
+
+    launcher_prefix = _launcher_module_target()
+    inner_cmd = [
+        *launcher_prefix,
+        str(repo),
+        "--worktree", str(worktree),
+        "--",
+        sys.executable, "-c", _STAGING_PROBE_SCRIPT,
+        str(repo), str(worktree), str(repo_dir),
+    ]
+    cmd = ["unshare", "-Urm", "--propagation", "slave", *inner_cmd]
+    result = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+
+    out = result.stdout + result.stderr
+    fail_lines = [line for line in out.splitlines() if line.startswith("FAIL ")]
+    assert not fail_lines, f"the staging path is still a writable view of production:\n{out}"
+    assert "STAGING-PROBE: PASS" in out, out
+
+
+_STAGING_PROBE_SCRIPT = r"""
+import os, subprocess, sys
+PROD = sys.argv[1]
+WT = sys.argv[2]
+REPO_DIR = sys.argv[3]
+FAIL = 0
+STAGE_PREFIX = "/tmp/hermes-isolate-stage."
+
+def report(label, ok, detail=""):
+    global FAIL
+    print(("PASS  " if ok else "FAIL  ") + label + " :: " + (detail or ""))
+    if not ok:
+        FAIL = 1
+
+def own_staging_mounts():
+    # Staging mounts whose SOURCE is the tree this run created.
+    #
+    # The namespace INHERITS the spawner's mount table, so a live worker's
+    # own staging mount can be visible here. Only mounts whose source is the
+    # tree under test belong to the launcher being measured.
+    out = []
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split(" ")
+                if len(parts) < 5:
+                    continue
+                target, root = parts[4], parts[3]
+                if not target.startswith(STAGE_PREFIX):
+                    continue
+                if REPO_DIR in root or REPO_DIR in target:
+                    out.append((target, root))
+    except OSError:
+        pass
+    return out
+
+def write_denied(path):
+    if os.path.isdir(path):
+        return True, "is a directory (not probed)"
+    try:
+        with open(path, "w") as fh:
+            fh.write("x")
+    except OSError:
+        return True, "write denied"
+    return False, "write SUCCEEDED"
+
+# The canonical path is read-only (this worked before the fix too).
+ok, detail = write_denied(os.path.join(PROD, "app.py"))
+report("canonical prod write denied", ok, detail)
+
+# The staging path must NOT be a writable view of the production tree.
+mounted = own_staging_mounts()
+report("no staging MOUNT of the production tree visible", not mounted,
+       "mounted: %s" % mounted)
+for target, root in mounted:
+    for rel in ("app.py", os.path.basename(PROD) + "/app.py"):
+        p = os.path.join(target, rel)
+        if not os.path.exists(p):
+            continue
+        ok, detail = write_denied(p)
+        report("staging write denied: %s" % p, ok, detail)
+    gitdir = os.path.join(target, os.path.basename(PROD), ".git")
+    if not os.path.isdir(gitdir):
+        gitdir = os.path.join(target, ".git")
+    if not os.path.isdir(gitdir):
+        continue
+    r = subprocess.run(
+        ["git", "--git-dir", gitdir, "update-ref", "refs/heads/canonical-deploy", "HEAD"],
+        capture_output=True, text=True, timeout=20,
+    )
+    denied = r.returncode != 0 or "Read-only" in (r.stderr + r.stdout)
+    report("staging update-ref denied", denied, (r.stderr or r.stdout).strip()[:200])
+
+# The legitimate carve-outs must still work.
+probe = os.path.join(WT, "probe_write.txt")
+ok, detail = write_denied(probe)
+report("own worktree writable", not ok, detail or "wrote ok")
+try:
+    os.unlink(probe)
+except OSError:
+    pass
+
+objdir = os.path.join(PROD, ".git", "objects")
+if os.path.isdir(objdir):
+    ok, detail = write_denied(os.path.join(objdir, "probe_obj"))
+    report(".git/objects carve-out writable", not ok, detail or "wrote ok")
+    try:
+        os.unlink(os.path.join(objdir, "probe_obj"))
+    except OSError:
+        pass
+
+own = os.path.join(PROD, ".git", "refs", "heads", "wt")
+if os.path.isdir(own):
+    ok, detail = write_denied(os.path.join(own, "probe_ref"))
+    report("own branch ref dir writable", not ok, detail or "wrote ok")
+    try:
+        os.unlink(os.path.join(own, "probe_ref"))
+    except OSError:
+        pass
+else:
+    report("own branch ref dir present", False, "missing %s" % own)
+
+sib = os.path.join(PROD, ".git", "refs", "heads", "canonical-deploy")
+if os.path.exists(sib):
+    ok, detail = write_denied(sib)
+    report("sibling ref read-only", ok, detail)
+
+print("---")
+print("STAGING-PROBE: PASS" if FAIL == 0 else "STAGING-PROBE: FAIL")
+sys.exit(FAIL)
+"""
+
+
 _PROBE_SCRIPT = r"""
 import os, subprocess, sys
 PROD = sys.argv[1]
@@ -636,28 +828,30 @@ def test_worker_branch_ref_dir_detached_returns_none():
         assert _worker_branch_ref_dir(agent_home, wt_dir) is None
 
 
-def test_ensure_dir_in_stage_creates_missing_path():
-    """Carve-out targets must exist as paths inside the rw staging bind."""
-    import tempfile
+def test_rmtree_staging_removes_the_staging_directory(tmp_path):
+    """The staging directory must not survive the launch (t_034e4912).
 
-    from hermes_cli.worker_isolate import _ensure_dir_in_stage
+    Before t_034e4912 the launcher left one ``/tmp/hermes-isolate-stage.*``
+    directory per worker spawn -- 3550 of them had accumulated on the
+    production host. The launcher's ``finally`` now removes it.
+    """
+    from hermes_cli.worker_isolate import _rmtree_staging
 
-    with tempfile.TemporaryDirectory() as td:
-        stage = os.path.join(td, "stage")
-        os.makedirs(stage)
-        parent = td  # parent of the eventual target
-        # A target that is *not* under parent -- the function should no-op.
-        bogus = os.path.join("/somewhere/else", "fix")
-        _ensure_dir_in_stage(stage, parent, bogus)
-        assert not os.path.exists(os.path.join(stage, "somewhere"))
-        # A target that IS under parent and DOES NOT exist -- create it.
-        target = os.path.join(parent, ".git", "refs", "heads", "fix")
-        assert not os.path.exists(target)
-        _ensure_dir_in_stage(stage, parent, target)
-        assert os.path.isdir(os.path.join(stage, ".git", "refs", "heads", "fix"))
-        # Calling again on an existing path is a no-op.
-        _ensure_dir_in_stage(stage, parent, target)
-        assert os.path.isdir(os.path.join(stage, ".git", "refs", "heads", "fix"))
+    stage = tmp_path / "hermes-isolate-stage.abc123"
+    stage.mkdir()
+    (stage / "c000").mkdir()
+    (stage / "c001").mkdir()
+
+    _rmtree_staging(str(stage))
+
+    assert not stage.exists(), "the staging directory must be removed"
+
+
+def test_rmtree_staging_tolerates_a_missing_directory(tmp_path):
+    """Cleanup must not raise when the staging dir is already gone."""
+    from hermes_cli.worker_isolate import _rmtree_staging
+
+    _rmtree_staging(str(tmp_path / "never-existed"))  # must not raise
 
 
 def test_make_staging_dir_is_outside_the_agent_home(tmp_path, monkeypatch):

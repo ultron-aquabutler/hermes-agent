@@ -104,6 +104,36 @@ Three pieces, all in the canonical-deploy branch:
    `~/.hermes/kanban/boards/<board>/workspaces/<id>`, a sibling of the code
    tree).
 
+   **The staging bind is per carve-out, not whole-parent (t_034e4912).**
+   A carve-out must be sourced from an rw bind, because a bind of an
+   already-ro source inherits `MS_RDONLY`. The launcher used to take ONE
+   rw bind of the whole parent directory and use it as the source for
+   every carve-out. That left a writable view of the ENTIRE production
+   tree — including the code tree — inside the worker's mount namespace
+   for the whole lifetime of the worker, so a worker could write the
+   production tree and move a protected ref cross-branch through the
+   staging path even though the canonical path was `EROFS`:
+
+   ```
+   touch /tmp/hermes-isolate-stage.XXXX/hermes-agent/probe      # succeeded
+   git --git-dir /tmp/hermes-isolate-stage.XXXX/hermes-agent/.git \
+       update-ref refs/heads/canonical-deploy <sha>              # succeeded
+   ```
+
+   That is the silent-fix-loss the `ro` bind exists to prevent. The
+   launcher now takes a DEDICATED rw staging bind of only each carve-out
+   SUBTREE, flips the tree ro, binds each staged subtree over its
+   carve-out target, and unmounts the staging bind immediately. The
+   carve-out keeps its own mount reference, so it stays writable after
+   the staging bind is gone. Net effect: **no writable view of the
+   production tree exists anywhere in the worker's namespace, and the
+   worker never sees a staging mount at all.**
+
+   The staging directory (`/tmp/hermes-isolate-stage.XXXX`) is also
+   removed when the launcher finishes. It used to leak one directory per
+   worker spawn — 3550 had piled up in `/tmp` on the production host,
+   one per dispatch tick.
+
    **Caveats** (measured, not surprises):
 
    - Supplementary groups are lost inside the user namespace; local
