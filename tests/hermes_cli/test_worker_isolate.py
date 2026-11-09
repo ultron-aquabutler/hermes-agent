@@ -1127,6 +1127,16 @@ def chk(label, expect, args, cwd=None):
     if not ok:
         FAIL = 1
 
+# A REAL commit object, so the cross-branch probe below can only fail for
+# the RIGHT reason (the filesystem denied the write). A nonexistent object
+# like ``deadbeef...`` is rejected by git regardless of permissions, which
+# makes the probe pass even when the filesystem hole is wide open --
+# that is how the cron-path widening in b4afd04233 stayed green
+# (review round 1 of t_034e4912).
+real_sha = subprocess.check_output(
+    ["git", "-C", PROD, "log", "--format=%H", "-n", "1"], text=True
+).strip()
+
 # Forbidden: cron-evil must NOT be able to mutate the production tree.
 chk("git switch -c cron-evil", "deny",
     ["git", "-C", PROD, "switch", "-c", "cron-evil-test"])
@@ -1136,8 +1146,23 @@ chk("git reset --hard", "deny",
     ["git", "-C", PROD, "reset", "--hard", "HEAD"])
 chk("git checkout HEAD -- .", "deny",
     ["git", "-C", PROD, "checkout", "HEAD", "--", "."])
-chk("git update-ref other-branch", "deny",
-    ["git", "-C", PROD, "update-ref", "refs/heads/cross-branch-attack", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"])
+# Cross-branch ref move, targeted at a REAL commit object: the only thing
+# that can stop this is the filesystem denial on refs/heads.
+chk("git update-ref other-branch (real object)", "deny",
+    ["git", "-C", PROD, "update-ref", "refs/heads/cross-branch-attack", real_sha])
+# Creating a NEW branch must also be denied -- the carve-out is a single
+# ref FILE, so the refs/heads directory itself stays read-only.
+chk("git branch new-branch", "deny",
+    ["git", "-C", PROD, "branch", "cross-branch-created", real_sha])
+# Writing a file straight into refs/heads must be denied too (the carve-out
+# must not widen to the whole directory).
+try:
+    with open(os.path.join(PROD, ".git", "refs", "heads", "sneaky"), "w") as fh:
+        fh.write(real_sha + "\n")
+    print("FAIL  create file in refs/heads denied :: write SUCCEEDED")
+    FAIL = 1
+except OSError as e:
+    print("PASS  create file in refs/heads denied :: " + str(e))
 
 # Allowed: a legitimate read of the production tree.
 chk("cat app.py", "allow", ["cat", os.path.join(PROD, "app.py")])
@@ -1208,6 +1233,143 @@ def test_cron_acceptance_harness_isolates_synthetic_repo(tmp_path):
     out = result.stdout + result.stderr
     fail_lines = [line for line in out.splitlines() if line.startswith("FAIL ")]
     assert not fail_lines, f"cron isolation allowed a forbidden op:\n{out}\nfull argv: {cmd}"
+
+
+# ---------------------------------------------------------------------------
+# Cron file-carve-out must not widen to the whole refs/heads directory
+# (t_034e4912, review round 1)
+#
+# The per-carve-out staging redesign (b4afd04233) staged a FILE carve-out
+# through its PARENT DIRECTORY and then bound that staged parent back over
+# the real parent. The staged parent was an rw bind taken BEFORE the tree
+# was flipped ro, so it carried rw -- and binding it over ``refs/heads``
+# made the whole directory writable. A cron worker could then create or
+# move ANY sibling ref, which is exactly the cross-branch-update hole the
+# narrow carve-out exists to close.
+#
+# The commit's own new regression test only exercised the DISPATCH path
+# (--worktree), and the pre-existing cron acceptance probe used a
+# nonexistent object (``deadbeef...``) that git rejects regardless of
+# permissions -- so the hole stayed green.
+#
+# This test targets the cron path (--cron, top-level branch -> single ref
+# FILE carve-out) and uses a REAL commit object, so it can only fail for
+# the right reason: the filesystem allowed the write.
+# ---------------------------------------------------------------------------
+
+
+_CRON_CARVEOUT_PROBE_SCRIPT = r"""
+import os, subprocess, sys
+PROD = sys.argv[1]
+FAIL = 0
+
+def report(label, ok, detail=""):
+    global FAIL
+    print(("PASS  " if ok else "FAIL  ") + label + " :: " + (detail or ""))
+    if not ok:
+        FAIL = 1
+
+# A REAL commit object in the repo, so an update-ref to it would SUCCEED
+# if the filesystem allowed the write. A nonexistent object would be
+# rejected by git regardless of permissions and the probe would pass for
+# the wrong reason.
+real_sha = subprocess.check_output(
+    ["git", "-C", PROD, "log", "--format=%H", "-n", "1"], text=True
+).strip()
+
+refs_heads = os.path.join(PROD, ".git", "refs", "heads")
+
+# 1. Creating a SIBLING ref must be denied.
+r = subprocess.run(
+    ["git", "-C", PROD, "update-ref", "refs/heads/sibling-attack", real_sha],
+    capture_output=True, text=True, timeout=20)
+report("sibling ref creation denied", r.returncode != 0,
+       (r.stderr or r.stdout).strip()[:300])
+
+# 2. Creating a file directly in refs/heads must be denied -- the
+#    carve-out is ONE ref file, never the directory.
+try:
+    with open(os.path.join(refs_heads, "sneaky"), "w") as fh:
+        fh.write(real_sha + "\n")
+    report("direct write into refs/heads denied", False, "write SUCCEEDED")
+except OSError as e:
+    report("direct write into refs/heads denied", True, str(e))
+
+# 3. The worker's OWN branch ref must still be writable -- the carve-out
+#    is the whole point of the cron path.
+own_ref = os.path.join(refs_heads, "canonical-deploy-t_7161d9a9")
+try:
+    with open(own_ref, "w") as fh:
+        fh.write(real_sha + "\n")
+    report("own branch ref file writable", True, "wrote ok")
+except OSError as e:
+    report("own branch ref file writable", False, str(e))
+
+print("---")
+print("CRON-CARVEOUT: PASS" if FAIL == 0 else "CRON-CARVEOUT: FAIL")
+sys.exit(FAIL)
+"""
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.platforms("linux")
+@pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare not on PATH")
+@pytest.mark.skipif(
+    subprocess.run(
+        ["unshare", "--user", "--map-root-user", "true"],
+        capture_output=True, timeout=5,
+    ).returncode != 0,
+    reason="unprivileged user namespace unavailable on this host",
+)
+def test_cron_file_carve_out_does_not_widen_to_refs_heads(tmp_path):
+    """A cron file carve-out must stay ONE ref file, never all of refs/heads.
+
+    Regression for the widening introduced by b4afd04233 (t_034e4912): the
+    file carve-out was staged through its parent directory and that rw
+    staged parent was bound back over ``refs/heads``, so a cron worker
+    could create and move arbitrary sibling refs.
+    """
+    from hermes_cli.worker_isolate import _launcher_module_target
+
+    repo = tmp_path / "cron-agent-home"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-q", "-b", "canonical-deploy-t_7161d9a9", "."],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "--allow-empty", "-q", "-m", "initial"],
+        check=True,
+    )
+    # Materialise the branch ref as a loose FILE -- that is what the cron
+    # file carve-out targets.
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref",
+         "refs/heads/canonical-deploy-t_7161d9a9", "HEAD"],
+        check=True,
+    )
+    ref_file = repo / ".git" / "refs" / "heads" / "canonical-deploy-t_7161d9a9"
+    assert ref_file.is_file(), "the branch ref must be a loose file for this test"
+
+    launcher_prefix = _launcher_module_target()
+    inner_cmd = [
+        *launcher_prefix,
+        str(repo),
+        "--cron",
+        "--",
+        sys.executable, "-c", _CRON_CARVEOUT_PROBE_SCRIPT, str(repo),
+    ]
+    cmd = ["unshare", "-Urm", "--propagation", "slave", *inner_cmd]
+    result = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+
+    out = result.stdout + result.stderr
+    fail_lines = [line for line in out.splitlines() if line.startswith("FAIL ")]
+    assert not fail_lines, (
+        "the cron file carve-out widened to the whole refs/heads directory:\n"
+        f"{out}\nfull argv: {cmd}"
+    )
+    assert "CRON-CARVEOUT: PASS" in out, out
 
 
 # ---------------------------------------------------------------------------

@@ -88,7 +88,10 @@ Three pieces, all in the canonical-deploy branch:
      because a worker that can update arbitrary refs can move
      `canonical-deploy` to a different commit — the narrow carve-out
      refuses cross-branch moves while still letting the worker update
-     its own branch ref via the standard git plumbing),
+     its own branch ref via the standard git plumbing). On the cron path
+     the branch is top-level, so the carve-out is the branch ref FILE
+     and `refs/heads` stays read-only all the same — see the staging
+     note below),
    - `<agent_home>/.git/logs` (reflog),
    - `<agent_home>/.git/worktrees/<this-worktree-name>` (this worktree's
      `index`/`HEAD` — carved out per name, never the whole `.git/worktrees`).
@@ -133,6 +136,31 @@ Three pieces, all in the canonical-deploy branch:
    removed when the launcher finishes. It used to leak one directory per
    worker spawn — 3550 had piled up in `/tmp` on the production host,
    one per dispatch tick.
+
+   **A file carve-out is staged as the FILE ITSELF — never through its
+   parent directory.** On the **cron** path the branch is top-level
+   (e.g. `canonical-deploy-t_7161d9a9`), so the carve-out is the branch
+   ref FILE, not a directory. The launcher stages that file and binds it
+   over the real file; `refs/heads` itself is NEVER bound rw.
+
+   This matters because the staged view is an rw bind taken BEFORE the
+   tree is flipped ro — it carries `rw`, not `ro`. An earlier iteration
+   of the per-carve-out design staged the file's PARENT DIRECTORY and
+   bound that staged parent back over the real parent, which made the
+   whole `refs/heads` directory writable. A cron worker could then
+   create and move arbitrary sibling refs:
+
+   ```
+   git update-ref refs/heads/attacker <real-commit>   # succeeded
+   touch .git/refs/heads/attacker                     # succeeded
+   ```
+
+   The pre-existing cron probe missed it because it targeted a
+   nonexistent object (`deadbeef...`), which git rejects regardless of
+   filesystem permissions — the probe passed for the wrong reason. The
+   probe now uses a real commit object, and
+   `test_cron_file_carve_out_does_not_widen_to_refs_heads` covers the
+   cron path explicitly (the dispatch path was already covered).
 
    **Caveats** (measured, not surprises):
 

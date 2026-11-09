@@ -38,8 +38,14 @@ Carve-out set (exactly this, no more):
   updates where the target SHA matched the current value). The narrow
   carve-out refuses cross-branch moves while still letting the worker
   commit on its own branch via the standard git plumbing.
+* On the **cron** path the branch is top-level (e.g.
+  ``canonical-deploy-t_7161d9a9``), so the carve-out is the branch ref
+  **FILE** rather than a directory. The carve-out stays ONE ref file:
+  ``refs/heads`` itself is never bound rw, so sibling refs stay
+  read-only and a cron worker cannot create or move another branch
+  (widening regression caught in review round 1 of ``t_034e4912``).
 
-Three traps (all measured):
+Four traps (all measured):
 
 * Carve-outs must be sourced from an **rw staging bind taken before the
   tree is flipped ro** -- a bind from an already-ro mount inherits
@@ -49,6 +55,12 @@ Three traps (all measured):
   the tree and move protected refs cross-branch even though the canonical
   path is read-only (``t_034e4912``). The staging bind is unmounted as
   soon as the carve-out bind lands, so the worker never sees it.
+* A **file** carve-out is staged as the FILE ITSELF, never through its
+  parent directory. Staging the parent and binding it back over the real
+  parent widens the carve-out from one ref to the whole ``refs/heads``
+  directory, because the staged parent is an rw bind taken before the
+  flip -- and that re-opens the cross-branch-update hole the narrow
+  carve-out exists to close.
 * ``.git/worktrees`` must be carved out **per worktree name**, not as a whole
   directory.
 * ``.git/refs/heads`` must be carved out **per branch directory**, not as a
@@ -721,7 +733,7 @@ def _enter_isolation(
         # spawn leaked one ``/tmp/hermes-isolate-stage.*`` directory (3550
         # of them had accumulated on the production host).
         # ------------------------------------------------------------------
-        for _sub, _src, stage_slot in staged:
+        for _sub, stage_slot, _is_file in staged:
             _umount(stage_slot)
         _rmtree_staging(stage)
 
@@ -804,8 +816,8 @@ def _carve_out_set(
 def _stage_carve_outs(carve: Sequence[str], stage: str) -> List[tuple]:
     """Phase A -- take a dedicated rw staging bind of each carve-out subtree.
 
-    Returns a list of ``(carve-out target, staged source, staging slot)``
-    triples, one per carve-out whose rw copy was staged.
+    Returns a list of ``(carve-out target, staging slot, is_file)`` triples,
+    one per carve-out whose rw copy was staged.
 
     Only the carve-out SUBTREES are staged -- never the code tree. This
     is the whole point of the per-carve-out design (t_034e4912): the old
@@ -815,10 +827,19 @@ def _stage_carve_outs(carve: Sequence[str], stage: str) -> List[tuple]:
 
     A carve-out that cannot be staged is skipped, which leaves the worker
     with the standard ro denial on that path -- the safe default.
+
+    A FILE carve-out (the cron single-ref-file case) is staged as the FILE
+    ITSELF, never through its parent directory. Staging the parent and
+    binding it back over the real parent would widen the carve-out from
+    one ref to the whole ``refs/heads`` directory, which re-opens the
+    cross-branch-update hole the design exists to close: the staged parent
+    is an rw bind taken BEFORE the tree is flipped ro, so it carries rw,
+    and binding it over ``refs/heads`` makes every sibling ref writable
+    (regression found in review round 1 of t_034e4912).
     """
     staged: List[tuple] = []
     for idx, sub in enumerate(carve):
-        src_for_stage = sub
+        is_file = False
         if not os.path.lexists(sub):
             # The carve-out path does not exist yet on this host -- the
             # usual case is the worker's own branch ref dir for a branch
@@ -845,23 +866,31 @@ def _stage_carve_outs(carve: Sequence[str], stage: str) -> List[tuple]:
                 # standard ro denial, which is the safe default.
                 continue
         elif os.path.isfile(sub):
-            # A FILE carve-out (the cron single-ref-file case) is staged
-            # through its parent directory: a bind of a file needs a file
-            # target, and the carve-out target must keep its own shape.
-            src_for_stage = os.path.dirname(sub)
-            if not os.path.lexists(src_for_stage):
-                continue
+            # A FILE carve-out (the cron single-ref-file case). Stage the
+            # file itself: the staging slot is a FILE, and the bind
+            # source is the real ref file -- not its parent directory.
+            is_file = True
         stage_slot = os.path.join(stage, "c%03d" % idx)
-        try:
-            os.makedirs(stage_slot, exist_ok=True)
-        except OSError:
-            continue
+        if is_file:
+            # A file bind needs the mount POINT to exist and to be a file.
+            try:
+                with open(stage_slot, "wb"):
+                    pass
+            except OSError:
+                continue
+            src_for_stage = sub
+        else:
+            try:
+                os.makedirs(stage_slot, exist_ok=True)
+            except OSError:
+                continue
+            src_for_stage = sub
         if _mount(["--bind", src_for_stage, stage_slot]) != 0:
             # Could not stage this carve-out rw. Leaving it out means the
             # worker gets the standard ro denial on it -- the safe default
             # (same as the pre-existing "path does not exist" skip).
             continue
-        staged.append((sub, src_for_stage, stage_slot))
+        staged.append((sub, stage_slot, is_file))
     return staged
 
 
@@ -875,24 +904,15 @@ def _bind_carve_outs(staged: Sequence[tuple]) -> int:
 
     Returns 0 on success, 94 when a carve-out bind fails.
     """
-    for sub, _src_for_stage, stage_slot in staged:
-        if os.path.isfile(sub):
-            # File carve-out (the cron single-ref-file case): the staged
-            # slot holds the ref file's PARENT directory, so bind that
-            # parent over the real parent first, then bind the staged
-            # FILE over the real file. The parent's other entries stay
-            # read-only because the staged parent is a bind of the (now
-            # ro) real parent.
-            real_parent = os.path.dirname(sub)
-            if _mount(["--bind", stage_slot, real_parent]) != 0:
-                return 94
-            file_slot = os.path.join(stage_slot, os.path.basename(sub))
-            if os.path.lexists(file_slot):
-                if _mount(["--bind", file_slot, sub]) != 0:
-                    return 94
-        else:
-            if _mount(["--bind", stage_slot, sub]) != 0:
-                return 94
+    for sub, stage_slot, is_file in staged:
+        # A file carve-out binds the staged FILE over the real file. The
+        # real file's parent directory is NEVER bound over, so sibling refs
+        # stay read-only and a worker cannot create or move another
+        # branch. The bind must land AFTER the production tree's ro flip
+        # (phase B) -- a bind over an already-ro parent inherits the
+        # parent's read-only state -- which is the order phase C runs in.
+        if _mount(["--bind", stage_slot, sub]) != 0:
+            return 94
         # Tear the staging bind down NOW. The carve-out holds its own
         # reference to the underlying inode, so it stays writable.
         _umount(stage_slot)
@@ -978,6 +998,13 @@ def _agent_home_branch_ref_dir(agent_home: str) -> Optional[str]:
       is sufficient because git's ref-update syscall targets only that
       one file (sibling refs in the same directory stay ro and
       ``git update-ref refs/heads/<other-branch>`` is denied).
+
+      The staging step must honour the same rule: the ref FILE is
+      staged as a file, and the launcher never binds ``refs/heads``
+      itself. Staging the parent directory and binding it back over the
+      real parent would make the whole directory rw, which lets a cron
+      worker create and move sibling refs -- the widening regression
+      caught in review round 1 of ``t_034e4912``.
 
     Returns ``None`` when:
 
