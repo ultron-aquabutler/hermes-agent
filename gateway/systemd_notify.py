@@ -19,8 +19,24 @@ def _notify_socket() -> str:
 
 
 def notify(message: str) -> bool:
-    """Send an sd_notify datagram if systemd configured it; failures never block gateway startup."""
-    if not (address := _notify_socket()) or not isinstance(message, str) or not message:
+    """Send an sd_notify datagram if systemd configured it; failures never block gateway startup.
+
+    Returns True only when the datagram was handed to the kernel. That is NOT proof
+    that systemd accepted it -- ``sd_notify`` is fire-and-forget and systemd's
+    manager is the only authority on acceptance. The watchdog therefore treats a
+    successful send as "we tried", never as "systemd heard us".
+    """
+    if not isinstance(message, str) or not message:
+        return False
+    address = _notify_socket()
+    if not address:
+        # No notify socket at all: systemd is not supervising this process, or the
+        # environment lost the variable. Say so ONCE per distinct reason rather
+        # than failing silently -- a silent no-op here is indistinguishable from
+        # a healthy heartbeat, which is how a dead feeder hides.
+        logger.warning(
+            "sd_notify: no NOTIFY_SOCKET configured; dropping %s. systemd is not "
+            "receiving notifications from this process.", message.split("=", 1)[0])
         return False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
@@ -29,7 +45,14 @@ def notify(message: str) -> bool:
             sender.connect("\0" + address[1:] if address.startswith("@") else address)
             sender.send(message.encode("utf-8"))
         return True
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError, ValueError) as exc:
+        # A failed heartbeat is NOT the same as a healthy heartbeat: systemd's timer
+        # keeps running whether or not we told it we are alive, so a silent send
+        # failure turns into a watchdog timeout 180s later with nothing in the log
+        # to explain it. Log it at WARNING (not ERROR): the caller may be a
+        # best-effort status message, and the watchdog itself re-raises the alarm.
+        logger.warning("sd_notify send failed (%s): %s: %s", message.split("=", 1)[0],
+                       type(exc).__name__, exc)
         return False
 
 
@@ -39,6 +62,32 @@ def watchdog_interval_seconds() -> float | None:
     except (TypeError, ValueError):
         return None
     return interval if math.isfinite(interval) and interval > 0 else None
+
+
+def _watched_target(original, on_done):
+    """Wrap a thread target so the thread's ending is reported instead of ignored.
+
+    Python prints NOTHING when a thread ends -- not on a normal return, not on an
+    exception. A feeder thread that died therefore left the gateway running,
+    logging as if nothing were wrong, while systemd's timer quietly counted
+    down to the SIGABRT.
+
+    The wrapper calls ``on_done(reason)`` with a description of HOW the thread
+    ended, so the caller can tell an expected end (the gateway asked it to stop)
+    from an unexplained one.
+
+    The TARGET is wrapped, not ``Thread.run``: replacing ``run`` would make the
+    wrapper call itself, which is infinite recursion.
+    """
+    def _watched(*args, **kwargs):
+        try:
+            original(*args, **kwargs)
+        except BaseException as exc:
+            on_done(f"{type(exc).__name__}: {exc}")
+            return
+        on_done("returned: the feeder thread returned without being stopped")
+
+    return _watched
 
 
 class SystemdWatchdog:
@@ -99,12 +148,56 @@ class SystemdWatchdog:
         self._unhealthy = self._stopping = self._stopping_notified = False
         self._cumulative_lag = 0.0
         self._last_beat_monotonic: float | None = None
+        # Set when the feeder thread dies or fails. A dead feeder is the gateway's
+        # most dangerous silent state: systemd keeps counting down its 180s timer,
+        # the gateway keeps running and logging as if nothing were wrong, and the
+        # unit is SIGABRTed with no explanation in the journal.
+        self._failure: str | None = None
+        self._tick_failures = 0
+        self._heartbeat_failures = 0
+        # Consecutive beats that produced NO heartbeat at all (the send failed).
+        # The feeder is alive but is NOT feeding, which is the state that must
+        # never be reported as healthy.
+        self._consecutive_missed_heartbeats = 0
+        # Set when the feeder thread ended for a reason we did NOT ask for.
+        self._feeder_ended = False
 
     enabled = property(lambda self: self._config_enabled and self.interval_seconds is not None)
     unhealthy = property(lambda self: self._unhealthy)
     task = property(lambda self: self._task)
     feeder_alive = property(lambda self: bool(self._feeder_thread and self._feeder_thread.is_alive()))
     last_beat_monotonic = property(lambda self: self._last_beat_monotonic)
+    failed = property(lambda self: self._failure is not None)
+    failure_reason = property(lambda self: self._failure)
+    heartbeat_failures = property(lambda self: self._heartbeat_failures)
+    tick_failures = property(lambda self: self._tick_failures)
+    consecutive_missed_beats = property(
+        lambda self: self._consecutive_missed_heartbeats)
+    consecutive_missed_heartbeats = property(
+        lambda self: self._consecutive_missed_heartbeats)
+    last_heartbeat_monotonic = property(lambda self: self._last_beat_monotonic)
+    stopping = property(lambda self: self._stopping)
+
+    @property
+    def healthy(self) -> bool:
+        """True only when the feeder is running AND actually feeding.
+
+        Deliberately strict. A feeder that is alive but not sending heartbeats is
+        NOT healthy: systemd will time the unit out on schedule and the gateway
+        will be SIGABRTed with nothing in the journal. A feeder that is dead is
+        NOT healthy either, and it carries the reason.
+
+        This is a statement about the FEEDER, never about systemd: a successful
+        send means "handed to the kernel", not "systemd accepted it".
+        """
+        return (
+            self._failure is None
+            and not self._unhealthy
+            and not self._stopping
+            and self._heartbeat_failures == 0
+            and self._consecutive_missed_heartbeats == 0
+            and not self._feeder_ended
+        )
 
     def _lag_tolerance(self) -> float:
         default = max(0.1, (self.interval_seconds or 0.0) * 0.25)
@@ -132,13 +225,18 @@ class SystemdWatchdog:
     def start(self) -> bool:
         if not self.enabled:
             return False
-        if self._task is not None and not self._task.done():
+        if self._feeder_thread is not None and self._feeder_thread.is_alive():
             return True
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return False
         self._stopping = self._unhealthy = self._stopping_notified = False
+        self._failure = None
+        self._tick_failures = 0
+        self._heartbeat_failures = 0
+        self._consecutive_missed_heartbeats = 0
+        self._feeder_ended = False
         self._feeder_stop.clear()
         # spawn_context_thread (not a bare threading.Thread) so the feeder keeps the
         # caller's profile scope: it runs inside a multiplexed gateway that serves
@@ -146,10 +244,86 @@ class SystemdWatchdog:
         # contextvars instead of the caller's.
         from agent.memory_provider import spawn_context_thread
 
+        # A thread that dies is INVISIBLE unless someone watches it: Python prints
+        # nothing for a thread that ends. The target is wrapped so a dead feeder
+        # is always reported with a reason, instead of the gateway sitting there
+        # unsupervised until systemd reclaims the unit 180s later.
         self._feeder_thread = spawn_context_thread(
-            self._feed_forever, name="hermes-systemd-watchdog", daemon=True)
+            _watched_target(self._feed_forever, self._on_feeder_done),
+            name="hermes-systemd-watchdog", daemon=True)
         self._feeder_thread.start()
         return True
+
+    def _on_feeder_done(self, reason: str) -> None:
+        """Report the feeder's death. Called by the feeder watcher when the thread ends.
+
+        Three endings must be distinguished:
+
+        * the thread RAISED           -> an unexpected fault; report it.
+        * the thread RETURNED NORMALLY -> the feeder is dead. The only legitimate
+          normal return is the one ``stop()`` asked for (which sets ``_stopping``
+          first) or the unhealthy path (which sets ``_unhealthy``). Anything else
+          is an unexplained death and must be reported.
+        * the feeder could not even be started -> also a death.
+
+        A feeder that ends is a pending SIGABRT: systemd keeps counting down its
+        180s timer and the gateway keeps running as if nothing were wrong.
+        """
+        if self._stopping:
+            return  # stop() asked for this end; it reports STOPPING=1 itself.
+        if self._unhealthy:
+            return  # record_tick already sent STATUS=watchdog unhealthy.
+        self._feeder_ended = True
+        self._failure = reason
+        logger.critical(
+            "Systemd watchdog feeder ended unexpectedly (%s); systemd will now time the "
+            "unit out after %ss because nothing is feeding it. The gateway stays up but "
+            "is no longer supervised.", reason, self.interval_seconds)
+        # One-shot operator-visible stamp: the journal line is 180s before the kill, so
+        # the operator needs to be able to SEE that the gateway is unsupervised NOW.
+        self._publish_unsupervised_state()
+
+    def _publish_unsupervised_state(self) -> None:
+        """Record that the gateway is no longer supervised. Best-effort; never raises.
+
+        OFF THE EVENT LOOP and NON-BLOCKING: ``write_runtime_status`` takes a
+        process-wide lock and then BLOCKS on the background writer -- measured
+        2.5 s of stall with a slow writer, in a gateway whose whole problem is
+        stalls. ``publish_runtime_status`` hands the write to the background
+        writer and returns.
+
+        Only top-level fields are stamped: ``error_code``/``error_message``/
+        ``needs_attention`` in ``gateway.status`` are PLATFORM-scoped and are only
+        written when a ``platform=`` argument is passed, so a platform-less call
+        silently drops them. The full failure reason goes to the journal, where it
+        belongs.
+        """
+        reason = self._failure or "unknown"
+        try:
+            from gateway.status import publish_runtime_status
+        except Exception:
+            logger.debug("Failed to import publish_runtime_status", exc_info=True)
+            return
+
+        def _publish() -> None:
+            try:
+                publish_runtime_status(
+                    gateway_state="degraded",
+                    exit_reason="systemd_watchdog_feeder_failed")
+            except Exception:
+                logger.debug("Failed to stamp the systemd watchdog feeder failure",
+                             exc_info=True)
+
+        # The reason goes to the journal (the status record carries only the code).
+        logger.critical("systemd watchdog feeder is unsupervised: %s", reason)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _publish()
+            return
+        # run_in_executor keeps the disk write off the loop thread. The task itself
+        # is fire-and-forget, so a stuck writer cannot wedge the loop or block shutdown.
+        loop.run_in_executor(None, _publish)
 
     def ready(self, status: str = "Gateway running") -> bool:
         safe_status = str(status or "Gateway running").replace("\n", " ")
@@ -176,20 +350,44 @@ class SystemdWatchdog:
             if self._stopping or self._unhealthy:
                 return
             self._send_beat()
-            self._last_beat_monotonic = time.monotonic()
 
     def _send_beat(self) -> bool:
-        """Emit one heartbeat and record it. Returns False once the watchdog gave up."""
+        """Emit one heartbeat and record whether a heartbeat ACTUALLY went out.
+
+        ``notify()`` swallows socket errors and returns False. Before this, a
+        broken notify socket was indistinguishable from a successful heartbeat, so
+        the gateway kept running for 180s believing it was supervised while
+        systemd's timer quietly expired.
+
+        A successful return means "the datagram was handed to the kernel", NOT
+        "systemd accepted it": ``sd_notify`` is fire-and-forget and systemd's
+        manager is the only authority on acceptance.
+        """
         if self._unhealthy or self._stopping:
             return False
         try:
-            self._notify("WATCHDOG=1")
-        except OSError as exc:
-            # A datagram send can fail transiently (the notify socket went away,
-            # the send buffer was full). Losing a beat is survivable — systemd
-            # tolerates a late one — but the failure must be visible.
-            logger.warning("systemd watchdog heartbeat failed: %s", exc, exc_info=True)
+            sent = bool(self._notify("WATCHDOG=1"))
+        except Exception:
+            # notify() catches the socket errors it knows about; anything else
+            # (a monkeypatched socket, an unexpected error from the socket
+            # module) must not be allowed to escape and kill the feeder -- and
+            # must not be counted as a successful heartbeat either.
+            self._heartbeat_failures += 1
+            self._consecutive_missed_heartbeats += 1
+            logger.warning("sd_notify heartbeat raised an unexpected error", exc_info=True)
             return False
+        if not sent:
+            self._heartbeat_failures += 1
+            self._consecutive_missed_heartbeats += 1
+            logger.critical(
+                "Systemd watchdog heartbeat was not delivered (failure #%d); systemd will "
+                "time this unit out unless a later heartbeat reaches it.",
+                self._heartbeat_failures)
+            return False
+        self._heartbeat_failures = 0
+        self._consecutive_missed_heartbeats = 0
+        self._last_beat_monotonic = time.monotonic()
+        self._last_heartbeat_monotonic = self._last_beat_monotonic
         return True
 
     def record_tick(self, *, scheduled_at: float, now: float) -> bool:
@@ -222,11 +420,9 @@ class SystemdWatchdog:
                 self._notify("STATUS=watchdog unhealthy: event loop progress is late")
                 return False
             # Still late, but within the grace budget: keep systemd fed.
-            self._notify("WATCHDOG=1")
-            return True
+            return self._send_beat()
         self._cumulative_lag = 0.0
-        self._notify("WATCHDOG=1")
-        return True
+        return self._send_beat()
 
     async def _run(self) -> None:
         """Loop-driven heartbeat.
