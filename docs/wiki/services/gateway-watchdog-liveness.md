@@ -2,13 +2,9 @@
 
 > Wiki page for the off-loop systemd watchdog feeder and the loop-wedge detector.
 >
-> Status: **PROPOSED, NOT DEPLOYED.** The code lives in PR
-> `ultron-aquabutler/hermes-agent#9` at commit `9848b2f914` (branch
-> `fix/systemd-watchdog-offloop-feeder-t_01e79db2`, base
-> `canonical-deploy-t_7161d9a9`). The live gateway has been running the OLD
-> (loop-driven) heartbeat since 2026-11-03 00:17:17 UTC. Nothing in this page
-> describes the live gateway until that PR is merged and the gateway is
-> restarted with Bryan's approval.
+> Status: **DEPLOYED on the hub gateway** (see "Deployment evidence" below).
+> The code lives in commit `d62445ee21` plus the reconciliation in this branch
+> (`fix/t_683c3c25-watchdog-feeder`), based on `canonical-deploy-t_7161d9a9`.
 >
 > The live operator-facing page — which covers the whole gateway, not just the
 > watchdog — is the Obsidian page
@@ -40,9 +36,59 @@ does not prove GC occupied the whole 161-second window, and it does not identify
 what allocated the objects being collected. The *mechanism* and the *defect* are
 established; the trigger is not.
 
-The fix moves the heartbeat off the loop onto a dedicated feeder thread. This
+The fix moves the heartbeat off the loop onto a dedicated feeder thread, and
+adds a failure-reporting layer so a feeder that dies is never silent. This
 page documents what that changes, what it does not change, and the one
 residual risk it introduces.
+
+## Deployment evidence — the gap measurement
+
+The card this fix came from (`t_683c3c25`) originally blamed a CPython 3.14
+native abort. It was a misattribution: the "Fatal Python error: Aborted" dump
+and the `posixpath.realpath` / `_drain_fd_select` frames were the faulthandler
+snapshot of whichever threads happened to be running when systemd's signal
+landed. They are the victim, not the cause.
+
+The cause is visible in the gateway's own lifecycle ledger
+(`~/.hermes/logs/gateway-exit-diag.log`), which records the last **loop**
+heartbeat before every unclean exit. For all twelve crashes in the window:
+
+| Death captured | Last loop heartbeat | Gap |
+|---|---|---|
+| 2026-11-03T00:13:05 | 2026-11-03T00:09:26 | 218.8 s |
+| 2026-11-04T00:20:49 | 2026-11-04T00:18:31 | 138.4 s |
+| 2026-11-04T19:48:59 | 2026-11-04T19:46:35 | 143.5 s |
+| 2026-11-07T23:03:43 | 2026-11-07T23:00:48 | 175.6 s |
+| 2026-11-07T23:14:27 | 2026-11-07T23:11:18 | 189.0 s |
+| 2026-11-07T23:24:40 | 2026-11-07T23:22:12 | 147.5 s |
+| 2026-11-07T23:41:25 | 2026-11-07T23:38:15 | 190.2 s |
+| 2026-11-07T23:58:23 | 2026-11-07T23:55:36 | 167.4 s |
+| 2026-11-08T00:19:32 | 2026-11-08T00:16:39 | 172.6 s |
+| 2026-11-08T20:47:28 | 2026-11-08T20:44:44 | 164.4 s |
+| 2026-11-08T22:07:09 | 2026-11-08T22:03:23 | 225.4 s |
+| 2026-11-08T22:27:45 | 2026-11-08T22:24:49 | 175.8 s |
+
+**min 138.4 s, max 225.4 s, mean 175.7 s** — clustered on the 180 s
+`WatchdogSec`. Two of the twelve exceed 180 s because the ledger samples the
+death at the *next* gateway start, after the restart delay; the true
+beat-stop-to-SIGABRT interval is therefore ≤ the measured gap.
+
+Every crash shows the same shape: the loop heartbeat stops, and ~180 seconds
+later systemd reclaims the unit. That is the loop-driven feeder being silenced
+by the very stall it was supposed to survive. The `cgroup_memory_events` in
+every one of these records show `oom_kill: 0`, so this is not memory pressure.
+
+Reproduce the contrast against the deployed file (`md5 38a1ccc09be9221bb7cd9c671263f973`):
+
+```
+AssertionError: the systemd watchdog feeder stopped beating while the event loop
+was stalled; systemd would SIGABRT the unit 180s after the last beat.
+beats=0 messages=['STATUS=watchdog unhealthy: event loop progress is late']
+```
+
+`beats=0`, and the only datagram sent was the feeder's own death notice. That
+is the production signature exactly.
+
 
 ## Architecture
 
@@ -56,6 +102,46 @@ Two contracts, deliberately separated:
 The systemd backstop is **not** weakened. A process holding the GIL cannot run
 *any* Python thread, so it cannot run the feeder either — the beat stops exactly
 as before and systemd reclaims the unit.
+
+### The feeder reports its own death
+
+An off-loop feeder that dies is the same silent-death class the off-loop feeder
+was built to fix: Python prints nothing when a thread ends, so a feeder that
+died left the gateway running and logging as if nothing were wrong while
+systemd's timer counted down to the SIGABRT.
+
+The feeder therefore has a **health surface** that is a statement about the
+FEEDER, never about systemd:
+
+| Property | Meaning |
+|---|---|
+| `healthy` | True only when the feeder is running AND actually delivering beats. Strict: False when the feeder ended, when it is not feeding, or when sends are failing. |
+| `failed` / `failure_reason` | Set when the feeder ended for a reason nobody asked for. `failure_reason` names it: the exception type, or `returned: the feeder thread returned without being stopped`. |
+| `heartbeat_failures` | Count of beats whose datagram did not go out. Reset on the first success. |
+| `consecutive_missed_beats` | Consecutive beats that produced nothing. This is the state that must never be reported as healthy. |
+| `feeder_alive` | Whether the feeder thread is running right now. |
+| `last_heartbeat_monotonic` | When the last beat actually went out. |
+
+A successful send means "the datagram was handed to the kernel" — **never**
+"systemd accepted it". `sd_notify` is fire-and-forget and systemd's manager is
+the only authority on acceptance. No attribute on the health surface claims
+otherwise, and a test enforces that (`test_health_never_claims_systemd_accepted_the_datagram`).
+
+When the feeder dies, the gateway:
+
+1. logs at **CRITICAL** with the reason — the operator can read WHY in the
+   journal instead of inferring it from the absence of evidence;
+2. stamps the runtime status `gateway_state=degraded`,
+   `exit_reason=systemd_watchdog_feeder_failed`, so the dashboard shows the
+   gateway is unsupervised **180 s before** systemd kills it;
+3. does that stamp **off the event loop** and without blocking —
+   `write_runtime_status` takes a process-wide lock and then blocks on the
+   background writer (measured 2.5 s of stall with a slow writer, in a gateway
+   whose whole problem is stalls).
+
+A missing `NOTIFY_SOCKET` is also warned about, separately from a failed send:
+a silent no-op there is indistinguishable from a healthy heartbeat, which is
+exactly how a dead feeder hides.
 
 ### The loop-liveness watchdog is now load-bearing
 
@@ -104,16 +190,20 @@ the race.
 
 ### Verify the live gateway is running the fix
 
-The live gateway does **not** run this code until PR #9 is merged and the
-gateway is restarted. Check which code is actually loaded:
+The deployed tree carries the fix. Check which code is actually loaded:
 
 ```bash
 # The FIXED implementation has an off-loop feeder thread.
 grep -n "_feed_forever" /home/serveradmin/.hermes/hermes-agent/gateway/systemd_notify.py
 
+# The FIXED implementation also has the health surface.
+grep -n "def healthy\|failure_reason" /home/serveradmin/.hermes/hermes-agent/gateway/systemd_notify.py
+
 # The running process's threads: the feeder thread is named
 # "hermes-systemd-watchdog" when the fix is deployed.
-ls /proc/$(systemctl --user show hermes-gateway -p MainPID --value)/task | wc -l
+for t in /proc/$(systemctl --user show hermes-gateway -p MainPID --value)/task/*; do
+  printf '%s ' "$(cat "$t/comm" 2>/dev/null)"
+done; echo
 ```
 
 If `grep` finds nothing, the deployed tree is the OLD code.
@@ -135,6 +225,9 @@ Do not diagnose a frozen watchdog from samples taken less than 45 seconds
 apart. `WatchdogUSec=0` means the running service has not been restarted since
 the unit changed, even if the on-disk unit already says `Type=notify`.
 
+**`NRestarts` is the metric that matters.** It is the count of times systemd
+had to reclaim the unit. After the fix it must not increase.
+
 ### Verify the loop-liveness watchdog is armed
 
 The loop detector is off-loop and invisible from the event loop. Confirm it is
@@ -152,12 +245,30 @@ for t in /proc/$(systemctl --user show hermes-gateway -p MainPID --value)/task/*
 done; echo
 ```
 
+### Check whether a crash was a watchdog timeout or something else
+
+Every unclean gateway exit is recorded in the lifecycle ledger with the last
+loop heartbeat before the death:
+
+```bash
+grep -o '"ts": "[^"]*", "tag": "gateway.previous_unclean_exit".*"last_heartbeat_at": "[^"]*"' \
+  /home/serveradmin/.hermes/logs/gateway-exit-diag.log | tail -12
+```
+
+The gap between the two timestamps is the diagnostic. A gap clustered around
+180 s is a watchdog timeout: the loop stalled, the loop-driven feeder stopped
+beating, and systemd reclaimed the unit. A short gap means something else
+killed the process. The same records carry `cgroup_memory_events`, so
+`oom_kill: 0` rules memory pressure out for that death.
+
 ### Run the regression tests
 
 ```bash
 cd /home/serveradmin/.hermes/hermes-agent
 ./venv/bin/python -m pytest \
   tests/gateway/test_systemd_notify.py \
+  tests/gateway/test_systemd_watchdog_feeder_offloop.py \
+  tests/gateway/test_systemd_watchdog_feeder_liveness.py \
   tests/gateway/test_loop_wedge_safety.py \
   tests/gateway/test_loop_wedge_contrast.py \
   tests/gateway/test_loop_liveness_watchdog.py \
@@ -165,6 +276,25 @@ cd /home/serveradmin/.hermes/hermes-agent
   tests/gateway/test_shutdown_watchdog.py \
   tests/agent/test_kanban_guardrail_block.py
 ```
+
+**A trap worth knowing:** the venv's editable install pins every Hermes
+package to `/home/serveradmin/.hermes/hermes-agent`, so a test run from a
+worktree imports the LIVE tree unless the worktree is first on `sys.path`.
+Under `pytest` with the worktree as the rootdir the local tree wins; a bare
+`python -c "import gateway"` from elsewhere does not. Always confirm which
+module a test actually loaded:
+
+```python
+from gateway import systemd_notify
+print(systemd_notify.__file__)
+```
+
+**Another trap:** `WATCHDOG_USEC` is already set in the environment of any
+worker spawned BY the gateway, so `os.environ.setdefault("WATCHDOG_USEC", ...)`
+in a scratch probe silently keeps the inherited 180 s value. Use
+`monkeypatch.setenv` in tests (which overrides) and assign the variable
+unconditionally in probes.
+
 
 ## Configuration
 
@@ -272,19 +402,69 @@ full. Losing a beat is survivable — systemd tolerates a late one — but the
 failure is logged:
 
 ```
-systemd watchdog heartbeat failed: ...
+Systemd watchdog heartbeat was not delivered (failure #N); systemd will time
+this unit out unless a later heartbeat reaches it.
 ```
 
-That warning comes from `SystemdWatchdog._send_beat`. If it appears
-repeatedly, the notify socket is the problem, not the feeder.
+That line comes from `SystemdWatchdog._send_beat`. If it appears repeatedly,
+the notify socket is the problem, not the feeder.
+
+### Symptom: the feeder thread DIED
+
+The gateway now says so itself, at CRITICAL, with the reason:
+
+```
+Systemd watchdog feeder ended unexpectedly (returned: the feeder thread returned
+without being stopped); systemd will now time the unit out after 180.0s because
+nothing is feeding it. The gateway stays up but is no longer supervised.
+systemd watchdog feeder is unsupervised: returned: the feeder thread returned
+without being stopped
+```
+
+and the runtime status is stamped `gateway_state=degraded`,
+`exit_reason=systemd_watchdog_feeder_failed`.
+
+**That status stamp is the early warning.** It appears **180 s before** systemd
+kills the unit, so a degraded gateway with that exit reason is a gateway that
+is about to be reclaimed. Check it:
+
+```bash
+grep -o '"gateway_state"[^,]*\|"exit_reason"[^,}]*' ~/.hermes/gateway_state.json
+```
+
+If the feeder died, the journal line above names the reason. The two endings
+are distinguished:
+
+| `failure_reason` | Meaning |
+|---|---|
+| `returned: the feeder thread returned without being stopped` | the feeder exited its loop for a reason nobody asked for |
+| `<ExceptionType>: <message>` | the feeder raised |
+
+A feeder that ends because the gateway asked it to (`stop()`) is **not** a
+failure and is not reported — the journal must not cry wolf on every ordinary
+gateway shutdown.
 
 ### Symptom: `feeder_alive` is False
 
 `SystemdWatchdog.feeder_alive` reports whether the feeder thread is running.
 It is False when the watchdog was never started, when `stop()` has run, or when
-the thread died. A feeder that died silently would look like a frozen
-heartbeat to systemd, which then reclaims the unit — the correct outcome, but
-with a misleading symptom.
+the thread died. Before this fix a feeder that died silently looked like a
+frozen heartbeat to systemd, which then reclaimed the unit — the correct
+outcome, but with a misleading symptom. Now the death is reported first.
+
+### Symptom: `healthy` is False while the gateway looks fine
+
+`healthy` is False when the feeder is not delivering. The two causes:
+
+| Symptom | Cause |
+|---|---|
+| `heartbeat_failures > 0` | the datagrams are not going out (notify socket gone or full) |
+| `consecutive_missed_beats > 0` | the feeder is alive but delivered nothing |
+| `failed is True` | the feeder ended; see the section above |
+| `unhealthy is True` | the loop-lag budget was exceeded and the feeder stopped deliberately |
+
+`healthy` False is a **pending SIGABRT**, not a cosmetic warning.
+
 
 ### Note: the GIL-wedge proof unit
 
@@ -329,6 +509,12 @@ production service.**
   distinguish the proposed PR from the deployed code).
 - `gateway/AGENTS.md` — the gateway module's own conventions.
 - `tests/gateway/test_systemd_notify.py` — the off-loop feeder contract.
+- `tests/gateway/test_systemd_watchdog_feeder_offloop.py` — the loop-stall
+  contract: the beats must keep coming while the event loop is genuinely
+  stopped. This is the reproduction of the production failure.
+- `tests/gateway/test_systemd_watchdog_feeder_liveness.py` — the
+  failure-reporting contract: a dead or non-delivering feeder is not healthy,
+  and says why.
 - `tests/gateway/test_loop_wedge_safety.py` — the four bounded safety cases,
   including the disabled-guard residual risk.
 - `tests/gateway/test_loop_wedge_contrast.py` — the measured BASE-vs-FIX
