@@ -204,6 +204,11 @@ def test_the_watchdog_interval_is_the_systems_contract_not_a_guess():
 
     The drop-in file name is not fixed by any contract, so glob for it rather
     than hard-coding a name that a future edit may change.
+
+    NOTE: parse only real config lines. A naive ``text.split("WatchdogSec=")``
+    picks up the OLD value out of a COMMENT (the drop-in documents the value
+    it replaced), and ``180s,`` is not an int. That is exactly the bug this
+    test had before it was fixed.
     """
     from pathlib import Path
 
@@ -212,15 +217,26 @@ def test_the_watchdog_interval_is_the_systems_contract_not_a_guess():
     watchdog_drops = [p for p in candidates if "WatchdogSec=" in p.read_text()]
     if not watchdog_drops:
         pytest.skip("watchdog drop-in is not installed on this host")
-    assert watchdog_drops, "a drop-in sets WatchdogSec but it declares no value"
 
-    value = 0
+    values = []
     for path in watchdog_drops:
         text = path.read_text()
-        assert "WatchdogSec=" in text, "the drop-in must set WatchdogSec explicitly"
-        value = int(text.split("WatchdogSec=")[1].split()[0].strip())
-        # 180s was the old value and it expired eleven times in three days.
-        assert value >= 600, f"WatchdogSec={value}s is too tight for a memory-throttled gateway"
+        # Only uncommented `Key=value` lines count as configuration.
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            if stripped.startswith("WatchdogSec="):
+                raw = stripped.split("=", 1)[1].strip().rstrip(",")
+                values.append((path, int(raw.rstrip("s"))))
+
+    assert values, "a drop-in sets WatchdogSec but no real config line was found"
+    # 180s was the old value and it expired eleven times in three days.
+    for path, value in values:
+        assert value >= 600, (
+            f"{path.name} sets WatchdogSec={value}s, which is too tight for a "
+            f"memory-throttled gateway"
+        )
 
 
 # ---------------------------------------------------------------------------
