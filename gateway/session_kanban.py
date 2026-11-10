@@ -280,6 +280,15 @@ def _run_worker_turns(agent, frame, history):
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
+        # Carry the machine-readable persistence cause into the recorded output.
+        # The dispatcher's dead-worker sweep reads THIS text, and without the
+        # cause it cannot tell "the owner was busy" (a lost receipt) from "the
+        # work failed" (a real error) - it used to see only the generic
+        # "the drive is out of room" advice and count the crash against the
+        # card's failure budget. t_c3e25704.
+        failure_reason = result.get('failure_reason') if isinstance(result, dict) else None
+        if failure_reason and 'session_persistence_failed' in str(failure_reason):
+            last_output = f"{last_output}\n{failure_reason}".strip()[-500:]
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))

@@ -233,3 +233,50 @@ class TestTheTurnIsNotDiscarded:
         source = inspect.getsource(session_persistence)
         assert "classify_persistence_error" in source
         assert "_last_persistence_error_cause" in source
+
+
+class TestTheCauseReachesTheDispatcher:
+    """The recorded worker output must carry the cause, or the sweep cannot see it.
+
+    This is the link that was MISSING on the first attempt at this fix. The
+    worker printed only the generic "the drive is out of room" advice; the
+    machine-readable ``failure_reason`` was dropped on the floor, so the
+    dispatcher's dead-worker sweep saw text with no cause in it and could not
+    tell a lost receipt from a real work failure. Verified against the REAL
+    crashed card: ``logs/t_9bef45b3.log`` contains zero occurrences of
+    ``worker_receipt_timeout``.
+    """
+
+    def test_the_worker_records_the_failure_reason(self):
+        import inspect
+
+        from gateway import session_kanban
+
+        source = inspect.getsource(session_kanban)
+        assert "failure_reason" in source, (
+            "the worker's recorded output must carry the machine-readable cause"
+        )
+        assert "session_persistence_failed" in source
+
+    def test_the_recorded_output_is_detected_by_the_sweep(self):
+        """End-to-end: what the worker records must be what the sweep reads."""
+        from hermes_cli.kanban_db_dispatch import _is_persistence_timeout_crash
+
+        final_response = (
+            "No reply: Hermes couldn't confirm that this conversation was saved "
+            "in time, so it stopped rather than lose your messages."
+        )
+        failure_reason = "session_persistence_failed:worker_receipt_timeout"
+        last_output = f"{final_response}\n{failure_reason}".strip()[-500:]
+
+        assert _is_persistence_timeout_crash(last_output), (
+            "the recorded output must be recognisable to the dead-worker sweep"
+        )
+
+    def test_a_real_work_failure_is_still_recognised_as_a_work_failure(self):
+        from hermes_cli.kanban_db_dispatch import _is_persistence_timeout_crash
+
+        assert not _is_persistence_timeout_crash("SyntaxError: invalid syntax")
+        assert not _is_persistence_timeout_crash(
+            "account entitlement is exhausted for z-ai/glm-5.2"
+        )
