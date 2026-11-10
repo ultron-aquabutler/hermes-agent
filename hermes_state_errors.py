@@ -98,7 +98,8 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing", "worker_receipt_timeout",
+    "unknown",
 )
 
 
@@ -280,6 +281,12 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
+    # A worker RPC to the owner (gateway) that the owner never confirmed in
+    # time. This is NOT a storage failure: the write may well have landed, and
+    # the turn's WORK was already done -- only the receipt was missing. It must
+    # not fall through to the generic "disk full / database locked" advice,
+    # which sends the triage at a completely wrong target (t_c3e25704).
+    (("worker_receipt_timeout",), "worker_receipt_timeout"),
     # RPC-wrapped errors lose their exception type; retain the same sidecar/main-file split.
     (("deleted state.db-wal", "deleted state.db-shm"), "deleted_wal"),
     (("was replaced underneath",), "replaced"),
@@ -299,7 +306,9 @@ def classify_persistence_error(exc_or_str) -> str:
     corruption to the FTS index (the transcript store is not damaged); "replaced" =
     main-file replacement; "deleted_wal" = a retired sidecar generation requiring
     capture inspection; "session_row_missing" = the session row was deleted under a
-    live agent (FK rejection; the flush recreates it)."""
+    live agent (FK rejection; the flush recreates it); "worker_receipt_timeout" =
+    the OWNER did not confirm the write in time (not a storage failure -- the
+    work was done and the write may well have landed; t_c3e25704)."""
     if exc_or_str is None:
         return "unknown"
     # Lease refusals contain neither "locked" nor "busy": match by type first,

@@ -47,6 +47,57 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+# The owner (gateway) answers a worker's persistence RPC with a receipt. How
+# long the worker waits for that receipt used to be a hardcoded 20 seconds,
+# which is short for an owner that is simultaneously running five platform
+# adapters, the kanban dispatcher, the cron scheduler, and every other
+# profile's sessions -- and whose state.db can be several GB, so a write can
+# legitimately take a while under write-transaction contention.
+#
+# A timeout here LOSES A COMPLETED TURN: the work is done, the assistant has
+# answered, and the only thing that failed is the confirmation. So the budget
+# must be generous enough that a slow owner does not discard finished work.
+#
+# Config: ``agent.worker_receipt_timeout_seconds`` (int seconds). The default
+# is 120s -- six times the old leash -- because the cost of a false timeout
+# (a whole turn lost, a card marked crashed, a failure counted against the
+# card's failure_limit) is far higher than the cost of waiting.
+#
+# Env override: ``HERMES_WORKER_RECEIPT_TIMEOUT_SECONDS`` (same convention as
+# the rest of the agent config knobs).
+_RECEIPT_TIMEOUT_DEFAULT_SECONDS = 120
+_RECEIPT_TIMEOUT_MIN_SECONDS = 5
+_RECEIPT_TIMEOUT_MAX_SECONDS = 3600
+
+
+def _RECEIPT_TIMEOUT_SECONDS() -> int:
+    """Seconds a worker waits for the owner's persistence receipt.
+
+    Read fresh each call so a config change takes effect without a restart.
+    Any failure (missing config, malformed value) falls back to the default
+    rather than failing the turn -- a persistence path must never be the
+    reason a turn dies.
+    """
+    raw = os.environ.get("HERMES_WORKER_RECEIPT_TIMEOUT_SECONDS")
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config as _load_config
+
+            cfg = _load_config() or {}
+            agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+            if isinstance(agent_cfg, dict):
+                raw = agent_cfg.get("worker_receipt_timeout_seconds")
+        except Exception:
+            raw = None
+    if raw is None:
+        return _RECEIPT_TIMEOUT_DEFAULT_SECONDS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _RECEIPT_TIMEOUT_DEFAULT_SECONDS
+    return max(_RECEIPT_TIMEOUT_MIN_SECONDS, min(value, _RECEIPT_TIMEOUT_MAX_SECONDS))
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -194,7 +245,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(_RECEIPT_TIMEOUT_SECONDS())
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

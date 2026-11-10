@@ -971,6 +971,27 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 
 WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our words, then the worker's
+# A worker whose turn COMPLETED and then failed only to get its persistence
+# receipt confirmed in time. The work was done; only the acknowledgement was
+# missing, and the write may well have landed. Counting this against the card's
+# failure budget spent the whole budget on identical infrastructure stalls and
+# gave up cards whose premise was fine (t_c3e25704).
+_PERSISTENCE_TIMEOUT_MARKERS = (
+    "worker_receipt_timeout",
+    "session_persistence_failed",
+)
+
+
+def _is_persistence_timeout_crash(error_text: str) -> bool:
+    """True when a crash is a lost persistence receipt rather than lost work.
+
+    The worker's own last output is appended to the error text after
+    ``WORKER_OUTPUT_SEP``, so the cause is visible there. Both markers are
+    checked because the receipt timeout surfaces as ``worker_receipt_timeout``
+    and the turn-level stamp is ``session_persistence_failed``.
+    """
+    text = (error_text or "").lower()
+    return any(marker in text for marker in _PERSISTENCE_TIMEOUT_MARKERS)
 _PROTOCOL_VIOLATION_ERROR = (
     # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
     # ``kanban_complete`` / ``kanban_block`` / ``kanban_request_review``. Overwhelmingly the work itself succeeded and only the
@@ -1306,6 +1327,17 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
+            # A lost persistence receipt is an INFRASTRUCTURE stall, not a work
+            # failure: the turn completed and only the owner's acknowledgement
+            # was late. Do not spend the card's failure budget on it, and do not
+            # let the systemic-fingerprint breaker trip on it either -- three
+            # identical receipt timeouts are one slow gateway, not three
+            # independent problems (t_c3e25704).
+            persistence_timeout = _is_persistence_timeout_crash(error_text)
+            if persistence_timeout:
+                extra["persistence_timeout"] = True
+                extra["sticky"] = False
+                is_systemic = False
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -1314,6 +1346,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
+                infrastructure=persistence_timeout,
             )
         if tripped:
             auto_blocked.append(tid)
