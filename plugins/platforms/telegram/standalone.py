@@ -304,10 +304,26 @@ def _escape_non_telegram_markup(text):
 def _telegram_format(message):
     """``(formatted, parse_mode, has_html)``: text using a Telegram HTML tag outside Markdown code
     is sent as HTML (any other markup escaped); otherwise Markdown -> MarkdownV2 via the adapter's
-    ``format_message``."""
+    ``format_message``.
+
+    The HTML detection is the SHARED helper (``telegram_markdown.has_html_tags``) - the same
+    one the gateway reply path uses through ``TelegramAdapter.format_for_send`` - so the two
+    paths cannot diverge. This path used to carry its own looser copy
+    (``_TELEGRAM_HTML_TAG_RE.search(...)``), which matched an UNBALANCED tag and so could put
+    prose like ``a <b`` into HTML mode, where Telegram rejects the whole message with a 400.
+    """
     from telegram.constants import ParseMode
-    # A tag shown as Markdown code (any backtick width, as the MarkdownV2 path reads it) is an example.
-    if _TELEGRAM_HTML_TAG_RE.search(_MD_CODE_RE.sub("", message)):
+    try:
+        from plugins.platforms.telegram.telegram_markdown import has_html_tags
+    except ImportError:
+        has_html_tags = None
+    if has_html_tags is not None:
+        html_mode = has_html_tags(message)
+    else:
+        # Helper unavailable: fall back to the local regex. A tag shown as Markdown code
+        # (any backtick width, as the MarkdownV2 path reads it) is an example, not markup.
+        html_mode = bool(_TELEGRAM_HTML_TAG_RE.search(_MD_CODE_RE.sub("", message)))
+    if html_mode:
         return _escape_non_telegram_markup(message), ParseMode.HTML, True
     mdv2 = _telegram_mdv2(message)
     return (message if mdv2 is None else mdv2), ParseMode.MARKDOWN_V2, False  # None: send as-is

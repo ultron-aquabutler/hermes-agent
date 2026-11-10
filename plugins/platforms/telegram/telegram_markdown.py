@@ -1,4 +1,8 @@
-"""Markdown -> Telegram MarkdownV2 conversion (the legacy, non-rich send path)."""
+"""Markdown -> Telegram MarkdownV2 conversion (the legacy, non-rich send path).
+
+Also owns the SEND-MODE decision (HTML vs MarkdownV2) that every Telegram send
+path must agree on — see :func:`has_html_tags` and :func:`detect_parse_mode`.
+"""
 
 import bisect
 import re
@@ -360,3 +364,194 @@ def escape_rich_currency_dollars(text: str) -> str:
     if '$' not in text:
         return text
     return _RICH_DOLLAR_RE.sub(lambda m: m.group(0) if m.group('keep') else '\\$', text)
+
+
+# ---------------------------------------------------------------------------
+# Send-mode detection: HTML or MarkdownV2?
+#
+# WHY THIS LIVES HERE
+# -------------------
+# Three send paths reach Telegram, and they do NOT accept the same input:
+#
+#   | Path                          | How it is sent           | Accepts     |
+#   |-------------------------------|-------------------------|-------------|
+#   | gateway reply (agent answer)  | format_message() -> MDV2| Markdown    |
+#   | standalone / _send_telegram   | sniffs for tags -> HTML | either      |
+#   | gateway rich-message path     | sendRichMessage         | Markdown    |
+#
+# The gateway reply path used to hard-code ``ParseMode.MARKDOWN_V2`` with no
+# HTML detection. Because Telegram's MarkdownV2 reserved set contains ``>`` but
+# NOT ``<``, the MarkdownV2 escaper escaped the ``>`` of a hand-written ``<b>``
+# and left the ``<`` alone::
+#
+#     input:    <b>Bold</b>
+#     escaped:  <b\\>Bold</b\\>
+#
+# Telegram accepts that with HTTP 200 (it is not a parse error) and renders
+# ``<b>Bold</b>`` as PLAIN TEXT — the user sees the tags. Observed 2026-10-29:
+# a 2.5 KB decision summary reached Bryan with every heading wrapped in visible
+# ``<b>`` tags. No error is ever logged, so the defect is invisible to every
+# error path — only the send-mode decision fixes it.
+#
+# This module holds the ONE detection routine used by every send path, so the
+# paths cannot drift apart again.
+#
+# THE DETECTION RULE
+# ------------------
+# A text is treated as HTML only when it contains **well-formed, balanced tags
+# whose names Telegram supports**. That is deliberately stricter than a naive
+# ``<[a-zA-Z/][^>]*>`` sniff, which misfires on ordinary prose:
+#
+#   * ``a < b``      — a less-than sign in prose. NOT HTML.
+#   * ``x <y> z``    — angle brackets around a word. NOT HTML (and would be a
+#                      Telegram 400 if sent as HTML, since ``<y>`` is not a
+#                      supported tag).
+#   * ``5<10``       — arithmetic. NOT HTML.
+#   * ``<b>x</b>``   — a real tag. HTML.
+#
+# Requiring *balanced* known tags also rejects half-written markup
+# (``a <b and b> c``, ``<b>unclosed``) that Telegram would reject.
+#
+# MIXED CONTENT
+# -------------
+# A message may contain both real tags and prose ``<``. When we switch a message
+# to HTML mode, every ``<`` that is NOT the start of a recognised tag is escaped
+# to ``&lt;`` — otherwise Telegram's HTML parser would either drop the text or
+# reject the message outright.
+# ---------------------------------------------------------------------------
+
+# The tag names Telegram's HTML parse_mode actually supports.
+# https://core.telegram.org/bots/api#formatting-options
+#
+# This is the AUTHORITATIVE list for send-mode detection. It is a superset of
+# the tags Telegram documents, matching what the standalone send path already
+# accepted, so a message that used to be sent as HTML is not silently
+# downgraded to MarkdownV2 (which would show the tags literally).
+_TELEGRAM_HTML_TAGS = (
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a",
+    "code", "pre", "blockquote", "tg-spoiler", "span", "tg-emoji",
+)
+
+# Longest-first so ``<tg-emoji>`` wins over ``<tg>``-style prefixes.
+_HTML_TAG_ALT = "|".join(sorted(_TELEGRAM_HTML_TAGS, key=len, reverse=True))
+
+# A character entity Telegram's HTML parser accepts. Matched so
+# escape_html_text() can preserve an entity that is already written, instead of
+# turning ``&amp;`` into ``&amp;amp;``.
+_HTML_ENTITY_RE = re.compile(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);")
+
+# A single recognised tag: opening or closing, optionally with attributes.
+# Attribute values may contain ``>`` (e.g. ``href="a>b"``), so quoted values
+# are matched atomically and a trailing ``>`` is required.
+_HTML_TAG_RE = re.compile(
+    rf"""</?(?:{_HTML_TAG_ALT})(?:\s(?:[^>"']++|"[^"]*+"|'[^']*+')*+)?>""", re.IGNORECASE)
+
+# Opening/closing pairs, used for the balance check.
+_HTML_PAIR_RE = re.compile(rf"<(/?)({_HTML_TAG_ALT})\b", re.IGNORECASE)
+
+
+def has_html_tags(text: str) -> bool:
+    """True when *text* contains balanced, well-formed, Telegram-supported HTML tags.
+
+    Deliberately stricter than a bare ``<[a-zA-Z/][^>]*>`` sniff so that prose
+    containing ``<`` (comparisons, shell redirects, angle-bracketed
+    placeholders) is NOT misread as markup — see the module docstring for the
+    case table.
+
+    A tag inside a Markdown code span/fence is an EXAMPLE, not markup: the
+    MarkdownV2 path renders it verbatim, so it must not push the message into
+    HTML mode.
+    """
+    if not text:
+        return False
+    # Code spans/fences are excluded first: a ``<b>`` shown as an example is
+    # code, not markup.
+    candidate = _MD_CODE_RE.sub("", text)
+    if not _HTML_TAG_RE.search(candidate):
+        return False
+    # Balance check: every opening tag must be closed by a matching closing tag,
+    # in order. Unbalanced or crossed markup is not trustworthy as HTML.
+    stack: list[str] = []
+    for match in _HTML_PAIR_RE.finditer(candidate):
+        closing = match.group(1) == "/"
+        name = match.group(2).lower()
+        if closing:
+            if not stack or stack[-1] != name:
+                return False
+            stack.pop()
+        else:
+            stack.append(name)
+    return not stack
+
+
+def escape_html_text(text: str) -> str:
+    """Escape *text* for Telegram's HTML parse_mode, preserving real tags.
+
+    Recognised tags pass through untouched; every other ``<`` becomes ``&lt;``
+    so Telegram's HTML parser cannot mistake prose for markup (and reject the
+    message with HTTP 400). ``&`` is escaped too — outside a tag it is a
+    literal ampersand in Telegram HTML and must be written ``&amp;``.
+
+    Existing entities (``&amp;``, ``&#39;``, ``&lt;``) are preserved as-is so
+    a message that was already partly escaped does not get double-escaped.
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "&":
+            entity = _HTML_ENTITY_RE.match(text, index)
+            if entity:
+                out.append(entity.group(0))
+                index = entity.end()
+                continue
+            out.append("&amp;")
+        elif char == "<":
+            match = _HTML_TAG_RE.match(text, index)
+            if match:
+                out.append(match.group(0))
+                index = match.end()
+                continue
+            out.append("&lt;")
+        elif char == ">":
+            # Outside a recognised tag a bare ``>`` is literal text. Escaping it
+            # is optional but harmless, and keeps the output unambiguous.
+            out.append("&gt;")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def strip_html_tags(text: str) -> str:
+    """Strip HTML tags from *text*, leaving the readable content.
+
+    Used as the plain-text fallback when an HTML-mode message is rejected by
+    Telegram's parser: the user still gets the words, not a wall of tags.
+    """
+    if not text:
+        return text
+    without_tags = _HTML_TAG_RE.sub("", text)
+    # Unescape the entities escape_html_text() introduced.
+    return (without_tags.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+
+
+def detect_parse_mode(text: str, *, markdown_formatter=None):
+    """Return ``(text, mode)`` for *text* — ``mode`` is ``"html"`` or ``"markdown"``.
+
+    *markdown_formatter* converts Markdown to MarkdownV2. It is required only
+    when the message is NOT HTML; pass ``None`` to skip conversion entirely
+    (the caller then sends the raw text).
+
+    ``mode`` is a plain string so this module stays free of the
+    python-telegram-bot import (it is imported by the adapter, which must work
+    without the SDK installed).
+    """
+    if has_html_tags(text):
+        return escape_html_text(text), "html"
+    if markdown_formatter is not None:
+        return markdown_formatter(text), "markdown"
+    return text, "markdown"

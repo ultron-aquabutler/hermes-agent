@@ -26,6 +26,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli import memory_budget as _memory_budget
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -1837,12 +1838,21 @@ def review_dispatch_enabled() -> bool:
 
 # Assumed per-worker footprint for the derived cap; deliberately conservative
 # so the cap errs toward fewer workers on small VMs.
-MEMORY_GUARD_MB_PER_WORKER = 512
+#
+# 2026-11-10 (t_28090196): the per-worker footprint is now the SHARED, MEASURED
+# number from ``hermes_cli.memory_budget`` (1400 MiB, measured 1343-1375 MiB on
+# the homelab host) instead of a local 512 MiB guess. The 512 number understated
+# the real footprint by ~2.7x, so the derived cap of 8 was never achievable and
+# the two sides of the worker lifecycle disagreed: the cap here assumed 512
+# MiB/worker while ``tools.process_registry._worker_memory_max_bytes()`` set
+# each worker's cgroup limit with no awareness of how many workers would run.
+# See ``hermes_cli/memory_budget`` for the full invariant.
+MEMORY_GUARD_MB_PER_WORKER = _memory_budget.MEMORY_GUARD_MB_PER_WORKER
 
 # Derived default bounds: never below 2 (smallest VM must still progress),
 # never above 8 (more fan-out must be explicit in config).
-DERIVED_MAX_IN_PROGRESS_FLOOR = 2
-DERIVED_MAX_IN_PROGRESS_CEILING = 8
+DERIVED_MAX_IN_PROGRESS_FLOOR = _memory_budget.DERIVED_MAX_IN_PROGRESS_FLOOR
+DERIVED_MAX_IN_PROGRESS_CEILING = _memory_budget.DERIVED_MAX_IN_PROGRESS_CEILING
 
 
 def _system_memory_sample() -> dict:
@@ -1860,18 +1870,26 @@ def _system_memory_sample() -> dict:
 
 
 def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
-    """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
+    """Memory-derived default for ``kanban.max_in_progress`` when unset.
+
+    ``floor(budget / per_worker_limit)`` clamped to ``[FLOOR, CEILING]``, where
+    ``budget = MEMORY_BUDGET_FRACTION x MemTotal`` and ``per_worker_limit`` is the
+    shared per-worker footprint from ``hermes_cli.memory_budget``.
+
+    Returns ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
     machines are unaffected.
+
+    The derivation order is deliberate: the per-worker limit is PRIMARY (a worker
+    must never be too tight to run) and the cap is DERIVED from it, so
+    ``workers x per_worker`` always fits inside the host budget.
     """
     if sample is None:
         sample = _system_memory_sample()
     total_kib = sample.get("mem_total_kib")
     if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
         return None
-    workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
-    return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
+    host_bytes = total_kib * 1024
+    return _memory_budget.effective_max_workers(host_bytes)
 
 
 def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:

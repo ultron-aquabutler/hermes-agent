@@ -323,7 +323,14 @@ def check_telegram_requirements() -> bool:
     return True
 
 
-from plugins.platforms.telegram.telegram_markdown import degrade_unrenderable_links, escape_rich_currency_dollars, to_markdown_v2
+from plugins.platforms.telegram.telegram_markdown import (
+    degrade_unrenderable_links,
+    escape_html_text,
+    escape_rich_currency_dollars,
+    has_html_tags,
+    strip_html_tags,
+    to_markdown_v2,
+)
 
 
 def _strip_mdv2(text: str) -> str:
@@ -3270,22 +3277,31 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any]):
-        """MarkdownV2 first; on a Bot API entity-parse refusal resend as stripped plain text."""
-        def send(text: str, mode: Any):
-            return _await_with_thread_deadline(self._bot.send_message(text=text, parse_mode=mode, **send_kwargs),
+    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any], parse_mode: Any = None):
+        """Send *chunk* with *parse_mode* (HTML or MarkdownV2); on a Bot API entity-parse
+        refusal resend as stripped plain text.
+
+        *parse_mode* is ``None`` for MarkdownV2 — the historical behaviour — and
+        ``ParseMode.HTML`` when the message carried real HTML tags (the send-mode
+        decision lives in :meth:`format_for_send`).
+        """
+        mode = ParseMode.MARKDOWN_V2 if parse_mode is None else parse_mode
+
+        def send(text: str, send_mode: Any):
+            return _await_with_thread_deadline(self._bot.send_message(text=text, parse_mode=send_mode, **send_kwargs),
                                                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         try:
-            return await send(chunk, ParseMode.MARKDOWN_V2)
+            return await send(chunk, mode)
         except Exception as md_error:
             if not is_entity_parse_error(md_error):  # an HTML 5xx page is no refusal: it may be in the chat
                 raise
-            logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-            return await send(_strip_mdv2(chunk), None)
+            logger.warning("[%s] %s parse failed, falling back to plain text: %s", self.name, mode, md_error)
+            fallback = _strip_mdv2(chunk) if mode == ParseMode.MARKDOWN_V2 else strip_html_tags(chunk)
+            return await send(fallback, None)
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple, parse_mode: Any = None):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3306,7 +3322,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs, parse_mode), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3477,14 +3493,23 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            # The send-mode decision (HTML vs MarkdownV2) is made ONCE here, on the whole
+            # message, so every chunk of a split reply is sent in the same mode. A message
+            # carrying real HTML tags is sent as HTML — otherwise MarkdownV2 escapes the '>'
+            # of '<b>' but not the '<', and Telegram renders the tags literally (HTTP 200,
+            # no error logged).
+            formatted, send_parse_mode = self.format_for_send(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
+                # truncate_message appends a raw " (1/2)" suffix; escape the parentheses for
+                # the send mode. MarkdownV2 needs '\(1/2\)'; HTML mode needs '(1/2)' — a
+                # backslash is literal in Telegram HTML and would reach the user.
+                indicator = r" \\(\1/\2\\)" if send_parse_mode != ParseMode.HTML else r" (\1/\2)"
                 chunks = [
-                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
+                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", indicator, chunk))
                     for chunk in chunks
-               ]
-            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
+                ]
+            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types, send_parse_mode)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
@@ -3505,17 +3530,21 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
 
     async def _send_chunks(
         self, chat_id: str, chunks: list[str], delivered: list[str], reply_to: Optional[str],
-        metadata: Optional[dict[str, Any]], error_types: tuple) -> SendResult:
+        metadata: Optional[dict[str, Any]], error_types: tuple, parse_mode: Any = None):
         """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
         (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
-        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
+        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result.
+
+        *parse_mode* is the send mode the chunks were formatted for (``ParseMode.HTML`` for a message
+        that carried real HTML tags, else MarkdownV2)."""
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
         for chunk in chunks:
             outcome = await self._send_chunk_with_retries(
-                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types,
+                parse_mode)
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
@@ -5277,6 +5306,25 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             logger.error("[%s] Failed to get Telegram chat info for %s: %s", self.name, chat_id, _redact_telegram_error_text(
                 e), exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
+
+    def format_for_send(self, content: str) -> tuple[str, Any]:
+        """Return ``(text, parse_mode)`` for an outbound message.
+
+        A message that already contains well-formed HTML tags is sent with
+        ``ParseMode.HTML`` (tags preserved, stray ``<`` escaped); anything else
+        is converted to MarkdownV2 and sent with ``ParseMode.MARKDOWN_V2``.
+
+        This is the shared decision point for every Telegram send path. Before
+        it existed, the gateway reply path hard-coded ``ParseMode.MARKDOWN_V2``:
+        hand-written ``<b>`` was escaped to ``<b\\>Bold</b\\>`` (MarkdownV2 escapes
+        ``>`` but not ``<``) and reached the user as literal tags — accepted with
+        HTTP 200, so no error was ever logged. See ``telegram_markdown``.
+        """
+        if not content:
+            return content, ParseMode.MARKDOWN_V2
+        if has_html_tags(content):
+            return escape_html_text(content), ParseMode.HTML
+        return self.format_message(content), ParseMode.MARKDOWN_V2
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2 (``telegram_markdown.to_markdown_v2``)."""

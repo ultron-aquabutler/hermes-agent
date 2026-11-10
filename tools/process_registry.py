@@ -26,6 +26,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env
+from hermes_cli import memory_budget as _memory_budget
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -126,12 +127,20 @@ _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 def _worker_memory_max_bytes() -> int:
     """Finite per-worker cgroup limit that can never widen host risk.
+
     ``TERMINAL_LOCAL_MEMORY_MAX_MB`` is honored only when it *tightens* the safe
-    bound (min of the gateway's cgroup-v2 ``memory.max`` and half of physical RAM,
-    capped at 4 GiB), so an oversized override cannot exceed the enclosing slice.
+    bound, so an oversized override cannot exceed the enclosing slice.
 
     The proposed local-memory-guard environment override is honored when it tightens the safe bound, so this
     isolation composes with PR #57121 instead of inventing a second knob.
+
+    2026-11-10 (t_28090196): the per-worker limit now comes from the SHARED
+    ``hermes_cli.memory_budget`` module, so it is derived from the SAME numbers as
+    the concurrency cap in ``hermes_cli.kanban_db_dispatch``. Previously this
+    function picked the bound with no awareness of how many workers would run,
+    while the dispatcher assumed 512 MiB per worker — so the two sides disagreed
+    and the sum of concurrent scopes could exceed the host budget by 1.5x-4x
+    (see ``hermes_cli.memory_budget`` for the invariant).
     """
     override_bound: Optional[int] = None
     override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
@@ -163,6 +172,24 @@ def _worker_memory_max_bytes() -> int:
     except (OSError, ValueError):
         pass
 
+    slice_limit = min(candidates) if candidates else None
+    host_bytes = _memory_budget.host_memory_total_bytes()
+    # The concurrency cap the dispatcher will honour, so the per-worker limit and
+    # the cap are derived from one another instead of from two assumptions.
+    max_workers = None
+    try:
+        from hermes_cli.kanban_db_dispatch import derive_default_max_in_progress
+
+        max_workers = derive_default_max_in_progress()
+    except Exception:
+        max_workers = None
+    budgeted = _memory_budget.per_worker_memory_max_bytes(
+        host_bytes,
+        max_workers,
+        slice_limit=slice_limit,
+    )
+    if budgeted is not None:
+        candidates.append(int(budgeted))
     try:
         physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
             os.sysconf("SC_PAGE_SIZE")
