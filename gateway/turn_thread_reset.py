@@ -9,6 +9,23 @@ live in turn 2. Context variables need nothing here: every item runs in a fresh 
 
 Modules are looked up in ``sys.modules`` only: one that was never imported holds no state.
 A new per-turn ``threading.local`` in turn code belongs in ``_PER_TURN_THREAD_LOCALS``.
+
+A module that is PRESENT but only PARTIALLY initialized is a third case. It happens when
+an import cycle puts a module into ``sys.modules`` before its body has finished running, so
+its module-level attributes do not exist yet. Touching one then raises ``AttributeError``.
+
+That is not hypothetical. ``tools.terminal_tool_sudo`` is reached from several lazy
+(inside-function) import sites, and ``tools.terminal_tool_result`` imports both
+``tools.terminal_tool`` and ``tools.terminal_tool_sudo`` from inside a function body, so
+the sudo module can be observed mid-import. When that happened, ``reset_reused_thread_state``
+raised ``AttributeError: partially initialized module 'tools.terminal_tool_sudo' ... has no
+attribute '_sudo_password_cache_lock'``, the caller (``gateway/turn_executor.py::_park``)
+treated the failed reset as a reason to retire the worker thread, and the turn died with
+its state half-dropped. The gateway then logged "turn worker state reset failed; retiring
+the thread" and the session stalled instead of continuing.
+
+So: read every attribute defensively. A missing attribute means the module is not ready
+yet, which is exactly the case where there is no per-thread state to drop.
 """
 
 from __future__ import annotations
@@ -43,8 +60,15 @@ def reset_reused_thread_state() -> None:
         interrupt.set_interrupt(False, tid)  # clears the bit, its reason and a pending yield
     sudo = sys.modules.get("tools.terminal_tool_sudo")
     if sudo is not None:
-        with sudo._sudo_password_cache_lock:
-            sudo._sudo_password_cache.pop(f"thread:{tid}", None)
+        # A module observed mid-import is only PARTIALLY initialized: its module-level
+        # names may not exist yet. Reading them directly raised AttributeError and killed
+        # the turn worker. A missing attribute simply means there is no cached password
+        # to drop for this thread yet.
+        lock = getattr(sudo, "_sudo_password_cache_lock", None)
+        cache = getattr(sudo, "_sudo_password_cache", None)
+        if lock is not None and cache is not None:
+            with lock:
+                cache.pop(f"thread:{tid}", None)
     for module_name, attr in _PER_TURN_THREAD_LOCALS:
         local = getattr(sys.modules.get(module_name), attr, None)
         if local is not None:
