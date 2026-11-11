@@ -2,10 +2,27 @@
 
 > Wiki page for the duplicated-tool-call fix.
 >
-> Status: **NOT DEPLOYED**. The change lives on local branch
-> `fix/duplicate-tool-call-ids-t_d0a68830` (worktree
-> `/home/serveradmin/.hermes/hermes-agent/.worktrees/t_d0a68830-dupids`).
-> Nothing was pushed, merged, deployed, or restarted.
+> Status: **LANDED ON THE LIVE BRANCH — NOT YET ACTIVE IN RUNNING SESSIONS.**
+>
+> The fix is committed on the live branch `fix/gateway-outage-patches-t_1915c9a3`
+> (the branch the running gateway checks out), via commit
+> **`4fff132baa06901db0326d5f0d6ad3eb12c8b16a`** — the port of the original fix
+> onto live HEAD `7f523f9f8ae28284900c7edd0eb1267ad7f233e5`. The port is a clean
+> fast-forward with no conflicts; its diff against live HEAD is exactly the
+> six files of the original fix (1062 insertions / 36 deletions).
+>
+> The original fix was merged upstream as PR #12 (merge `0aca5eb5bf37`) into the
+> fork's `canonical-deploy-t_7161d9a9` — a **different lineage** from the live
+> branch, not a superset of it. That merge alone did not put the fix in the
+> running tree; the port onto live HEAD did.
+>
+> **No gateway restart has been performed.** The tree carries the fix, but
+> in-flight and future sessions pick it up only when the gateway is restarted.
+> A restart is a separate, human-gated step: it tears down the unit cgroup and
+> kills in-flight workers, and it requires Bryan's explicit permission.
+>
+> Regression on the landed tree: `tests/agent/test_duplicate_tool_call_ids.py`
+> -> 28 passed; six broader agent modules -> 160 passed.
 >
 > Incident: session `ultron/20261104_161428_2a9017` (2026-11-04 16:14 UTC).
 
@@ -293,6 +310,33 @@ reconciliation happened.
 - `agent/transports/codex.py` — builds the `ToolCall` shape.
 - `agent/agent_runtime_helpers.py` — the pre-API chokepoint.
 - `run_agent.py` — `AIAgent._deduplicate_tool_calls` delegates to the owner.
+
+## Deployment history
+
+| When | What | Where |
+|---|---|---|
+| 2026-11-04 | Original fix authored | branch `fix/duplicate-tool-call-ids-t_d0a68830` (worktree `.worktrees/t_d0a68830-dupids`) |
+| 2026-11-11 | Merged upstream as **PR #12** (merge `0aca5eb5bf37`) | fork branch `canonical-deploy-t_7161d9a9` — a different lineage from the live branch, so this did **not** reach the running tree |
+| 2026-11-11 | **Ported onto live HEAD** `7f523f9f8ae` as **`4fff132baa`** | live branch `fix/gateway-outage-patches-t_1915c9a3` — clean fast-forward, 6-file footprint, no conflicts |
+
+**PR for the live-branch port: see the card t_89c5e390.** The live branch was
+local-only before this port and is pushed to the fork `ultron-aquabutler/hermes-agent`
+by the same change.
+
+**Deployment status: landed, not activated.** The running gateway imports the
+checkout at `~/.hermes/hermes-agent/`, so the tree now carries the fix, but
+running sessions keep the old code until the gateway is restarted. The restart
+is deliberately NOT part of this change — it is a separate human-gated step
+(it tears down the unit cgroup and kills in-flight workers).
+
+### Verifying the landed state
+
+```bash
+cd /home/serveradmin/.hermes/hermes-agent
+git log --oneline -1                       # -> 4fff132baa
+git grep -c reconcile_duplicate_tool_call_items HEAD -- agent/
+git diff --name-only 7f523f9f8ae 4fff132baa   # -> exactly the 6 files
+```
 
 ## See Also
 
