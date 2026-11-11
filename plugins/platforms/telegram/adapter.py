@@ -3621,6 +3621,65 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             await self._await_disconnect_step(task, _DISCONNECT_STEP_TIMEOUT, label)
         setattr(self, attr, None)
 
+    def _neutralize_ptb_polling_cleanup(self, updater) -> bool:
+        """Drop PTB's shutdown-cleanup ``get_updates`` from an Updater we are discarding.
+
+        PTB's ``Updater.stop()`` ends with ``_stop_polling()``, which awaits a private
+        ``__polling_cleanup_cb`` — one last ``get_updates(offset=last_update_id, timeout=0)``
+        whose only job is to mark already-fetched updates as "read" so the SAME Updater does
+        not refetch them on its next ``start_polling()`` (see PTB's
+        ``telegram/ext/_updater.py``).
+
+        That receipt is worthless here: this Updater is being thrown away, and its replacement
+        is a DIFFERENT Updater with its own ``_last_update_id``. PTB says so itself — "When
+        polling for updates is restarted, updates may be fetched again."
+
+        Worse, the receipt is actively harmful. The gateway hands a fatal adapter to the
+        reconnect watcher BEFORE awaiting ``disconnect()`` (GatewayRunner._handle_adapter_fatal_error_detached
+        queues with ``delay=0.0``), and the watcher's 10 s tick can start the replacement
+        poller on the same bot token while this Updater is still stopping. The two overlap on
+        one token, and the cleanup call lands on the replacement's live getUpdates session →
+        ``telegram.error.Conflict: terminated by other getUpdates request``.
+
+        That is a SELF-INFLICTED 409: it fires on the network-failure path (poll stall → fatal →
+        supervisor rebuild), never on the conflict ladder, so the ladder never sees it and the
+        deliberate queue-preserving conflict retry never gets a chance to run.
+
+        Live evidence (2026-11-11 05:26, root adapter, journal + gateway.log):
+
+            05:26:39,697  telegram queued for background reconnection
+            05:26:39,915  Reconnecting telegram (attempt 1)...
+            05:26:41,049  Connected to Telegram (polling mode)      ← replacement poller live
+            05:26:44,543  telegram.error.Conflict                    ← this cleanup call, 3.5 s later
+            05:26:44,604  Disconnected from Telegram
+
+        Suppressing the receipt removes the conflict at its source. Nothing is lost: the
+        replacement adapter resumes from Telegram's own pending queue (``drop_pending_updates=False``),
+        and the admission-receipt dedupe already covers an at-most-once redelivery.
+
+        Returns True when a cleanup callback was found and neutralised.
+        """
+        if updater is None:
+            return False
+        # PTB name-mangles the attribute (``_Updater__polling_cleanup_cb``). Probe both the
+        # mangled and the unmangled spelling so a PTB rename degrades to "no callback"
+        # rather than to a silent AttributeError.
+        for attr in ("_Updater__polling_cleanup_cb", "_polling_cleanup_cb"):
+            cb = getattr(updater, attr, None)
+            if cb is None:
+                continue
+            try:
+                setattr(updater, attr, lambda: asyncio.sleep(0))
+            except Exception:
+                # A read-only slot / frozen mock: fall through to the no-op-updater path.
+                continue
+            logger.info(
+                "[%s] Suppressed PTB's shutdown-cleanup getUpdates on the discarded Updater "
+                "(it would 409 against the replacement poller sharing this bot token).",
+                self.name)
+            return True
+        return False
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
         # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
@@ -3669,6 +3728,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             try:
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
                 if self._app.updater and self._app.updater.running:
+                    # Drop PTB's shutdown-cleanup getUpdates BEFORE stopping this Updater. The
+                    # gateway queues the replacement adapter for reconnection BEFORE awaiting
+                    # disconnect(), so a replacement poller can already be live on this bot
+                    # token; the cleanup call would then land on the replacement's session and
+                    # self-inflict a 409 (telegram.error.Conflict: terminated by other
+                    # getUpdates request). See _neutralize_ptb_polling_cleanup.
+                    self._neutralize_ptb_polling_cleanup(self._app.updater)
                     try:
                         await self._await_disconnect_step(self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
                     except Exception as stop_error:
