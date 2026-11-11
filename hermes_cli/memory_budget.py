@@ -57,12 +57,38 @@ The two call sites to keep in agreement:
 
 * ``tools/process_registry._worker_memory_max_bytes()`` — the per-worker cgroup limit
 * ``hermes_cli.kanban_db_dispatch.derive_default_max_in_progress()`` — the concurrency cap
+
+## The Kanban cap does not count every scope (t_67049b90, 2026-11-11)
+
+The Kanban concurrency cap bounds the KANBAN scopes only.  Cron executions and
+local managed workers create a scope the same way, draw the same per-worker
+limit, and are NOT bounded by that cap — so the sum of live scope limits could
+exceed the host budget while the Kanban-side arithmetic still read
+``consistent``.
+
+On the homelab host (2026-11-11) the live population was 8 scopes x 1400 MiB =
+11200 MiB against an 11204 MiB budget — a 4 MiB margin that one more scope
+erased.  ``per_worker_memory_max_bytes`` already had a ``live_scopes`` term for
+exactly this, but NO production caller passed it, so the term was dead code.
+
+The fix counts the live population AND the scope being created (the limit is
+read before the scope exists, so counting only the existing scopes would let
+the Nth scope overshoot).  With that count, ``N scopes x limit`` equals the
+budget exactly for every N, and the limit tightens automatically as scopes
+accumulate.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
+
+# The cgroup slice the transient worker scopes live in, relative to the cgroup
+# v2 root.  Every scope that draws a per-worker ``MemoryMax`` is named
+# ``hermes-worker-<kind>-<id>.scope`` under this slice.
+_WORKER_SCOPE_PREFIX = "hermes-worker-"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 # Fraction of physical RAM the fleet may claim. The remaining 30% is headroom for
 # the gateway itself, cron scopes, the docker daemon, and page cache.
@@ -91,6 +117,67 @@ def host_memory_total_bytes() -> Optional[int]:
         return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
     except (OSError, ValueError, TypeError, AttributeError):
         return None
+
+
+def _worker_scope_dir() -> Optional[Path]:
+    """The directory holding the transient worker scopes, or ``None``.
+
+    The scopes are created by ``systemd-run --user --scope`` under the user's
+    ``app.slice``.  That path is derived from the caller's own cgroup so it
+    works on any host without hard-coding a slice name.
+
+    The caller is often ITSELF inside one of those scopes (a worker computing
+    the limit for its own scope), so the scope's PARENT is the directory that
+    holds them all — the scope itself is walked out of the path.
+    """
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            if not line.startswith("0::"):
+                continue
+            relative = line.partition("::")[2].lstrip("/")
+            parts = Path(relative).parts
+            # Drop our own scope: the scopes live one level up, beside us.
+            if parts and parts[-1].startswith(_WORKER_SCOPE_PREFIX):
+                parts = parts[:-1]
+            return _CGROUP_ROOT.joinpath(*parts) if parts else _CGROUP_ROOT
+    except OSError:
+        return None
+    return None
+
+
+def count_live_worker_scopes() -> Optional[int]:
+    """How many worker scopes on this host already draw a per-worker limit.
+
+    The Kanban concurrency cap only bounds the KANBAN scopes.  Cron executions
+    and local managed workers create scopes through the same mechanism and draw
+    the same limit, and their count is not bounded by the cap — so the cap alone
+    does not describe how much memory the host has already promised.
+
+    Counts every ``hermes-worker-*.scope`` that carries a FINITE
+    ``memory.max`` (an unlimited scope claims nothing).  Returns ``None`` when
+    the cgroup tree cannot be read, which callers treat as "not measured" and
+    preserve the pre-existing behaviour.
+    """
+    scope_dir = _worker_scope_dir()
+    if scope_dir is None:
+        return None
+    try:
+        entries = list(scope_dir.iterdir())
+    except OSError:
+        return None
+    count = 0
+    for entry in entries:
+        name = entry.name
+        if not name.startswith(_WORKER_SCOPE_PREFIX) or not name.endswith(".scope"):
+            continue
+        try:
+            raw = (entry / "memory.max").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        # "max" = unlimited (claims nothing); a finite number claims memory.
+        if raw.isdigit() and int(raw) > 0:
+            count += 1
+    return count
 
 
 def per_worker_memory_max_bytes(
@@ -235,6 +322,7 @@ __all__ = [
     "MEMORY_GUARD_MB_PER_WORKER",
     "MIN_WORKER_MEMORY_MAX_BYTES",
     "budget_is_consistent",
+    "count_live_worker_scopes",
     "effective_max_workers",
     "host_memory_total_bytes",
     "per_worker_memory_max_bytes",

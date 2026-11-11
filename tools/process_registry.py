@@ -131,6 +131,28 @@ _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
+def _live_scope_count_including_this_one() -> Optional[int]:
+    """How many worker scopes will hold a per-worker limit once THIS one exists.
+
+    The limit is read at scope-CREATION time, so the scope being created is not
+    in the live count yet.  Counting only the scopes that already exist would
+    let the sum overshoot: with 8 live scopes the 9th would be created with the
+    8-scope limit and the total would land at ``9 x limit`` — above the budget.
+
+    So the count is the live scopes PLUS the one being created.  With that, the
+    ``live_scopes`` term of ``per_worker_memory_max_bytes`` gives every scope
+    the SAME limit for a given population, and the population's sum equals the
+    budget exactly.
+
+    ``None`` when the cgroup tree cannot be read — the caller then keeps the
+    pre-existing behaviour (no live-scopes term).
+    """
+    live = _memory_budget.count_live_worker_scopes()
+    if live is None:
+        return None
+    return live + 1
+
+
 def _worker_memory_max_bytes() -> int:
     """Finite per-worker cgroup limit that can never widen host risk.
 
@@ -147,6 +169,14 @@ def _worker_memory_max_bytes() -> int:
     while the dispatcher assumed 512 MiB per worker — so the two sides disagreed
     and the sum of concurrent scopes could exceed the host budget by 1.5x-4x
     (see ``hermes_cli.memory_budget`` for the invariant).
+
+    2026-11-11 (t_67049b90): the limit now also counts the scopes ALREADY LIVE
+    on the host (``live_scopes``). The Kanban concurrency cap bounds only the
+    KANBAN scopes; cron executions and local managed workers create scopes the
+    same way, draw the same limit, and are NOT bounded by that cap. Without this
+    term the sum of live scope limits could exceed the host budget the moment a
+    cron job overlapped a busy Kanban board. The term makes the limit tighten
+    as scopes accumulate, so ``N live scopes x limit <= budget`` always holds.
     """
     override_bound: Optional[int] = None
     override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
@@ -193,6 +223,7 @@ def _worker_memory_max_bytes() -> int:
         host_bytes,
         max_workers,
         slice_limit=slice_limit,
+        live_scopes=_live_scope_count_including_this_one(),
     )
     if budgeted is not None:
         candidates.append(int(budgeted))
