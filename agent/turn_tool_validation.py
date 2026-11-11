@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import (close_interrupted_tool_sequence, coalesce_tool_call_id,
-                                          normalize_provider_tool_call_ids)
+                                          normalize_provider_tool_call_ids,
+                                          reconcile_duplicate_tool_call_items)
 from agent.turn_failure_copy import site_copy, stamp_failure
 from hermes_constants import FINISH_REASON_LENGTH
 
@@ -85,6 +86,20 @@ def validate_tool_calls(
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ToolValidationVerdict:
         return ToolValidationVerdict(action=action, result=result, mixed_invalid_batch=_mixed_invalid_batch)
+
+    # Reconcile the provider's ITEM identity BEFORE anything else: the provider
+    # can emit ONE tool call twice in a single turn (same call id AND same
+    # response-item id) — once with the real arguments and once with ``{}``
+    # (incident ultron/20261104_161428_2a9017). Those are two representations of
+    # ONE operation, so exactly one of them may run. Collapsing here — by
+    # identity, keeping the richer arguments — is what stops the empty copy from
+    # being dispatched as a second, malformed call.
+    #
+    # Only AFTER this may the id repair run: whatever still shares an id is then
+    # a genuinely distinct call that merely reused the id, and it must keep its
+    # own id so it can run and be paired with its own result.
+    tool_calls = reconcile_duplicate_tool_call_items(tool_calls)
+    assistant_message.tool_calls = tool_calls
 
     # Uniquify duplicate tool-call ids BEFORE any downstream consumer: the
     # pre-API sanitizer keeps only the first call/result per id.
