@@ -456,6 +456,10 @@ __all__ = [
     # call_id policy owners
     "deterministic_call_id", "coalesce_tool_call_id", "tool_call_id_variants",
     "tool_result_id_variants", "uniquify_tool_call_ids", "normalize_provider_tool_call_ids",
+    # provider-item identity policy owner (same item seen twice -> one operation)
+    "provider_item_identity", "reconcile_duplicate_tool_call_items",
+    # call-level duplicate policy owner
+    "deduplicate_tool_calls",
     # reasoning_content policy owners
     "reasoning_echo_family", "matches_reasoning_echo_family", "needs_reasoning_echo",
     "stale_thinking_reaches_wire", "apply_reasoning_content_policy", "reapply_reasoning_echo",
@@ -475,7 +479,131 @@ def _tc_field(tc: Any, key: str) -> Any:
 
 
 def _tc_set(tc: Any, key: str, value: Any) -> None:
-    tc.__setitem__(key, value) if isinstance(tc, dict) else setattr(tc, key, value)
+    """Write one field on a tool-call entry (dict or SDK/dataclass object).
+
+    ``agent.transports.types.ToolCall`` exposes ``call_id``/``response_item_id`` as
+    READ-ONLY properties backed by ``provider_data`` — a plain ``setattr`` raises
+    ``AttributeError`` ("property 'call_id' of 'ToolCall' object has no setter").
+    A failed write aborted the whole duplicate-id repair half-way, leaving the
+    entry with a rewritten ``id`` and the ORIGINAL ``call_id`` — a split-brain
+    where the effective (coalesced) id was still duplicated. Write through
+    ``provider_data`` when the attribute is a property, so the two spellings can
+    never disagree.
+    """
+    if isinstance(tc, dict):
+        tc[key] = value
+        return
+    if isinstance(getattr(type(tc), key, None), property):
+        # Property view (ToolCall.call_id / .response_item_id): the backing dict
+        # is the only writable store. A property WITH a setter is still routed
+        # here: the setter's own backing store is provider_data for ToolCall, and
+        # writing it directly keeps the view and the store in agreement even when
+        # the setter is a no-op or stores elsewhere.
+        provider_data = getattr(tc, "provider_data", None)
+        if isinstance(provider_data, dict):
+            provider_data[key] = value
+            return
+    setattr(tc, key, value)
+
+
+def _tc_arguments(tc: Any) -> str:
+    """The raw arguments string of a tool-call entry."""
+    value = _tc_field(_tc_field(tc, "function"), "arguments")
+    return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+def _tc_name(tc: Any) -> Any:
+    """The tool name of a tool-call entry."""
+    return _tc_field(_tc_field(tc, "function"), "name")
+
+
+def _is_empty_arguments(tc: Any) -> bool:
+    """True when the call carries no arguments at all (``{}`` or blank)."""
+    return _tc_arguments(tc).strip() in ("", "{}")
+
+
+def provider_item_identity(tc: Any) -> str:
+    """The PROVIDER's per-item identity for one tool call, or ``""`` when unknown.
+
+    This is the evidence key for deciding whether two colliding tool calls are
+    ONE provider item seen twice or TWO distinct operations:
+
+    * ``response_item_id`` — the provider's own response-item id (``fc_...`` for
+      the Responses API). It is DERIVED from the call id, so two entries with the
+      same call id carry the same item id.
+    * ``id`` — the entry's own id, used only when no response-item id is present.
+
+    Entries sharing one item identity are the SAME provider item; entries with
+    different item identities are DIFFERENT calls and must both run.
+    """
+    for key in ("response_item_id", "id"):
+        value = _tc_field(tc, key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def reconcile_duplicate_tool_call_items(tool_calls: list) -> list:
+    """Collapse tool calls that are the SAME provider item represented more than once.
+
+    Incident ``ultron/20261104_161428_2a9017`` (2026-11-04): the provider emitted
+    each tool call TWICE in one assistant turn — once with the real arguments and
+    once with ``{}`` — under the SAME call id and the SAME provider response-item
+    id. Both copies reached dispatch, so every call ran twice: once usefully and
+    once as a malformed empty-argument call (which is what tripped the
+    no-progress guardrail). The recorded payloads are in
+    ``~/.hermes/profiles/ultron/state.db``, session ``20261104_161428_2a9017``
+    (45 entries, 17 duplicated item ids, every one an empty-args copy of a
+    full-args copy).
+
+    Two entries that share the provider item identity are ONE operation: keep a
+    single representative, preferring the copy with the most complete arguments.
+    Entries with DIFFERENT item identities are distinct calls and are never
+    merged — not even when the tool name and the arguments are byte-identical
+    (two independent calls to the same tool with the same arguments are two
+    operations, and the caller's intent is not ours to discard).
+
+    The surviving entry keeps its original position in the batch (the first
+    occurrence), so stream order and the provider's output order are preserved.
+    Returns the original list when nothing was collapsed.
+    """
+    entries = list(tool_calls or [])
+    if len(entries) < 2:
+        return tool_calls
+
+    groups: dict[str, list[int]] = {}
+    for index, tc in enumerate(entries):
+        identity = provider_item_identity(tc)
+        if not identity:
+            continue
+        groups.setdefault(identity, []).append(index)
+
+    duplicated = {identity: idxs for identity, idxs in groups.items() if len(idxs) > 1}
+    if not duplicated:
+        return tool_calls
+
+    dropped: set[int] = set()
+    for identity, idxs in duplicated.items():
+        # Prefer the copy with the most complete arguments; among equals keep the
+        # first (stream order). A copy that carries arguments always beats an
+        # empty-argument copy of the same provider item.
+        best = max(idxs, key=lambda i: (0 if _is_empty_arguments(entries[i]) else 1,
+                                        len(_tc_arguments(entries[i])), -i))
+        for index in idxs:
+            if index == best:
+                continue
+            dropped.add(index)
+            logger.warning(
+                "Collapsed duplicate representation of one provider tool-call item "
+                "(item=%s tool=%s kept_args=%d dropped_args=%d): the provider emitted the "
+                "same call twice (once with empty arguments). Running it once.",
+                identity, _tc_name(entries[best]),
+                len(_tc_arguments(entries[best])), len(_tc_arguments(entries[index])),
+            )
+
+    if not dropped:
+        return tool_calls
+    return [tc for index, tc in enumerate(entries) if index not in dropped]
 
 
 # --------------------------------------------------------------------------- call_id policy — single owner
@@ -536,6 +664,17 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
     get a deterministic ``<id>_d<n>`` suffix (never uuid4 — cache-prefix stability). Mutates
     entries (SDK models / SimpleNamespace / dicts) in place. Blank ids are left for the
     deterministic fallback in ``build_assistant_message``.
+
+    This runs AFTER ``reconcile_duplicate_tool_call_items``: by then the entries sharing
+    one provider item identity are already collapsed, so anything still colliding here is
+    a GENUINELY distinct call that merely reused an id — it gets its own id and must
+    run.
+
+    Every spelling of the id is rewritten TOGETHER (``id``, ``call_id`` and the
+    ``provider_data`` backing them). Rewriting only some of them left a split-brain entry
+    whose effective (coalesced) id was still the duplicated one, so the pre-API sanitizer
+    dropped the call and its side effect never ran. The rewrite is therefore applied
+    atomically: a failed write leaves the entry untouched rather than half-renamed.
     """
     seen: set = set()
     for tc in tool_calls or []:
@@ -551,23 +690,114 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
             continue
         # range is bounded: at most len(seen) suffixes can already be taken.
         new_id = next(f"{cid}_d{n}" for n in range(2, len(seen) + 3) if f"{cid}_d{n}" not in seen)
-        seen.add(new_id)
 
+        # Snapshot every writable spelling first, then write them all. If ANY write
+        # raises, restore the snapshot so the entry is never left half-renamed.
+        snapshot = _snapshot_tool_call_ids(tc)
         try:
-            # Keep a composite id's response-item half so the provider's fc_/item id survives.
-            old = _tc_field(tc, "id")
-            _tc_set(tc, "id", f"{new_id}|{old.split('|', 1)[1]}" if isinstance(old, str) and "|" in old else new_id)
-            if _tc_field(tc, "call_id"):
-                _tc_set(tc, "call_id", new_id)
+            _apply_tool_call_id(tc, new_id)
         except Exception:
+            _restore_tool_call_ids(tc, snapshot)
             logger.warning("Could not uniquify duplicate tool call id %s", cid)
             continue
-        _fn_name = _tc_field(_tc_field(tc, "function"), "name") or "?"
+        seen.add(new_id)
+
+        _fn_name = _tc_name(tc) or "?"
         logger.warning(
             "Model reused tool call id %s within one turn; renamed the duplicate to %s (tool=%s) to keep "
             "call/result pairing lossless.", cid, new_id, _fn_name,
         )
     return tool_calls
+
+
+def _snapshot_tool_call_ids(tc: Any) -> dict:
+    """Snapshot every id spelling of a tool-call entry (for an all-or-nothing rewrite)."""
+    snapshot: dict = {}
+    for key in ("id", "call_id", "response_item_id"):
+        try:
+            snapshot[key] = _tc_field(tc, key)
+        except Exception:
+            snapshot[key] = None
+    provider_data = getattr(tc, "provider_data", None)
+    if isinstance(provider_data, dict):
+        snapshot["__provider_data__"] = dict(provider_data)
+    return snapshot
+
+
+def _restore_tool_call_ids(tc: Any, snapshot: dict) -> None:
+    """Undo a partially applied id rewrite."""
+    provider_data = getattr(tc, "provider_data", None)
+    if isinstance(provider_data, dict) and "__provider_data__" in snapshot:
+        provider_data.clear()
+        provider_data.update(snapshot["__provider_data__"])
+    for key in ("id", "call_id", "response_item_id"):
+        if key not in snapshot:
+            continue
+        try:
+            _tc_set(tc, key, snapshot[key])
+        except Exception:
+            pass
+
+
+def _apply_tool_call_id(tc: Any, new_id: str) -> None:
+    """Rename a tool call to ``new_id`` across EVERY id spelling, atomically.
+
+    ``id`` keeps a composite id's response-item half so the provider's ``fc_``/item
+    id survives; ``call_id`` is the pairing key and must follow the rename.
+    """
+    # Keep a composite id's response-item half so the provider's fc_/item id survives.
+    old = _tc_field(tc, "id")
+    _tc_set(tc, "id", f"{new_id}|{old.split('|', 1)[1]}" if isinstance(old, str) and "|" in old else new_id)
+    if _tc_field(tc, "call_id"):
+        _tc_set(tc, "call_id", new_id)
+    # ``provider_data`` is the backing store for the read-only ``call_id`` /
+    # ``response_item_id`` property views (agent.transports.types.ToolCall). It must
+    # carry the SAME new id, or the coalesced id stays the duplicated one.
+    provider_data = getattr(tc, "provider_data", None)
+    if isinstance(provider_data, dict):
+        if provider_data.get("call_id"):
+            provider_data["call_id"] = new_id
+
+
+def deduplicate_tool_calls(tool_calls: list) -> list:
+    """Drop duplicate (tool_name, arguments) pairs in one turn (first wins).
+
+    Valid JSON arguments are canonicalized so key order/whitespace can't evade dedup;
+    returns the original list when nothing was removed.
+
+    A ZERO-ARGUMENT call (``{}``) is a legitimate call, not a duplicate: only two calls
+    to the SAME tool with the SAME canonical arguments collide. Two different tools
+    that both take no arguments must both run.
+
+    IDENTITY-AWARE: two calls with the same tool and the same arguments but DIFFERENT
+    provider item identities are TWO distinct operations (the model asked for the same
+    thing twice; each is its own provider item and gets its own id). They are both kept
+    — dropping the second would silently discard an operation the caller asked for.
+    The same-item case (one provider item represented more than once) is collapsed by
+    ``reconcile_duplicate_tool_call_items`` BEFORE this runs, using the provider's own
+    item identity, so it never reaches the argument-level rule.
+
+    Policy owner (mirrors the call_id policy above): ``run_agent.AIAgent._deduplicate_tool_calls``
+    delegates here.
+    """
+    seen, unique = set(), []
+    for tc in tool_calls or []:
+        arguments = _tc_arguments(tc)
+        try:
+            arguments = json.dumps(json.loads(arguments), separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError):
+            pass
+        name = _tc_name(tc)
+        identity = provider_item_identity(tc)
+        # The item identity is part of the key when known: two DIFFERENT provider
+        # items are two different operations even when the arguments match.
+        key = (name, arguments, identity) if identity else (name, arguments)
+        if key in seen:
+            logger.warning("Removed duplicate tool call: %s", name)
+            continue
+        seen.add(key)
+        unique.append(tc)
+    return unique if len(unique) < len(tool_calls or []) else tool_calls
 
 
 _PROVIDER_TOOL_ID_PREFIXES = ("chatcmpl-tool-",)

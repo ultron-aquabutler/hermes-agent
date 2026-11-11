@@ -891,8 +891,20 @@ class _CodexResponseAssembler:
             self.has_tool_calls = True
             if item_id:
                 announced_sequence, announced_index = self.announced_output_order[item_id]
+                arguments = str(_event_field(item, "arguments", "") or "")
+                existing = self.pending_function_calls.get(item_id)
+                if existing is not None:
+                    # The SAME provider item announced twice (incident
+                    # ultron/20261104_161428_2a9017): the provider emitted the
+                    # call once with its real arguments and once with ``{}``.
+                    # Overwriting here would DISCARD the real arguments and keep
+                    # the empty copy, so the call would run with no arguments.
+                    # Keep the richer arguments; the item is one operation.
+                    if len(arguments) > len(existing["arguments"]):
+                        existing["arguments"] = arguments
+                    return
                 self.pending_function_calls[item_id] = {
-                    "item": item, "arguments": str(_event_field(item, "arguments", "") or ""),
+                    "item": item, "arguments": arguments,
                     "output_index": announced_index, "sequence": announced_sequence,
                 }
 
