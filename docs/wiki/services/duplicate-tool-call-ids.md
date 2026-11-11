@@ -319,9 +319,17 @@ reconciliation happened.
 | 2026-11-11 | Merged upstream as **PR #12** (merge `0aca5eb5bf37`) | fork branch `canonical-deploy-t_7161d9a9` — a different lineage from the live branch, so this did **not** reach the running tree |
 | 2026-11-11 | **Ported onto live HEAD** `7f523f9f8ae` as **`4fff132baa`** | live branch `fix/gateway-outage-patches-t_1915c9a3` — clean fast-forward, 6-file footprint, no conflicts |
 
-**PR for the live-branch port: see the card t_89c5e390.** The live branch was
-local-only before this port and is pushed to the fork `ultron-aquabutler/hermes-agent`
-by the same change.
+**PR for the live-branch port: https://github.com/ultron-aquabutler/hermes-agent/pull/13**
+(base `canonical-deploy-t_7161d9a9`, head `fix/gateway-outage-patches-t_1915c9a3`). The
+live branch was local-only before this port and is now pushed to the fork
+`ultron-aquabutler/hermes-agent`.
+
+That PR's diff against `canonical-deploy-t_7161d9a9` is large (14,143 files) because
+the two lineages diverged: `canonical-deploy-t_7161d9a9` is 89 commits **behind**
+the live branch and the live branch is 17,341 commits ahead of their merge-base
+`4b6884aaa7`. The PR therefore carries the live branch's accumulated production
+patches as well as this fix. The **fix's own footprint** against the live branch's
+pre-port HEAD `7f523f9f8ae` is the six files listed above.
 
 **Deployment status: landed, not activated.** The running gateway imports the
 checkout at `~/.hermes/hermes-agent/`, so the tree now carries the fix, but
