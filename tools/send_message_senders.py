@@ -259,6 +259,29 @@ def _telegram_format(message):
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
+        # Resolve the bot token for the CALLING PROFILE before anything is sent. A send that
+        # cannot resolve its own profile's token fails here rather than borrowing another
+        # profile's bot — posting as the wrong bot makes the sender indistinguishable from
+        # that bot, which breaks the Identity Lock (t_43eff563).
+        from tools.telegram_identity import (
+            active_profile_name, bot_id_from_token, log_bot_id, resolve_profile_bot_token)
+
+        token, identity_error = resolve_profile_bot_token(token)
+        if identity_error:
+            logger.error("Telegram send refused: %s", identity_error)
+            return _error(identity_error)
+        # The bot id is only LOGGED, never required: a self-hosted Bot API server or a test double
+        # uses an arbitrary token with no numeric id, and refusing those sends would break a
+        # legitimate deployment. What must never happen is a send under ANOTHER profile's token —
+        # that is what resolve_profile_bot_token() above rules out.
+        resolved_bot_id = bot_id_from_token(token)
+        if not resolved_bot_id:
+            logger.warning(
+                "Telegram bot token for profile %r has no numeric bot id — the send proceeds, but the "
+                "bot id cannot be logged. A public Telegram bot token always starts with '<id>:'.",
+                active_profile_name(),
+            )
+
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -270,6 +293,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         thread_kwargs = _telegram_thread_kwargs(thread_id)
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
+        # ``_tg_caption`` starts as None, NOT []: the caption-fallback branch below tests
+        # ``_tg_caption is not None``, and an empty list is not None while carrying no caption.
+        # Initialising it to [] made a media-less send fall into that branch and emit an EMPTY
+        # text message instead of reporting "nothing was deliverable".
         last_msg, warnings, _tg_caption = None, [], None
         # MEDIA caption rides on the bubble as its *formatted* caption; formatting can inflate a
         # raw <1024 string past Telegram's cap, so re-check in UTF-16 units.
@@ -302,6 +329,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 logger.error(warnings[-1])
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
+        # Record WHICH bot posted. Before this line the only way to tell was to count
+        # bot<id>/sendMessage URLs in the log — which is exactly how the t_43eff563 mis-post
+        # (a default-profile worker posting as the ultron bot) went unnoticed.
+        log_bot_id(resolved_bot_id, chat_id=int_chat_id)
         return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: "

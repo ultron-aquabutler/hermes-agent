@@ -495,11 +495,24 @@ def load_hermes_dotenv(
     # (``is_multiplex_active()`` is also true, context-locally, for a routed cron fire in the desktop
     # backend — see ``cron.scheduler_provider.routed_profile_fire``.)
     from agent.secret_scope import is_multiplex_active
-    from hermes_constants import get_hermes_home, get_hermes_home_override
+    from hermes_constants import get_hermes_home
 
     launch_home = _process_hermes_home().resolve()
-    if (is_multiplex_active() and get_hermes_home_override() is not None
-            and (home_path.resolve() != launch_home or get_hermes_home().resolve() != launch_home)):
+    # The load's target is a ROUTED home (not the launch home) under multiplex semantics. The
+    # `get_hermes_home_override() is not None` clause this guard used to require was the hole that
+    # let a sibling profile's credential land in the shared os.environ: a routed cron fire turns
+    # multiplex semantics on for its span (``cron.scheduler._install_fire_secret_scope`` →
+    # ``set_multiplex_context(True)``) WITHOUT installing a home override, so the clause was false
+    # and the routed profile's .env was written into the process-global env with override=True.
+    # Every later resolution that reads os.environ (no secret scope bound) then answered with the
+    # ROUTED profile's credential — e.g. a `default`-profile worker posting to Telegram as the
+    # `ultron` bot because the ultron cron fire had just poisoned the shared env (t_43eff563).
+    # The routed TARGET home is the authority: a load for the launch home is process configuration
+    # and still loads.
+    routed_target = home_path.resolve() != launch_home
+    # ...and the ACTIVE home must be the launch home too (see the comment above).
+    active_foreign = get_hermes_home().resolve() != launch_home
+    if is_multiplex_active() and (routed_target or active_foreign):
         home_key = str(home_path.resolve())
         if home_key not in _SCOPED_SKIP_LOGGED:
             _SCOPED_SKIP_LOGGED.add(home_key)
