@@ -15,6 +15,15 @@ import sys
 import time
 from typing import Optional
 
+# ``GatewayClientError`` subclasses ``ValueError`` (hermes_cli/gateway_client.py), so the broad
+# ``except (KeyError, ValueError, OSError)`` in ``_submit`` used to swallow it and print
+# "Kanban owner refused: Kanban execution unknown; retained by owner" for a failure that happened
+# AFTER the owner admitted the card. The label asserts a cause that is false -- nothing was
+# refused -- and it is the text the next reader sees in ``task_runs.error``, the dispatcher's crash
+# summary and the card's ``last_failure_error``. Import it at module scope so the handler can
+# exclude it: a handshake failure must never be reported as an owner refusal.
+from hermes_cli.gateway_client import GatewayClientError
+
 # A worker that loses its owner (a dropped socket, a restart, `hermes update` draining it or a new
 # owner still starting) waits for it instead of exiting: the condition is the host's, not the card's,
 # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
@@ -185,6 +194,24 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except GatewayClientError as exc:
+        # The owner never REFUSED this card, so this must not claim otherwise: report what
+        # actually happened and let the dispatcher book the crash with the cause visible.
+        # t_bdfd455e.
+        #
+        # Two gateway-side failures arrive here, and they are different:
+        #   * 'Kanban owner silent for Ns: ...' -- the owner never became ready (draining,
+        #     starting, restarting). Nothing was admitted; the card never started.
+        #   * 'Kanban execution unknown; retained by owner' -- the owner DID admit the card
+        #     (an ``owner_admitted`` event exists for every such run) and the completion
+        #     handshake then came back 'unknown'. The work may well be done.
+        # The old handler caught both under 'Kanban owner refused', which asserted a refusal
+        # that never happened and sent triage hunting for a missing-env-var cause for days.
+        if str(exc).startswith('Kanban owner silent for'):
+            print(f'Kanban owner unavailable: {exc}', file=sys.stderr)
+        else:
+            print(f'Kanban handshake failed: {exc}', file=sys.stderr)
+        return 1
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1

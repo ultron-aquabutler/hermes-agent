@@ -328,7 +328,7 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
-def execute(frame, channel):
+def execute(frame, channel, holder=None):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
@@ -339,6 +339,10 @@ def execute(frame, channel):
     if adopted['owner_epoch'] != scope['epoch']:
         raise RuntimeError('stale_epoch')
     store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
+    if holder is not None:
+        # The caller reads the store's sticky failure when this worker dies: the cause of a
+        # lost receipt lives there, and the store is otherwise unreachable from outside.
+        holder['store'] = store
     from gateway.session_kanban import bind_worker_context
     bind_worker_context(frame)
     # Background processes a previous admission of this session started outlive that worker
@@ -450,6 +454,33 @@ def hello():
     return {'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]}
 
 
+def _failure_cause(exc, store=None):
+    """The machine-readable reason this worker died, for the board's attempt record.
+
+    A managed worker that dies inside its turn leaves the card with an EMPTY
+    ``worker_result``: the turn's own recorder never ran, so the board sees a crash with no
+    cause and cannot tell a lost persistence receipt from a failed task. The cause is
+    known here and nowhere else, so it travels with the worker.
+
+    ``WorkerPersistenceError`` carries its own reason (``worker_receipt_timeout`` and
+    friends). A store that has gone sticky holds the same reason in ``failure``. Anything
+    else is named by its exception type only -- a traceback may hold credentials, so no
+    message text is sent.
+    """
+    from agent.runtime_session_store import WorkerPersistenceError
+    failure = getattr(store, 'failure', None)
+    if failure:
+        # The store's sticky reason is the root cause: a ``close()`` that raises on it
+        # replaces the original exception, so the cause is read here, not from the type.
+        return str(failure)
+    if isinstance(exc, WorkerPersistenceError):
+        return str(exc)
+    reason = getattr(exc, 'reason', None)
+    if reason:
+        return str(reason)
+    return type(exc).__name__
+
+
 def main():
     channel = WorkerChannel(os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0))  # windows-footgun: ok — binary frames
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
@@ -459,18 +490,41 @@ def main():
     if not logger.handlers:
         logger.addHandler(logging.StreamHandler(sys.stderr))
     logger.propagate = False
+    frame = None
+    holder = {}
     try:
         channel.send('hello', **hello())
         frame = validate_bootstrap(read_frame(sys.stdin.buffer))
-        execute(frame, channel)
-    except Exception:
+        execute(frame, channel, holder)
+    except Exception as exc:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')
+        _record_failure_cause(frame, exc, holder.get('store'))
         channel.send('error', reason='managed_worker_failed')
         return 1
     finally:
         channel.stream.close()
     return 0
+
+
+def _record_failure_cause(frame, exc, store):
+    """Put this worker's cause on the card, so a lost turn is not a blank one.
+
+    The board write needs no owner round-trip -- only the owner's *persistence receipt* was
+    lost -- so the cause lands even in exactly the case that loses everything else. A card
+    that dies on the handshake then shows WHY, and the next reader can tell a lost receipt
+    from a failed task. Never raises: the turn's own outcome is already decided.
+    """
+    if frame is None:
+        return
+    try:
+        from gateway.session_kanban import record_worker_failure_cause
+        context = json.loads(frame['policy'].get('kanban_json') or 'null')
+        if not context:
+            return
+        record_worker_failure_cause(context, _failure_cause(exc, store))
+    except Exception:
+        logger.exception('managed worker failure cause record failed')
 
 
 if __name__ == '__main__':

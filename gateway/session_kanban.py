@@ -321,6 +321,47 @@ def _record_worker_result(context, code, last_output):
                  'last_output': last_output}, run_id=context['run_id'])
 
 
+def record_worker_failure_cause(context, cause):
+    """Stamp a failed managed worker's cause onto this attempt's ``worker_result``.
+
+    A worker that dies inside the turn (a lost persistence receipt, a missing skill, a
+    provider fault) never reaches ``_run_worker_turns``'s own recording, so the attempt's
+    ``worker_result`` carries an empty ``last_output`` and the board cannot tell a lost
+    receipt from a failed task. The cause travels with the worker instead: it is appended
+    as a NEW ``worker_result`` event, and the reader takes the latest one, so the cause
+    replaces the blank without rewriting history.
+
+    Only a cause the worker itself observed is recorded (the store's sticky failure, the
+    exception's own reason). Never raises: a failing board write must not replace the
+    turn's real outcome.
+    """
+    if not cause:
+        return
+    import os
+    context = context or {}
+    try:
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli import kanban_db as kb
+        with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+            if not _bound_worker_matches(conn, context):
+                return
+            row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result' "
+                "ORDER BY id DESC LIMIT 1", (context['task_id'], context['run_id'])).fetchone()
+            prior = json.loads(row[0]) if row else {}
+            output = str(prior.get('last_output') or '')
+            stamp = f'worker_failure_cause: {cause}'
+            if stamp in output:
+                return
+            kb._append_event(conn, context['task_id'], 'worker_result',
+                {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
+                 'exit_code': prior.get('exit_code', 1),
+                 'last_output': f'{output}\n{stamp}'.strip()[-500:]}, run_id=context['run_id'])
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('kanban worker failure cause record failed')
+
+
 def record_worker_loss(policy, reason, *, pid=None, bound=False):
     """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
 
