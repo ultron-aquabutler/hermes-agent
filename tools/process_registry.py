@@ -46,6 +46,12 @@ from tools.process_registry_wsl import _is_wsl_launcher_command
 
 logger = logging.getLogger(__name__)
 
+# Cache for the live gateway unit's cgroup path: (monotonic_timestamp, path).
+# The path only changes when the unit restarts, and it is consulted on every
+# spawn -- caching it keeps a `systemctl` probe off the per-spawn hot path.
+_GATEWAY_CGROUP_CACHE: "tuple[float, str | None] | None" = None
+_GATEWAY_CGROUP_TTL_SECONDS = 5.0
+
 # Crash-recovery checkpoint (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 _CHECKPOINT_PATH_AT_IMPORT = CHECKPOINT_PATH
@@ -354,6 +360,91 @@ def _is_supervised_gateway_process() -> bool:
     except Exception as exc:
         logger.debug("Could not verify supervised gateway process identity: %s", exc)
         return False
+
+
+def _enclosing_cgroup_path() -> str | None:
+    """This process's own cgroup path (the v2 unified ``0::`` line), or None."""
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            if line.startswith("0::"):
+                return line.partition("::")[2].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def _gateway_unit_cgroup_path() -> str | None:
+    """The cgroup path of the live ``hermes-gateway.service`` unit, or None.
+
+    Cached for a short TTL: this is consulted on every spawn, and the unit's
+    cgroup path only changes when the unit is restarted. The cache keeps the
+    lookup off the ``subprocess.Popen`` path -- the terminal-tool tests assert
+    on what is passed to ``Popen``, and a helper that spawns its own probe
+    would show up there.
+    """
+    global _GATEWAY_CGROUP_CACHE
+    now = time.monotonic()
+    cached = _GATEWAY_CGROUP_CACHE
+    if cached is not None and now - cached[0] < _GATEWAY_CGROUP_TTL_SECONDS:
+        return cached[1]
+
+    path: str | None = None
+    try:
+        import subprocess as _sp
+
+        result = _sp.run(
+            ["systemctl", "--user", "show", "hermes-gateway.service", "-p", "ControlGroup", "--value"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        raw = (result.stdout or "").strip()
+        if raw:
+            path = raw if raw.startswith("/") else "/" + raw
+    except Exception as exc:
+        logger.debug("Could not read the gateway unit cgroup: %s", exc)
+        path = None
+
+    _GATEWAY_CGROUP_CACHE = (now, path)
+    return path
+
+
+def _shares_gateway_cgroup() -> bool:
+    """Whether this process runs INSIDE the gateway's own service cgroup.
+
+    The PID-ownership gate in :func:`_is_supervised_gateway_process` answers "am
+    I the gateway?", which is the right question for the *self-kill guards*. It
+    is the WRONG question for *cgroup isolation*, because every descendant of
+    the gateway -- a managed worker, a terminal command an agent ran, an LSP
+    server -- shares the gateway's cgroup and therefore its ``memory.high`` /
+    ``memory.max`` budget, even though it is not the gateway process.
+
+    Measured 2026-11-11 (t_6b5fe961): a ``pytest tests/ -q`` started by an
+    agent through the terminal tool ran for 88 minutes inside
+    ``hermes-gateway.service`` holding **3,156 MiB of swap**, while the
+    gateway's own working set sat pinned at ``memory.high``. The
+    ``hermes-worker-*.scope`` units looked like isolation but held only the
+    *submitter* (28 MB) -- the worker itself was a plain ``subprocess.Popen``
+    child of the gateway and inherited its cgroup.
+
+    The scope mechanism was available and would have worked; the gate simply
+    excluded the processes that needed it. This predicate asks the question
+    that actually matters for memory isolation: "am I inside the gateway's
+    budget?" A descendant answers yes; an unrelated CLI (even one that
+    inherited ``_HERMES_GATEWAY``) does not -- it lives in a different cgroup,
+    so its memory is already isolated.
+
+    The comparison is against the *live unit's* cgroup, not against the PID
+    file: the PID record's identity matcher refuses a reader whose environment
+    differs from the gateway's, which made this predicate false exactly where
+    it mattered most. Cgroup membership is the authoritative, environment-free
+    answer.
+    """
+    own = _enclosing_cgroup_path()
+    if not own:
+        return False
+    gateway_cgroup = _gateway_unit_cgroup_path()
+    if not gateway_cgroup:
+        return False
+    return own.rstrip("/") == gateway_cgroup.rstrip("/")
 
 
 def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[str]:
@@ -1144,10 +1235,21 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
-        if in_supervised_gateway and _systemd_run_user_scope_available():
+        # ALSO scope when this process merely SHARES the gateway's cgroup: a managed
+        # worker, or a terminal command an agent ran inside the gateway, is not the
+        # gateway process, but it spends the gateway's memory.high / memory.max
+        # budget all the same. Without this, a heavy child (a test suite, a build)
+        # runs unbounded inside the gateway's cgroup and can get the whole gateway
+        # OOM-killed or starve its event loop until shutdown_watchdog fires.
+        # Measured 2026-11-11 (t_6b5fe961): a `pytest tests/ -q` held 3,156 MiB
+        # of swap inside hermes-gateway.service for 88 minutes.
+        shares_gateway_cgroup = (
+            _IS_LINUX and not in_supervised_gateway and _shares_gateway_cgroup()
+        )
+        if (in_supervised_gateway or shares_gateway_cgroup) and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if in_supervised_gateway:
+        if in_supervised_gateway or shares_gateway_cgroup:
             # Under a supervisor but no private cgroup: a worker OOM can still take
             # the whole gateway down.
             logger.debug(

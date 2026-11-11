@@ -1039,8 +1039,12 @@ class TestSpawnRewriteCompoundBackground:
 
         assert len(captured_cmd) == 1
         shell_cmd = captured_cmd[0]
-        # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        # The command passed to Popen should be the REWRITTEN version. The
+        # argv may be wrapped in a systemd scope (systemd-run ... -- /bin/bash
+        # -lic <cmd>) when the process shares the gateway's cgroup, so find
+        # the command rather than assuming a fixed index.
+        joined = " ".join(shell_cmd)
+        assert "&& { node server.js &>/tmp/srv.log & }" in joined
 
     def test_pty_path_uses_rewritten_command(self, registry):
         """PTY spawn path must also use the rewritten command (issue #68915)."""
@@ -2141,9 +2145,17 @@ class TestSystemdCgroupIsolation:
 
         INVOCATION_ID is inherited by every descendant, so its presence
         alone must not activate the gateway-only systemd scope path.
+
+        This CLI is NOT in the gateway's cgroup -- it is an ordinary terminal
+        session, so its memory is already isolated and scoping it would be
+        pointless. (A process that DOES share the gateway's cgroup is scoped
+        instead: see tests/tools/test_process_registry_cgroup_sharing.py.)
         """
         monkeypatch.setenv("INVOCATION_ID", "herdr-service-inherited-marker")
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            "tools.process_registry._shares_gateway_cgroup", lambda: False
+        )
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
@@ -2183,17 +2195,26 @@ class TestSystemdCgroupIsolation:
     def test_inherited_gateway_tree_markers_do_not_scope_child_cli(
         self, registry, monkeypatch, use_pty
     ):
-        """Gateway descendants are not the gateway process that owns the PID file.
+        """An UNRELATED cli that inherited the gateway markers must not be scoped.
 
         _HERMES_GATEWAY is inherited (and set by importing gateway.run), so
         both it and INVOCATION_ID may be present in a child process. The
         PID-ownership gate must still keep the scope path off.
+
+        This cli is NOT in the gateway's cgroup -- it is an ordinary terminal
+        session that merely inherited the markers, so its memory is already
+        isolated and scoping it would be pointless. (A process that DOES share
+        the gateway's cgroup is scoped instead: see
+        tests/tools/test_process_registry_cgroup_sharing.py.)
         """
         monkeypatch.setenv("INVOCATION_ID", "inherited-systemd-marker")
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda *, cleanup_stale=False: os.getpid() + 1,
+        )
+        monkeypatch.setattr(
+            "tools.process_registry._shares_gateway_cgroup", lambda: False
         )
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
