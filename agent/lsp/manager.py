@@ -45,6 +45,19 @@ def _float_or(value: Any, default: float) -> float:
         return default
 
 
+def _int_or(value: Any, default: int) -> int:
+    """``int(value)`` with a fallback; a malformed config value must not disable the bound.
+
+    ``bool`` is rejected on purpose: ``True`` is not a client count.
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _path_list(value: Any) -> Optional[list[str]]:
     """A config list of paths, ``~``-expanded; ``None`` when the value is not a list of strings."""
     if value is None:
@@ -73,11 +86,51 @@ def parse_trusted_workspaces(value: Any) -> list[str]:
     return roots or []
 
 
+#: Cache-key suffix for the process shared by every UNTRUSTED root of a multi-root server.
+#:
+#: It is deliberately NOT the empty string: the empty suffix is the TRUSTED multi-root key, and a
+#: trusted client is pinned to the first root's project venv (it may load that project's code).
+#: An untrusted client is pinned to the operator's own interpreter (never the project's), so it is
+#: safe to share across untrusted roots — and sharing it is what keeps the process count bounded.
+UNTRUSTED_SHARED_ROOT = "\x00untrusted-shared"
+
+
 def _client_key(srv: ServerDef, root: str, trusted: bool) -> _Key:
-    """Cache key for the client serving ``root``: multi-root servers share one process per
-    ``server_id`` across trusted roots; everything else, untrusted roots included, is keyed per
-    resolved project root (a shared process keeps the trust its first root spawned it with)."""
-    return (srv.server_id, "" if srv.multi_root and trusted else root)
+    """Cache key for the client serving ``root``.
+
+    Three key shapes:
+
+    * ``(server_id, "")`` — the TRUSTED multi-root process: one per ``server_id``, shared by every
+      trusted root. It is pinned to the first root's project venv, so it never serves an untrusted
+      root.
+    * ``(server_id, UNTRUSTED_SHARED_ROOT)`` — the UNTRUSTED multi-root process, shared by every
+      untrusted root of a server that is safe to run without trust
+      (:data:`agent.lsp.servers.UNTRUSTED_SAFE_SERVERS`).
+    * ``(server_id, root)`` — one process per root, for every other case (a non-multi-root server,
+      or a multi-root server that is not safe to run untrusted).
+
+    WHY the untrusted shared key exists (kanban t_2dfa12f1, 2026-11-11): keying untrusted roots
+    per-root made every distinct checkout spawn its OWN language-server process. A kanban worker has
+    no operator anchor — :func:`agent.lsp.workspace.operator_workspace_roots` returns an empty set
+    when ``HERMES_KANBAN_TASK`` is set — so EVERY root a worker touches is untrusted, and every
+    worker turn on a different checkout added another live server. On the homelab gateway those
+    processes live in the GATEWAY's cgroup: four pyright instances held ~1 GiB RSS plus ~1 GiB
+    swap, pinned the gateway at 99.9% of ``memory.high``, and the reclaim storm starved the event
+    loop until the gateway's own liveness watchdog killed it. Sharing the untrusted roots collapses
+    that to ONE process per server.
+
+    Sharing is safe precisely because the trust gate still decides what the server may DO:
+    :func:`agent.lsp.servers._spawn_pyright` pins an untrusted pyright to the operator's own
+    interpreter (``VIRTUAL_ENV``), never the checkout's ``.venv``, so an untrusted client never
+    loads project code no matter which root is attached to it. The TRUSTED client is still kept
+    separate, because it IS pinned to a project's venv.
+    """
+    if srv.multi_root:
+        if trusted:
+            return (srv.server_id, "")
+        if srv.server_id in UNTRUSTED_SAFE_SERVERS:
+            return (srv.server_id, UNTRUSTED_SHARED_ROOT)
+    return (srv.server_id, root)
 
 
 class _BackgroundLoop:
@@ -150,6 +203,8 @@ class LSPService:
         warmup_timeout: float = 0.0,
         exclude_roots: Any = None,
         trusted_workspaces: Any = None,
+        max_server_heap_mb: int = 0,
+        max_clients: int = 0,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -163,6 +218,10 @@ class LSPService:
         self._extra_servers: list[ServerDef] = list(extra_servers or [])
         self._broken_retry = max(0.0, broken_retry_seconds)
         self._warmup_timeout = max(0.0, warmup_timeout)
+        # V8 heap ceiling (MiB) for node-based servers; 0 = no cap.
+        self._max_server_heap_mb = max(0, int(max_server_heap_mb or 0))
+        # Maximum number of LIVE language-server processes; 0 = unlimited.
+        self._max_clients = max(0, int(max_clients or 0))
         # ``None`` = misconfigured → fail closed (every root excluded) until the user fixes the key: a
         # bare string here means "exclude that workspace", and excluding nothing would re-pay the stall it
         # was meant to avoid.
@@ -229,6 +288,8 @@ class LSPService:
             warmup_timeout=_float_or(lsp_cfg.get("warmup_timeout"), 0.0),
             exclude_roots=lsp_cfg.get("exclude_roots"),
             trusted_workspaces=lsp_cfg.get("trusted_workspaces"),
+            max_server_heap_mb=_int_or(lsp_cfg.get("max_server_heap_mb"), 0),
+            max_clients=_int_or(lsp_cfg.get("max_clients"), 0),
         )
 
     def _server_for(self, file_path: str) -> Optional[ServerDef]:
@@ -292,11 +353,20 @@ class LSPService:
         return is_trusted_workspace(root, self._trusted_workspaces, self._operator_roots)
 
     def _live_key(self, srv: ServerDef, root: str) -> _Key:
-        """The client key for ``root`` (under ``_state_lock``): a multi-root server started while
-        ``root`` was untrusted keeps its own client after ``root`` becomes trusted, so it is found and
-        released rather than orphaned."""
+        """The client key for ``root`` (under ``_state_lock``).
+
+        A multi-root server started while ``root`` was untrusted keeps its own client after ``root``
+        becomes trusted, so it is found and released rather than orphaned. The same applies to the
+        SHARED untrusted client: if one is already live it is reused for any further untrusted root
+        instead of spawning a second process.
+        """
         own = (srv.server_id, root)
-        return own if own in self._clients or own in self._spawning else _client_key(srv, root, self._trusted(root))
+        if own in self._clients or own in self._spawning:
+            return own
+        shared = _client_key(srv, root, self._trusted(root))
+        if shared in self._clients or shared in self._spawning:
+            return shared
+        return shared
 
     def _untrusted_denied(self, srv: ServerDef, root: str, file_path: str, trusted: bool) -> bool:
         """True iff ``srv`` may run project code and ``root`` is not a trusted workspace (deny by default:
@@ -588,9 +658,12 @@ class LSPService:
             return None
         with self._state_lock:
             key = self._live_key(srv, root)
-            # Derived with the key: trust only grows, so one read before the lock could store an
-            # untrusted spawn under the shared multi-root key every trusted root then attaches to.
-            trusted = key[1] == "" or self._trusted(root)
+            # Derived from the KEY, not from the root: trust only grows, so one read before the lock
+            # could store an untrusted spawn under the shared multi-root key every trusted root then
+            # attaches to. The key encodes the trust class of the process: "" is the trusted
+            # multi-root process, UNTRUSTED_SHARED_ROOT the shared untrusted one, anything else a
+            # per-root process.
+            trusted = key[1] != UNTRUSTED_SHARED_ROOT and (key[1] == "" or self._trusted(root))
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 self._last_used[key] = time.time()
@@ -624,6 +697,8 @@ class LSPService:
                     self._clients[key] = client
                     self._last_used[key] = time.time()
                 eventlog.log_active(srv.server_id, root)
+                # The new client counts against the cap; evict the LRU survivors if it is over.
+                await self._enforce_client_cap()
             spawning.set_result(client)
             return client
         finally:
@@ -644,7 +719,7 @@ class LSPService:
         ctx = ServerContext(
             workspace_root=root, install_strategy=self._install_strategy, binary_overrides=self._binary_overrides,
             env_overrides=self._env_overrides, init_overrides=self._init_overrides,
-            trusted=trusted,
+            trusted=trusted, max_server_heap_mb=self._max_server_heap_mb,
         )
         spec = srv.build_spawn(root, ctx)
         if spec is None:
@@ -698,6 +773,36 @@ class LSPService:
         # Externally deleted project roots (rm -rf, a worktree removed by another process) never go
         # idle from the server's point of view — tsserver keeps its multi-GiB heap for a tree that is gone.
         await self._detach_roots(lambda folder: not os.path.isdir(folder), reason="workspace root deleted")
+
+    async def _enforce_client_cap(self) -> None:
+        """Shut down the LEAST RECENTLY USED clients until the live count fits ``max_clients``.
+
+        A language server lives in the GATEWAY's cgroup, not in a worker scope, so an
+        unbounded number of them is charged against the gateway's ``MemoryMax`` -- the
+        messaging control plane. This caps the PROCESS count; the next use of an evicted
+        root respawns it.
+
+        The cap counts LIVE clients. A client that is mid-spawn is not in ``_clients``
+        yet, so the count here is the number of live processes.
+        """
+        if self._max_clients <= 0:
+            return
+        with self._state_lock:
+            overflow = len(self._clients) - self._max_clients
+            if overflow <= 0:
+                return
+            # Least-recently-used first. ``_last_used`` is the recency signal; a client
+            # with no entry sorts last (it is the oldest).
+            victims = sorted(self._clients, key=lambda k: self._last_used.get(k, 0.0))[:overflow]
+            clients = [self._clients.pop(key) for key in victims]
+            for key in victims:
+                self._last_used.pop(key, None)
+        for client in clients:
+            eventlog.log_reaped([(client.server_id, client.workspace_root)], self._idle_timeout)
+            try:
+                await asyncio.wait_for(client.shutdown(), timeout=5.0)
+            except Exception:
+                logger.debug("shutdown of LRU-evicted LSP client failed", exc_info=True)
 
     def release_workspace(self, workspace_root: str) -> int:
         """Shut down the clients serving ``workspace_root`` or any root beneath it; returns how many.

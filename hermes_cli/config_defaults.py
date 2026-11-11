@@ -2402,6 +2402,35 @@ DEFAULT_CONFIG = {
         # processes don't accumulate stale children (hundreds of MB + pipe FDs each) across
         # worktrees. 0 = keep servers for process lifetime.
         "idle_timeout": 600.0,
+        # V8 heap ceiling (MiB) for NODE-based language servers (pyright, tsserver, vue...).
+        # Applied as NODE_OPTIONS=--max-old-space-size=N. 0 = no heap cap.
+        #
+        # WHY (kanban t_67049b90, 2026-11-11): the language server was the UNBOUNDED
+        # consumer on the homelab host. Four live pyright processes held 909 MiB of RSS
+        # and one was observed growing 559 -> 666 MiB in 8 seconds, all charged to the
+        # GATEWAY's cgroup (they are gateway children, not worker-scope children), which
+        # sat at 99.84% of memory.high with 49841 throttle events. One more server at
+        # 400 MiB would have taken the gateway past MemoryMax -- an OOM kill of the
+        # entire messaging control plane.
+        #
+        # The heap cap makes the server FAIL (V8 aborts) instead of eating the gateway.
+        # A language server that dies is restarted on demand; a gateway that dies takes
+        # the fleet's control plane with it. 512 MiB clears pyright's working set on
+        # the repos here (measured 386-666 MiB RSS, of which the V8 OLD space is the
+        # part that grows) while keeping the worst case inside the gateway's headroom.
+        # A user-set NODE_OPTIONS in lsp.servers.<id>.env WINS over this default.
+        "max_server_heap_mb": 512,
+        # Maximum number of LIVE language-server PROCESSES per profile. When the cap
+        # is exceeded the LEAST RECENTLY USED client is shut down (its next use
+        # respawns it). 0 = unlimited (the pre-2026-11-11 behaviour).
+        #
+        # WHY (kanban t_67049b90): a client cap is a RESOURCE bound, not a trust
+        # relaxation. Pyright is a multi_root server, but multi-root sharing only
+        # engages for TRUSTED roots -- an untrusted root gets its own client key and
+        # therefore its own process. A Kanban worker has no operator anchor, so every
+        # checkout it touches is untrusted: a worker touching two repos runs TWO
+        # pyright processes. With four profiles live that multiplied without limit.
+        "max_clients": 2,
         # Per-server overrides keyed by registry server_id (pyright, gopls...): disabled: true;
         # command: ["path/to/server", "--stdio"] (bypasses auto- install); env: {...};
         # initialization_options: {...} (merged into LSP initializationOptions).

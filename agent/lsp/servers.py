@@ -93,6 +93,9 @@ class ServerContext:
     # Whether the server may load code the project ships (see workspace.is_trusted_workspace).
     # Defaults closed: a context built without a trust decision must never run the repo's code.
     trusted: bool = False
+    # V8 heap ceiling (MiB) for NODE-based servers; 0 = no cap. See
+    # ``apply_node_heap_cap``.
+    max_server_heap_mb: int = 0
 
 
 # ---- helpers ----
@@ -149,8 +152,41 @@ def _make_spec(root: str, ctx: ServerContext, server_id: str, command: list[str]
     init = ctx.init_overrides.get(server_id, {}) if base_init is None else {**base_init, **ctx.init_overrides.get(server_id, {})}
     env = env_for("node")
     env.update(ctx.env_overrides.get(server_id, {}))
+    apply_node_heap_cap(env, ctx.max_server_heap_mb)
     return SpawnSpec(command, root, root, env=env,
                      initialization_options=init, seed_diagnostics_on_first_push=seed)
+
+
+def apply_node_heap_cap(env: dict[str, str], max_server_heap_mb: int) -> dict[str, str]:
+    """Cap the V8 heap of a NODE-based language server via ``NODE_OPTIONS``.
+
+    ``--max-old-space-size`` bounds the V8 OLD space -- the part that grows without
+    bound when a server indexes a large tree. Without it the server's RSS is a
+    function of the repo it happens to be pointed at, and the server lives in the
+    GATEWAY's cgroup (language servers are gateway children, not worker-scope
+    children), so an unbounded server can OOM-kill the entire messaging control
+    plane.
+
+    A user-set ``NODE_OPTIONS`` already carrying ``--max-old-space-size`` WINS:
+    the operator's explicit choice is not overridden by a default. Otherwise the
+    flag is APPENDED to whatever ``NODE_OPTIONS`` exists (never clobbering other
+    flags such as ``--require``).
+
+    ``max_server_heap_mb`` of 0 (or a non-positive value) means "no cap".
+    """
+    try:
+        heap_mb = int(max_server_heap_mb)
+    except (TypeError, ValueError):
+        return env
+    if heap_mb <= 0:
+        return env
+    tokens = (env.get("NODE_OPTIONS") or "").split()
+    if any(tok.startswith("--max-old-space-size=") for tok in tokens):
+        # The operator already set a heap ceiling for this server — respect it.
+        return env
+    tokens.append(f"--max-old-space-size={heap_mb}")
+    env["NODE_OPTIONS"] = " ".join(tokens).strip()
+    return env
 
 
 def _simple_spawn(server_id: str, which: Sequence[str], args: Sequence[str] = (),
