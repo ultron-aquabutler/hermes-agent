@@ -1,4 +1,6 @@
 """Admission-owned production exec; observers never own the worker lifetime."""
+from __future__ import annotations
+
 import asyncio
 from contextlib import contextmanager, suppress
 from collections import deque
@@ -13,10 +15,14 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING, Optional
 
 from agent.managed_worker import accept_result, encode_frame, read_frame
 from gateway.session_worker_reservation import owner_worker_subject, reserve_admission_worker
 from hermes_state_runtime import RuntimeStoreError
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle broken at runtime by the local imports below
+    from gateway.session_worker_scope import WorkerScope
 
 # The interpreter only imports psutil before it introduces itself; a child silent this long
 # is wedged (loader/stdio stall), not slow.
@@ -35,6 +41,19 @@ WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
 
 class ManagedExecutionUnknown(RuntimeError):
     """The committed unknown verdict stops the FIFO without forging failed settlement."""
+
+
+def _managed_worker_scope(session_id, execution_id=''):
+    """The transient user scope a managed worker should live in, or ``None``.
+
+    ``None`` means the host cannot provide one (no user D-Bus, no
+    ``systemd-run``, a refused cgroup write).  That is a DEGRADED spawn, not a
+    failed one: the worker still runs, it simply shares the gateway's cgroup
+    again.  Dropping the worker instead would be worse.
+    """
+    from gateway.session_worker_scope import managed_worker_scope, managed_worker_unit_suffix
+
+    return managed_worker_scope(managed_worker_unit_suffix(session_id, execution_id))
 
 
 def managed_policy(authority, ref):
@@ -176,6 +195,9 @@ class ManagedWorker:
         self.stderr_drain = None
         # Exact secrets this worker was handed; the stderr sink scrubs them besides the patterns.
         self.secrets = []
+        # The transient user scope this worker lives in, when the host could provide one.
+        # Released in close(): the scope (and its cgroup) must outlive the worker it holds.
+        self.scope: Optional[WorkerScope] = None
 
     def _write_controls(self):
         try:
@@ -344,6 +366,22 @@ class ManagedWorker:
             self.stderr_drain.join(timeout=5)  # EOF once the child is gone; the thread closes it
         elif self.process.stderr is not None:
             self.process.stderr.close()
+        self._release_scope()
+
+    def _release_scope(self):
+        """Release the transient scope this worker lived in.
+
+        The scope's cgroup (and the memory it charged) is only reclaimed once
+        its holder exits, so this must run AFTER the child is reaped — the
+        worker's memory is charged to the scope until then.
+        """
+        scope, self.scope = self.scope, None
+        if scope is None:
+            return
+        try:
+            scope.release()
+        except Exception:  # pragma: no cover - releasing a scope must never break a teardown
+            pass
 
 
 def interrupt_managed(authority, actor, ref, generation):
@@ -587,24 +625,50 @@ async def _spawn_registered_worker(authority, ref, row):
     interrupted result is already recorded). The generation stays marked spawning until registration."""
     spawning = _mark_spawning(authority, ref, row)
     generation = row.get('generation')
+    scope = None
     try:
         env = await asyncio.to_thread(_worker_env, authority)
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
         log_path = worker_log_path(authority.profile_id)
+        # The worker gets its OWN cgroup so its memory is not charged against the
+        # gateway's memory.high/memory.max (six live workers held 1.7 GiB of a
+        # 1.8 GiB budget and pinned memory.high exactly, starving the gateway's
+        # event loop until shutdown_watchdog killed it).
+        #
+        # The scope is created AFTER the spawn and the child is moved into it
+        # afterwards, which keeps the worker the gateway's DIRECT child
+        # (verify_worker_identity requires handle.ppid() == os.getpid()) and the
+        # LEADER of its own process group (_die_with_owner requires
+        # os.getpgrp() == os.getpid()).  A systemd-run WRAPPER would break both
+        # by inserting a launcher between the gateway and the worker.
+        #
+        # The order is safe: the child is inert until the owner writes its
+        # bootstrap frame, and that happens only after this function returns.
+        # Creating the scope first would also delay the spawn itself, which
+        # the cancellation contract (a cancelled spawn must reap its late
+        # child) depends on.
         process = await acquire_process(subprocess.Popen, [sys.executable, '-m', 'agent.managed_worker'],
             cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+        scope = await asyncio.to_thread(_managed_worker_scope, ref.session_id, row.get('execution_id') or '')
+        if scope is not None:
+            await asyncio.to_thread(scope.move_child, process.pid)
     except asyncio.CancelledError:
         # acquire_process owns late-child cleanup; no bootstrap or reservation was sent.
         spawning.pop(ref.session_id, None)
+        if scope is not None:
+            scope.release()
         _interrupted_before_bootstrap(authority, row, _latched_stop_cause(authority, ref.session_id, generation))
         return None
     except BaseException:
         spawning.pop(ref.session_id, None)
+        if scope is not None:
+            scope.release()
         raise
     worker = ManagedWorker(process)
+    worker.scope = scope
     if log_path is not None:
         worker.drain_stderr(log_path)
     workers = getattr(authority, '_managed_workers', None)
