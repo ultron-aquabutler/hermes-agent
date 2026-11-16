@@ -124,6 +124,104 @@ def test_strict_mode_does_not_raise_on_match(tmp_path, monkeypatch):
     assert r.ok is True
 
 
+class TestStrictModeRaisesOnDriftOnly:
+    """t_59318511: strict must refuse a tick on DRIFT, not on INDETERMINATE.
+
+    ``missing_repo`` / ``git_unavailable`` mean the guard could not READ the
+    tree, not that the tree is on the wrong branch. Strict used to raise on
+    both, which refused dispatch for every profile-scoped process: a profile
+    home (``~/.hermes/profiles/<name>``) has no ``hermes-agent/`` child, so
+    the check reported ``missing_repo`` and the tick died with rc=1.
+    """
+
+    def test_strict_does_not_raise_on_missing_repo(self, tmp_path, monkeypatch):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.setenv("HERMES_AGENT_HOME", str(empty))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "canonical-deploy-t_7161d9a9")
+        monkeypatch.setenv("HERMES_DEPLOY_GUARD", "strict")
+        r = check_deploy_branch()
+        assert r.reason == "missing_repo"
+        assert r.ok is False
+
+    def test_strict_does_not_raise_for_profile_scoped_home(self, tmp_path, monkeypatch):
+        """A profile HERMES_HOME must not refuse the tick under strict."""
+        profile_home = tmp_path / "profiles" / "curator"
+        profile_home.mkdir(parents=True)
+        monkeypatch.delenv("HERMES_AGENT_HOME", raising=False)
+        monkeypatch.delenv("HERMES_AGENT", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "canonical-deploy-t_7161d9a9")
+        monkeypatch.setenv("HERMES_DEPLOY_GUARD", "strict")
+        r = check_deploy_branch()
+        assert r.reason == "missing_repo"
+        assert r.agent_home == str(profile_home / "hermes-agent")
+
+    def test_strict_still_raises_on_wrong_branch(self, tmp_path, monkeypatch):
+        """The guard stays enforced: a drifted tree still refuses the tick."""
+        repo = _make_git_repo(tmp_path, "fix/feature")
+        monkeypatch.setenv("HERMES_AGENT_HOME", str(repo))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "canonical-deploy-t_7161d9a9")
+        monkeypatch.setenv("HERMES_DEPLOY_GUARD", "strict")
+        with pytest.raises(DeployBranchDriftError):
+            check_deploy_branch()
+
+    def test_strict_still_raises_on_detached(self, tmp_path, monkeypatch):
+        """Detached HEAD is drift too — a worker checked out a feature branch."""
+        repo = _make_git_repo(tmp_path, "main")
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(["git", "-C", str(repo), "checkout", "--detach", sha], check=True)
+        monkeypatch.setenv("HERMES_AGENT_HOME", str(repo))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "main")
+        monkeypatch.setenv("HERMES_DEPLOY_GUARD", "strict")
+        with pytest.raises(DeployBranchDriftError):
+            check_deploy_branch()
+
+    def test_missing_repo_logs_at_error_with_agent_home(self, tmp_path, monkeypatch, caplog):
+        """The skipped check stays LOUD: ERROR, and it names the resolved home."""
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.setenv("HERMES_AGENT_HOME", str(empty))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "canonical-deploy-t_7161d9a9")
+        monkeypatch.setenv("HERMES_DEPLOY_GUARD", "strict")
+        with caplog.at_level("ERROR", logger="hermes_cli.deploy_guard"):
+            check_deploy_branch()
+        errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+        assert errors, "missing_repo must be logged at ERROR so a misresolved home stays visible"
+        assert str(empty) in errors[0].message
+
+    def test_drift_logs_at_warning_not_error(self, tmp_path, monkeypatch, caplog):
+        """Drift keeps its WARNING level — the drift banner is a warning."""
+        repo = _make_git_repo(tmp_path, "fix/feature")
+        monkeypatch.setenv("HERMES_AGENT_HOME", str(repo))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "canonical-deploy-t_7161d9a9")
+        monkeypatch.setenv("HERMES_DEPLOY_GUARD", "strict")
+        with caplog.at_level("WARNING", logger="hermes_cli.deploy_guard"):
+            with pytest.raises(DeployBranchDriftError):
+                check_deploy_branch()
+        assert not [rec for rec in caplog.records if rec.levelname == "ERROR"]
+        assert [rec for rec in caplog.records if rec.levelname == "WARNING"]
+
+    def test_agent_home_env_overrides_profile_home(self, tmp_path, monkeypatch):
+        """The pinned deployment rung wins over a profile-scoped HERMES_HOME.
+
+        This is the (2) half: the deployment sites pin HERMES_AGENT_HOME so a
+        profile-scoped process inspects the REAL deployed tree — the guard is
+        enforced, not skipped.
+        """
+        repo = _make_git_repo(tmp_path, "canonical-deploy-t_7161d9a9")
+        profile_home = tmp_path / "profiles" / "curator"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_AGENT_HOME", str(repo))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_DEPLOY_BRANCH", "canonical-deploy-t_7161d9a9")
+        r = check_deploy_state()
+        assert r.ok is True
+        assert r.agent_home == str(repo)
+
+
 def test_off_mode_returns_synthetic_match(tmp_path, monkeypatch):
     repo = _make_git_repo(tmp_path, "fix/anything")
     monkeypatch.setenv("HERMES_AGENT_HOME", str(repo))

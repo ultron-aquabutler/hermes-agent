@@ -39,6 +39,17 @@ kanban DB (``deploy_branch_drift``).
 - git binary missing: ``reason="git_unavailable"``; not a hard error — a
   containerized build environment may not have git.
 
+**Strict mode raises on DRIFT only (t_59318511).** ``strict`` refuses a tick
+when the deployed tree is demonstrably on the wrong branch (``wrong_branch``)
+or detached (``detached``). It does **not** raise for ``missing_repo`` or
+``git_unavailable``: those are *indeterminate*, not *drifted* — the guard
+could not read the tree, so it has no evidence the tree is wrong. Raising
+there refused dispatch for every profile-scoped process (a profile home has
+no ``hermes-agent/`` child, so the check reported ``missing_repo`` and the
+tick died with rc=1). The two are still logged at ERROR with the resolved
+``agent_home``, so a misresolved home stays visible instead of silently
+skipping the check.
+
 **Tests** live in ``tests/hermes_cli/test_deploy_guard.py`` and cover:
 clean match, drift, detached, missing repo, missing git, strict-mode raise,
 warn-mode log-only, env-override.
@@ -90,6 +101,19 @@ def _agent_home() -> str:
     code touches the real ``~/.hermes``. Without this rung, any code path that
     reaches ``check_deploy_state()`` -- including ``dispatch_once`` -- reads the
     REAL live git tree and trips the guard (t_3d00480e).
+
+    It also matters in production: a *profile-scoped* process runs with
+    ``HERMES_HOME=~/.hermes/profiles/<name>``, which has no ``hermes-agent/``
+    child, so the rung resolves a path with no ``.git``. That is why the
+    deployment sites pin ``HERMES_AGENT_HOME=/home/serveradmin/.hermes/hermes-agent``
+    (the systemd gateway units and the profile-scoped dispatch cron scripts):
+    the top rung makes the guard inspect the REAL deployed tree for every
+    profile, so strict mode is genuinely enforced rather than skipped.
+
+    Deliberately NOT done here: falling through a profile home with no
+    ``.git`` to ``DEFAULT_AGENT_HOME``. That would re-break test isolation —
+    an isolated test whose ``HERMES_HOME`` is a tmpdir would fall through to
+    the real live tree and trip ``home_io_guard`` (t_3d00480e, t_59318511).
     """
     for env_key in ("HERMES_AGENT_HOME", "HERMES_AGENT"):
         env = os.environ.get(env_key)
@@ -262,11 +286,21 @@ def check_deploy_branch(*, strict: Optional[bool] = None) -> DeployCheckResult:
 
     - ``off``  : no-op, returns a synthetic ``ok=True`` result with reason="match".
     - ``warn`` : logs at WARNING, prints a stderr banner, returns the real result.
-    - ``strict``: same as warn, plus raises ``DeployBranchDriftError`` on drift.
+    - ``strict``: same as warn, plus raises ``DeployBranchDriftError`` on
+      **drift** — ``wrong_branch`` or ``detached`` only.
 
     The default (``warn``) is chosen so the dispatcher doesn't die when the
     guard fires — but the banner reaches the operator through both the
     structured log and the cron pump's captured stderr.
+
+    ``strict`` does NOT raise for ``missing_repo`` / ``git_unavailable``
+    (t_59318511): those mean the guard could not READ the tree, not that the
+    tree is on the wrong branch. Refusing a tick on "could not check" is how
+    a profile-scoped process (whose ``HERMES_HOME`` is a profile home with no
+    ``hermes-agent/`` child) ends up unable to dispatch at all. Those two
+    reasons are logged at ERROR — louder than the drift warning — so a
+    misresolved ``agent_home`` stays visible, and the deployment sites pin
+    ``HERMES_AGENT_HOME`` so the check actually inspects the real tree.
     """
     mode = (os.environ.get("HERMES_DEPLOY_GUARD") or "warn").lower()  # health: allow HX002 -- the guard mode is a deploy-time setting the operator pins, not a per-profile behaviour
     if strict is not None:
@@ -289,8 +323,16 @@ def check_deploy_branch(*, strict: Optional[bool] = None) -> DeployCheckResult:
         _LOG.info(banner)
         return result
 
-    # Anything below is a drift or a missing-repo warning.
-    _LOG.warning(banner)
+    # ``missing_repo`` / ``git_unavailable`` are INDETERMINATE: the guard could
+    # not read the tree, so it has no evidence of drift. They are logged louder
+    # than a drift warning (ERROR, not WARNING) so a misresolved agent_home
+    # stays visible — but they never refuse a tick.
+    indeterminate = result.reason in ("missing_repo", "git_unavailable")
+
+    if indeterminate:
+        _LOG.error(banner)
+    else:
+        _LOG.warning(banner)
     try:
         print(banner, file=sys.stderr, flush=True)
     except Exception:  # health: allow BLE001 S110 -- some embedded contexts forbid stderr writes; the log line is enough
@@ -304,7 +346,7 @@ def check_deploy_branch(*, strict: Optional[bool] = None) -> DeployCheckResult:
     # tree-drift watcher (Ultron-owned, see t_7161d9a9) polls ``git
     # rev-parse HEAD`` for cron-pump visibility.
 
-    if mode == "strict":
+    if mode == "strict" and not indeterminate:
         raise DeployBranchDriftError(banner)
 
     return result
