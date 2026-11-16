@@ -214,7 +214,7 @@ to `expires_at`.
 |---|---|---|
 | `_INTEGRITY_CHECK_MAX_BYTES` | `1_073_741_824` (1 GiB) | Store size above which the quick_check is skipped. Decided with no I/O. |
 | `_INTEGRITY_CHECK_TIMEOUT_S` | `120.0` s | Wall-clock budget for one check. |
-| `HERMES_STATE_DB_INTEGRITY_CHECK_TIMEOUT_S` | unset | Overrides the budget. Invalid or non-positive values fall back to the default. |
+| `gateway.state_db_integrity_check_timeout_s` (in `config.yaml`) | unset | Overrides the budget. Invalid or non-positive values fall back to the default. |
 | `LEASE_TTL_SECONDS` | `300.0` s | Turn-lease TTL. The fallback path for anything the registry cannot prove. |
 | `_TURN_LEASE_SWEEP_GRACE_S` | `86400.0` s (24 h) | How long an expired row is retained before the sweep deletes it. |
 
@@ -235,8 +235,8 @@ grep -E 'skipped-too-large|INCONCLUSIVE|quick_check exceeded' ~/.hermes/logs/gat
 If the store is above the ceiling the verdict is `skipped-too-large` and the
 check did **not** run — the boot is not blocked. If the check itself is
 slow, raise the budget with
-`HERMES_STATE_DB_INTEGRITY_CHECK_TIMEOUT_S`, or run `hermes doctor` for a
-full check outside the boot path.
+`gateway.state_db_integrity_check_timeout_s` in `config.yaml`, or run
+`hermes doctor` for a full check outside the boot path.
 
 ### Symptom: `state.db FAILED integrity check after an unclean gateway exit`
 
