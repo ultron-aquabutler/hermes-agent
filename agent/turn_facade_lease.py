@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 from hermes_state_pidns import holder_namespace_token
 
+from agent.turn_liveness_registry import register_turn_token, retire_turn_token
+
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
 
@@ -97,10 +99,54 @@ class DurableTurnLease:
     def stop_refresher(self) -> None:
         """Stop renewal and deactivate the turn. Also the watchdog's deactivate callback: a wedge the
         hard interrupt cannot unwind must not keep the lease alive forever; TTL expiry lets
-        stale-turn cleanup reclaim the row."""
+        stale-turn cleanup reclaim the row.
+
+        Retiring the turn token here is what makes that reclamation *prompt*: once this turn
+        is no longer active, a later turn on the same session can prove the lease stale even
+        though the owning PID is still alive.  A turn wedged inside a blocking call never
+        reaches the façade's ``finally``, so ``release()`` may never run — but the liveness
+        watchdog's deactivate callback does reach this method, and the periodic refresher
+        (a separate daemon thread) keeps running against a dead turn, which is exactly how a
+        stale lease outlives its turn and blocks every later inbound."""
         with self._lock:
             self.turn_active = False
             self.stop.set()
+        retire_turn_token(self._turn_token())
+
+    def _turn_token(self) -> str:
+        """The per-turn token embedded in this lease's holder string."""
+        from agent.turn_liveness_registry import holder_turn_token
+
+        return holder_turn_token(self.holder) or ""
+
+    def _turn_thread_is_gone(self) -> bool:
+        """True when this turn's execution thread is provably no longer running.
+
+        The agent stamps ``_execution_thread_id`` at the start of every turn.  When that
+        thread has exited, the turn is over even if the façade's ``finally`` never ran —
+        which is exactly the wedge case: the turn thread is stuck or died inside a
+        blocking call, so the lease is never released, yet the turn is not making progress.
+
+        Conservative by construction: an unset thread id, an id that still names a live
+        thread, or any error reading the thread table all answer False (keep renewing).
+        Only a positively-proven dead thread reclaims the lease.
+        """
+        ident = getattr(self.agent, "_execution_thread_id", None)
+        if not ident:
+            return False
+        try:
+            for thread in threading.enumerate():
+                if thread.ident == ident:
+                    return False
+        except Exception:  # health: allow BLE001 -- a thread-table read must never raise; doubt keeps the lease
+            return False
+        # The turn thread is not in the live table.  It may simply not have started yet on
+        # a lease admitted before the turn body began, so only claim death when the lease
+        # was actually running: the refresher timer is only scheduled by ``start()``.
+        with self._lock:
+            if not self.turn_active:
+                return False
+        return True
 
     deactivate_after_liveness_abort = stop_refresher
 
@@ -211,8 +257,31 @@ class DurableTurnLease:
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
-        a loss."""
+        a loss.
+
+        The refresher runs on its own daemon thread, so it outlives a turn whose worker thread
+        died without unwinding (a wedge inside a blocking call never reaches the façade's
+        ``finally``, and never calls ``release()``).  Renewing such a lease keeps a dead turn
+        holding the session hostage: the row's PID probe still reads "alive" because the
+        *gateway* is alive, so the row is unreclaimable until its TTL, and every later inbound
+        on that session waits it out.  When the turn's execution thread is provably gone, stop
+        renewing and release the row so the next turn can proceed immediately."""
         if self.stop.is_set():
+            return False
+        if self._turn_thread_is_gone():
+            logger.warning(
+                "Turn thread for session %s is gone while its turn lease is still held; "
+                "releasing the stale lease so the next turn can proceed.",
+                self._current_session_id(),
+            )
+            self.stop_refresher()
+            try:
+                self.db.release_session_turn_lease(self._current_session_id(), self.holder)
+            except Exception:
+                logger.error(
+                    "Failed to release stale session turn lease: %s",
+                    self._current_session_id(), exc_info=True,
+                )
             return False
         started = time.time()
         # The whole renewal must finish before the authority runs out: a renewal still waiting on the
@@ -324,6 +393,11 @@ def admit_durable_turn_lease(
         f"pid={os.getpid()}{holder_namespace_token()}:turn={relay_turn_id}"
         f":platform={task_context['platform'] or 'unknown'}"
     )
+    # Announce the turn's liveness so a later turn on this session can tell "the owning
+    # process is alive but THIS turn is gone" apart from "a live turn holds the lease".
+    # Without it a turn wedged mid-flight (its release never runs) leaves a lease that no
+    # PID probe can reclaim, and every later inbound on the session waits out the TTL.
+    register_turn_token(relay_turn_id)
     reload_needed = announced = False
 
     def _on_contended() -> None:
@@ -349,6 +423,12 @@ def admit_durable_turn_lease(
         on_wait=_on_wait, on_contended=_on_contended,
         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
+        # Admission failed: the row is not ours, so there is nothing to release — but the
+        # token was registered before the attempt.  Retire it so a token in the registry
+        # always means "a turn of this process may still be running".  Retiring is
+        # fail-safe in the reclaim direction too: a retired token defers to TTL, exactly
+        # as an unregistered one does.
+        retire_turn_token(relay_turn_id)
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history,
                                                             waited=announced)
         return admission
