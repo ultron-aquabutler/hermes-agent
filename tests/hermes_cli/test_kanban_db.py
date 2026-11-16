@@ -603,6 +603,170 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
 
 
 
+def test_respawn_guard_quota_cooldown_after_crash_then_self_heals(
+    kanban_home, monkeypatch,
+):
+    """Quota text in ``last_failure_error`` stamped by a CRASH (pid-not-alive)
+    must NOT park the task forever (#t_cfbbb112). The guard returns
+    ``"quota_cooldown"`` inside ``DEFAULT_QUOTA_BLOCK_SECONDS`` and ``None``
+    past it, so the dispatcher probes the provider again without a human
+    clearing a DB field.
+
+    Also exercises the AC#2 distinguishability: a quota text on a crash returns
+    a DIFFERENT reason (``quota_cooldown``) than a real auth text on a crash
+    (``blocker_auth``). An operator scanning ``dispatch --json`` can tell
+    "transient wall, wait" from "auth broken, fix it" at a glance.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_BLOCK_SECONDS", "900")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        # Quota case: a worker crashed with "out of credits" in its last output.
+        q_tid = kb.create_task(conn, title="quota-crash", assignee="a")
+        kb.claim_task(conn, q_tid)
+        run_id = kb.get_task(conn, q_tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', "
+            "ended_at=? WHERE id=?",
+            (now - 60, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 not alive Worker's last output: 'out of credits on "
+             "OpenRouter. Switch providers with /model'", q_tid),
+        )
+        # Auth case: a worker crashed with a 401 / ANTHROPIC_TOKEN missing.
+        a_tid = kb.create_task(conn, title="auth-crash", assignee="a")
+        kb.claim_task(conn, a_tid)
+        run_id_a = kb.get_task(conn, a_tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', "
+            "ended_at=? WHERE id=?",
+            (now - 60, run_id_a),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("No Anthropic credentials found. Run 'hermes auth add "
+             "anthropic' to sign in, or set ANTHROPIC_TOKEN.", a_tid),
+        )
+        conn.commit()
+
+        # Inside quota block → defer with the QUOTA reason (transient).
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        assert kbd.check_respawn_guard(conn, q_tid) == "quota_cooldown"
+        # Auth stays blocker_auth even inside the quota window — the auth
+        # path is terminal and the breaker trips it (NOT self-healing).
+        assert kbd.check_respawn_guard(conn, a_tid) == "blocker_auth"
+
+        # Just past the quota block → allowed (None), the next tick probes.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 901)
+        assert kbd.check_respawn_guard(conn, q_tid) is None
+        # Auth is still blocked — no time-based decay.
+        assert kbd.check_respawn_guard(conn, a_tid) == "blocker_auth"
+
+
+
+def test_respawn_guard_quota_cooldown_zero_means_next_tick(
+    kanban_home, monkeypatch,
+):
+    """``HERMES_KANBAN_QUOTA_BLOCK_SECONDS=0`` must NOT park quota-crashed
+    tasks at all (matches the rate-limit-cooldown escape hatch and the
+    ``consecutive_failures`` breaker for the rare cases where an operator
+    wants the guard off but the breaker on).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_BLOCK_SECONDS", "0")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota-no-block", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("HTTP 429: Token Plan rate limit reached", tid),
+        )
+        conn.commit()
+
+        # Even at t=now (i.e. 0s elapsed), quota block disabled → allow.
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+
+def test_respawn_guard_quota_cooldown_no_ended_run_does_not_park(
+    kanban_home,
+):
+    """Defensive: a quota-flavoured ``last_failure_error`` with NO ended
+    ``task_runs`` row (e.g. legacy task predating the run log, or a row
+    inserted by hand) must NOT park the task. Returning ``None`` here is
+    the safer failure mode than ``blocker_auth`` — a clean run will
+    overwrite the stale text on completion via ``_clear_failure_counter``.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota-no-history", assignee="a")
+        # Stamp quota text without any task_runs row at all.
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("out of credits on OpenRouter", tid),
+        )
+        conn.commit()
+
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+
+def test_respawn_guard_auth_text_outside_quota_window_still_blocked(
+    kanban_home, monkeypatch,
+):
+    """Auth text must NOT inherit the quota cooldown. Even a long-elapsed
+    crash with auth text in ``last_failure_error`` stays blocked so a human
+    gets the signal — retrying would just hit the same 401.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="auth-old", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        # Crash long in the past — well past DEFAULT_QUOTA_BLOCK_SECONDS.
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', "
+            "ended_at=? WHERE id=?",
+            (now - 86400, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("HTTP 403 forbidden: invalid api key", tid),
+        )
+        conn.commit()
+
+        # An hour later, a day later — still blocked. No time-based decay
+        # for auth.
+        monkeypatch.setattr(_kb.time, "time", lambda: now - 86000)
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 86400)
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
+
 
 
 
@@ -2082,3 +2246,117 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# t_3d00480e — respawn-guard live-port regressions
+# ---------------------------------------------------------------------------
+
+
+def test_respawn_guard_never_guards_terminal_cards(kanban_home):
+    """A terminal card is never a respawn candidate.
+
+    A ``done`` card that still carries a quota/auth stamp in
+    ``last_failure_error`` used to keep generating ``respawn_guarded`` events
+    forever: the dispatcher re-read the card every tick, the guard returned a
+    reason, and the event was written even though the card could never be
+    dispatched again (t_7c686e45 burned 31 guard events/hour while ``done``).
+    """
+    with kbc.connect() as conn:
+        for status in ("done", "archived"):
+            tid = kb.create_task(conn, title=f"terminal {status}", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET status=?, last_failure_error=? WHERE id=?",
+                (
+                    status,
+                    "pid 1 exited rate-limited (quota wall) — requeued without counting a failure",
+                    tid,
+                ),
+            )
+            assert kbd.check_respawn_guard(conn, tid) is None, (
+                f"{status} card must not be a respawn-guard candidate"
+            )
+        conn.commit()
+
+
+def test_respawn_guard_crash_auth_diagnosis_in_preamble_still_blocks(kanban_home):
+    """A crashed run whose auth diagnosis is in the dispatcher's preamble parks.
+
+    The exemption for ``crashed`` runs covers auth words that appear only in
+    the worker's captured stdout (``claude auth status`` in progress prose —
+    #117097). A crash that carries a real diagnosis in the dispatcher's own
+    preamble ("HTTP 403 forbidden: invalid api key") must still park, or a
+    permanently-401 card would retry forever.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="crash with auth diagnosis", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', ended_at=? WHERE id=?",
+            (5_000_000, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+            ("HTTP 403 forbidden: invalid api key", tid),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
+def test_respawn_guard_crash_auth_words_only_in_worker_output_ignored(kanban_home):
+    """Auth words appearing only in the worker's captured stdout do not park.
+
+    This is the #117097 case: a plain crash persists the worker's last output
+    as context, and that output may innocently contain ``claude auth status``.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="crash with benign auth output", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', ended_at=? WHERE id=?",
+            (5_000_000, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+            (
+                "pid 1 killed by signal 9. Worker's last output: "
+                "'env -u ANTHROPIC_API_KEY claude auth status --text'",
+                tid,
+            ),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_quota_stamp_does_not_park_untripped_breaker(kanban_home):
+    """The quota-stamped card that caused this incident must be released.
+
+    Reproduces the live t_6be266df shape exactly: a quota/rate-limit stamp in
+    ``last_failure_error``, the latest run outcome is ``blocked`` (so the
+    rate-limit cooldown branch does not fire), and ``consecutive_failures`` is
+    0 — the breaker never tripped, so the card must not be parked.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota stamp, blocked run", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='blocked', status='blocked', ended_at=? WHERE id=?",
+            (5_000_000, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=0, last_failure_error=? WHERE id=?",
+            (
+                "pid 948415 exited rate-limited (quota wall) — "
+                "requeued without counting a failure",
+                tid,
+            ),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) is None

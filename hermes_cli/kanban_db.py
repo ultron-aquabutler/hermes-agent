@@ -325,6 +325,47 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
+def _resolve_quota_block_seconds() -> int:
+    """``HERMES_KANBAN_QUOTA_BLOCK_SECONDS`` (0 = next tick, for tests) else default.
+
+    Distinct from the rate-limit cooldown above: the rate-limit path only fires
+    when the latest run's outcome was ``rate_limited`` (clean EX_TEMPFAIL exit
+    that the worker raised itself). When a worker CRASHES / TIMES OUT and its
+    ``last_failure_error`` happens to contain quota text, the guard used to
+    park the task forever. ``_resolve_quota_block_seconds`` gates the cooldown
+    for that crash path (see ``kanban_db_dispatch.check_respawn_guard``).
+    """
+    return _env_int("HERMES_KANBAN_QUOTA_BLOCK_SECONDS", DEFAULT_QUOTA_BLOCK_SECONDS)
+
+
+# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
+_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+
+
+def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
+    reads a bare absolute timestamp as current fact — the relative age is what
+    prompts a worker to re-verify stale sibling work."""
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    if now is None:
+        now = int(time.time())
+    delta = now - ts
+    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
@@ -2274,6 +2315,12 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "blocked": "blocked",
     "dependency_wait": "blocked",
 }
+
+# Task statuses from which no further dispatch can happen. A card in one of
+# these states is never a respawn candidate, so the respawn guard must answer
+# "no reason" for it rather than a reason no code path acts on (2026-11-16:
+# t_7c686e45 generated 31 ``respawn_guarded`` events/hour while ``done``).
+TERMINAL_TASK_STATUSES = frozenset({"done", "archived"})
 
 
 def goal_run_status(
@@ -4236,6 +4283,7 @@ from hermes_cli.kanban_db_workspace import (
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
+    DEFAULT_QUOTA_BLOCK_SECONDS,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
