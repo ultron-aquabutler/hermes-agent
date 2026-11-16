@@ -480,7 +480,39 @@ def cmd_doctor(args) -> int:
             continue
         print(f"✓ {name} {fact['version']}")
     bad += _doctor_uv_cache(repair=getattr(args, "repair", False))
+    bad += _doctor_pip_guard()
     return 1 if bad else 0
+
+
+def _doctor_pip_guard() -> int:
+    """Report whether the pip guard is in place.
+
+    The guard is what stops a bare ``pip install`` from writing into the
+    managed Python store.  The store's own digest is verified above; this
+    checks the OTHER half of the same protection — that the guard still
+    exists to refuse the write in the first place.
+
+    It used to be a hand-placed file at ``~/.local/bin/pip``.  The uv/host
+    bootstrap recreates ``~/.local``, so the guard used to vanish silently.
+    It now lives canonically at ``~/.hermes/bin/pip_guard.py`` with
+    ``~/.local/bin/pip`` symlinked to it, and ``hermes-pip-guard.timer``
+    repairs the symlink.
+
+    A missing guard is a WARNING, not a hard failure: the store's integrity is
+    reported separately and on its own terms.  But it is loud, because the
+    failure it permits is silent and expensive.
+    """
+    from pm.pip_guard import guard_status, repair_hint
+
+    installed, detail = guard_status()
+    if installed:
+        print(f"✓ pip guard: {detail}")
+        return 0
+    print(f"⚠ pip guard: NOT INSTALLED — {detail}")
+    print("  The managed Python store is writable by a bare `pip install` until this is fixed.")
+    print(f"  Restore it with: {repair_hint()}")
+    print("  (or: systemctl --user start hermes-pip-guard.service)")
+    return 0
 
 
 def _doctor_uv_cache(*, repair: bool) -> int:

@@ -1,0 +1,33 @@
+[Unit]
+Description=Hermes pip guard self-heal (re-establish the guard after a ~/.local wipe)
+# WHY THIS EXISTS (kanban t_f25aee23)
+# -------------------------------------
+# The uv/host bootstrap RECREATES /home/serveradmin/.local from scratch. The
+# 2026-11-03 bootstrap did exactly that and took the static docker CLI, the
+# ssh shim and ~/.docker with it (card t_66795d80). The pip guard was a
+# hand-placed file at ~/.local/bin/pip and had neither a durable copy nor a
+# restore path -- `scripts/install_pip_guard.py` had ZERO call sites.
+#
+# The guard's CANONICAL copy now lives at ~/.hermes/bin/pip_guard.py, which
+# the bootstrap does not touch (same pattern as the docker CLI fix,
+# scripts/ensure-docker-cli.sh). This unit is the second layer: it re-creates
+# the ~/.local/bin/pip symlink if a bootstrap ate it, and ALERTS when it had
+# to -- a silent repair would hide the fact that a bootstrap ran.
+#
+# It runs OUTSIDE the gateway's process tree on purpose: a repair job that
+# lives inside the gateway dies with the gateway it is supposed to protect.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The durable copy of the ensurer lives beside this unit's siblings in
+# ~/.hermes/scripts -- NOT inside the repo checkout, which can be re-pointed or
+# pruned. The repo copy is the SOURCE OF TRUTH; this is the runtime copy.
+ExecStart=/usr/bin/python3 /home/serveradmin/.hermes/scripts/ensure_pip_guard.py
+# Exit 1 means the guard is STILL unhealthy after the repair attempt. Keep the
+# exit code visible in the journal but do not let the timer stop running, and
+# do not escalate: the repair attempt plus the journal entry IS the report,
+# and `hermes pm doctor` carries the standing warning.
+SuccessExitStatus=0 1
+TimeoutStartSec=60

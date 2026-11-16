@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes pip guard self-heal (every 5 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+# Persistent=true would fire the repair immediately after a host reboot. That
+# is actually DESIRABLE here -- unlike the gateway liveness watchdog, a
+# missing pip guard is never a legitimate boot-time state, and the guard is
+# needed as soon as anything can run pip. So this one IS persistent: the
+# first check fires right after a reboot, which is exactly when a bootstrap
+# would have just wiped ~/.local.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -293,9 +293,45 @@ contains a post-publication file. `__pycache__` bytecode is excluded from both c
 why running the store's own interpreter does not trip them.
 
 
+### `pm doctor` warns that the pip guard is not installed
+
+**Symptom.** `hermes pm doctor` prints:
+
+```
+⚠ pip guard: NOT INSTALLED — PATH entry missing at /home/serveradmin/.local/bin/pip
+```
+
+**Cause.** The guard is not in place — either the `~/.local/bin/pip` symlink is gone (the uv/host
+bootstrap recreates `~/.local`, and the symlink lived there) or the canonical copy at
+`~/.hermes/bin/pip_guard.py` is missing too. Until it is fixed, the managed store is writable by
+a bare `pip install`, and the next digest mismatch will have no visible cause.
+
+**Recovery.** The self-heal timer normally fixes this within 5 minutes on its own. To force it
+now:
+
+```bash
+systemctl --user start hermes-pip-guard.service
+journalctl --user -u hermes-pip-guard.service -n 20
+```
+
+If the canonical copy is also gone (the timer logs `no pip_guard.py source found`), reinstall the
+whole mechanism from the repo:
+
+```bash
+bash scripts/deploy_pip_guard.sh
+```
+
+To check the state without changing anything:
+
+```bash
+python scripts/install_pip_guard.py --check
+systemctl --user is-enabled hermes-pip-guard.timer
+```
+
+
 ### The pip guard
 
-`~/.local/bin/pip` is a wrapper that refuses to install into the managed store, because the
+The pip guard is a wrapper that refuses to install into the managed store, because the
 store is a published artifact and mutating it invalidates the digest every later doctor
 check verifies against.
 
@@ -312,24 +348,61 @@ both orderings, but pip itself only honours the first.
 
 #### Where the guard lives, and how to reinstall it
 
-The wrapper is **not** hand-written into `~/.local/bin` — that directory is rebuilt by the uv
-bootstrap, and a hand-placed file there does not survive. The source of truth is in the repo:
+The uv/host bootstrap **recreates `~/.local`** from scratch. This is not theoretical — the
+2026-11-03 bootstrap wiped `/home/serveradmin/.local` and took the static docker CLI, the
+ssh shim and `~/.docker` with it (card `t_66795d80`). A guard hand-placed in `~/.local/bin`
+therefore does not survive, and its absence is silent: the store becomes writable by a bare
+`pip install` and the next doctor failure has no visible cause.
+
+The guard is now layered so that no single failure is silent:
+
+| Layer | Mechanism | Protects against |
+|---|---|---|
+| 1 — durability | canonical copy at `~/.hermes/bin/pip_guard.py` | the bootstrap wiping `~/.local` |
+| 2 — self-heal | `hermes-pip-guard.timer` (every 5 min) re-creates the `~/.local/bin/pip` symlink | the symlink being removed by any means |
+| 3 — fail loud | `hermes pm doctor` warns when the guard is not installed | the repair itself not running |
+
+`~/.hermes/bin` is the same durable location the static docker CLI uses (see
+`scripts/ensure-docker-cli.sh`), and `~/.hermes` has survived every bootstrap so far.
+`~/.local/bin/pip` is a **symlink** to the canonical copy — the guard resolves itself with
+`os.path.realpath(__file__)`, so a symlink still identifies the right real pip to delegate to.
 
 | Path | Role |
 |---|---|
-| `scripts/pip_guard.py` | the guard itself (a Python program) |
+| `scripts/pip_guard.py` | the guard itself (a Python program) — source of truth |
+| `~/.hermes/bin/pip_guard.py` | the canonical installed copy (survives the bootstrap) |
+| `~/.local/bin/pip` | symlink → the canonical copy (PATH entry) |
 | `scripts/install_pip_guard.py` | idempotent installer / `--check` / `--uninstall` |
+| `scripts/ensure_pip_guard.py` | self-heal: check + repair + alert (run by the timer) |
+| `~/.hermes/scripts/ensure_pip_guard.py` | runtime copy of the above, outside the repo checkout |
+| `~/.config/systemd/user/hermes-pip-guard.service` | oneshot unit that runs the ensurer |
+| `~/.config/systemd/user/hermes-pip-guard.timer` | 5-minute recurring schedule |
 
 Reinstall or verify it with:
 
 ```bash
-python scripts/install_pip_guard.py            # install (or reinstall) to ~/.local/bin/pip
+python scripts/install_pip_guard.py            # install (or reinstall): canonical copy + symlink
 python scripts/install_pip_guard.py --check    # report only, change nothing
 python scripts/install_pip_guard.py --uninstall
 ```
 
 The installer refuses to overwrite a `~/.local/bin/pip` that is not ours, so it cannot clobber a
 real pip someone installed deliberately.
+
+#### The self-heal timer
+
+```bash
+systemctl --user status hermes-pip-guard.timer
+systemctl --user start   hermes-pip-guard.service   # force a repair now
+journalctl --user -u hermes-pip-guard.service -n 20
+```
+
+The timer fires every 5 minutes and is **persistent**, so it also fires immediately after a
+reboot — exactly when a bootstrap would have just wiped `~/.local`. The ensurer repairs the
+symlink from the canonical copy and **alerts when it had to** (journal entry plus an optional
+Telegram webhook via `HERMES_PIP_GUARD_TELEGRAM`), because a silent repair would hide the fact
+that a bootstrap ran. If the canonical copy is also missing, the ensurer falls back to any
+known checkout and otherwise alerts rather than leaving the store unguarded.
 
 #### Verifying the guard
 
@@ -344,6 +417,19 @@ It checks that a bare `pip install` is refused with a non-zero exit, that `--pyt
 orderings), `--target`, `check` and `--version` reach the real pip, that the argument parser
 resolves the subcommand and scope option correctly, and — as a live proof — that a real
 `pip install` attempt leaves the managed store's digest byte-identical.
+
+`scripts/verify_pip_guard_durability.py` proves the *durability* story — it reproduces the
+failure and watches it get repaired:
+
+```bash
+python scripts/verify_pip_guard_durability.py
+```
+
+It asserts the baseline, destroys the `~/.local/bin/pip` symlink exactly as a `~/.local`
+recreation would, confirms the canonical copy survived, invokes the real systemd unit to
+re-establish the link, confirms the timer is enabled with a recurring schedule, confirms the
+restored guard refuses a bare `pip install` again, and confirms `pm`'s guard status reports
+"not installed" when the guard is absent.
 
 ### The five install states on the hermes host (2026-10-25, before the fix)
 
