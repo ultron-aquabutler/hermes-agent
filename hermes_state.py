@@ -139,12 +139,37 @@ class SessionExportTooLargeError(ValueError):
         )
 
 
+def _turn_lease_holder_turn_is_dead(holder: str) -> bool:
+    """True when ``holder`` names a turn this process has already finished.
+
+    Import is deferred and failures are swallowed: ``hermes_state`` is a low-level module
+    that must not gain a hard dependency on the agent package, and a holder we cannot
+    interpret simply defers to TTL expiry (the safe direction).
+    """
+    try:
+        from agent.turn_liveness_registry import holder_turn_is_dead
+
+        return holder_turn_is_dead(holder)
+    except Exception:  # health: allow BLE001 -- an uninterpretable holder defers to TTL, which self-heals
+        return False
+
+
 def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     """True only when a ``pid=<n>`` lock holder's local PID is provably gone.
     Reclaim on kernel proof only: unstructured/same-process holders (another
     thread's live lease) and any probe doubt keep the lease until TTL expiry
     (PID reuse must never steal a live lease; a wrongly-kept one self-heals).
-    Foreign/unstamped PID namespaces defer to TTL: see ``hermes_state_pidns``."""
+    Foreign/unstamped PID namespaces defer to TTL: see ``hermes_state_pidns``.
+
+    Also true when the holder names a TURN this process has already finished, even
+    though its PID is still alive.  A turn that wedged never reached its release, so its
+    lease outlived the turn while the owning gateway stayed up — and a live PID makes
+    such a row unreclaimable by the probe above.  The turn token is proof this process
+    itself minted and retired, so it never steals a sibling process's live turn; an
+    unknown token defers to TTL (a false reclaim ends a live turn, a late reclaim only
+    delays the next inbound).  See ``agent/turn_liveness_registry``."""
+    if _turn_lease_holder_turn_is_dead(holder):
+        return True
     match = re.search(r"(?:^|:)pid=(\d+)(?::|$)", holder or "")
     pid = int(match.group(1)) if match else 0
     if pid <= 0 or pid == os.getpid():

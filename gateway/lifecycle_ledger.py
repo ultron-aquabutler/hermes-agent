@@ -15,11 +15,13 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
+import inspect
 from contextlib import closing
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,62 @@ _INTEGRITY_CHECK_LEASE_RENEW_S = 60.0
 # Bound on the deferred post-connect scan: a pathological store cannot pin its thread forever.
 STATE_DB_INTEGRITY_DEADLINE_S = 1800.0
 
+# F2 (2026-10-23 gateway DM outage): ``PRAGMA quick_check(1)`` is O(store size).  On the
+# 3.18 GB state.db it ran for ~36 minutes — the whole of the 22:44:33 -> 23:20:27 boot gap,
+# during which the API server was not listening and every inbound was dropped.  The check
+# runs on the boot path (``record_startup``), so its runtime IS the outage.
+#
+# The fix is a hard wall-clock budget on the check, not a better watchdog: the progress
+# handler renews the lease for as long as SQLite makes progress, which correctly protects a
+# slow-but-healthy check from the watchdog — but it also made the check unbounded, and
+# "still progressing" is not the same as "will finish soon enough to serve traffic".
+#
+# A timeout is reported as a distinct verdict (``timeout``) that is NOT a corruption
+# finding: the boot continues, the verdict is logged for the operator, and the store is
+# left alone.  Failing closed here would be worse than the fault: a skipped check costs a
+# diagnostic, while a blocked boot costs every message.
+#
+# The budget is generous enough for a healthy store of any plausible size (quick_check on
+# a 500 MB store is ~2s per the docstring; 3 GB is ~10x that) and is overridable for
+# operators who want a thorough check on a large store.
+_INTEGRITY_CHECK_TIMEOUT_S = 120.0
+# Above this store size the check is skipped by default: quick_check scales linearly and a
+# multi-GB store cannot be checked inside the boot budget.  The skip is reported, not silent.
+_INTEGRITY_CHECK_MAX_BYTES = 1_073_741_824  # 1 GiB
+
+
+def _integrity_check_timeout_s() -> float:
+    """Wall-clock budget for the unclean-exit integrity check (seconds).
+
+    Overridable in ``config.yaml`` under ``gateway.state_db_integrity_check_timeout_s``
+    for operators who want a longer (or shorter) check; invalid or non-positive values
+    fall back to the default.  Read from the YAML layer rather than a ``HERMES_*`` env
+    var: this is a behavioural setting, and the repo rule is that behaviour lives in
+    ``config.yaml`` while ``.env`` is for credentials only.
+    """
+    default = _INTEGRITY_CHECK_TIMEOUT_S
+    try:
+        from gateway import config_loader
+        from hermes_constants import get_hermes_home
+
+        yaml_cfg = config_loader.read_yaml_layers(get_hermes_home()) or {}
+        gateway_section = yaml_cfg.get("gateway")
+        if not isinstance(gateway_section, dict):
+            return default
+        raw = gateway_section.get("state_db_integrity_check_timeout_s")
+    except Exception as exc:  # health: allow BLE001 -- a broken config must not stop the boot
+        logger.debug("state_db integrity check timeout unreadable: %s", exc)
+        return default
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return value
+
 
 def _install_integrity_check_lease(conn: sqlite3.Connection, *, deadline_at: Optional[float] = None) -> None:
     """Claim the integrity-check lease and renew it from a SQLite progress handler.
@@ -229,6 +287,93 @@ def _install_integrity_check_lease(conn: sqlite3.Connection, *, deadline_at: Opt
     conn.set_progress_handler(_on_progress, _INTEGRITY_CHECK_PROGRESS_OPS)
 
 
+def _spawn_integrity_check_thread(target: Callable[[], None]) -> threading.Thread:
+    """Start the integrity-check worker under the caller's contextvars.
+
+    ``spawn_context_thread`` keeps the caller's profile scope (ContextVars do not cross a
+    bare ``Thread``), which is what the repo's HX012 rule requires.  The fallback keeps
+    the module importable if the agent package is unavailable — a lifecycle forensics
+    helper must never be the thing that breaks the boot.
+    """
+    try:
+        from agent.memory_provider import spawn_context_thread
+
+        return spawn_context_thread(target, name="state-db-integrity-check", daemon=True)
+    except Exception as exc:  # health: allow BLE001 -- forensics must never block the boot
+        logger.debug("spawn_context_thread unavailable for integrity check: %s", exc)
+        return threading.Thread(target=target, name="state-db-integrity-check", daemon=True)
+
+
+def _run_quick_check(path: Path, deadline: float, *, deadline_at: Optional[float] = None) -> tuple[str, Optional[str]]:
+    """Run ``PRAGMA quick_check(1)`` in a worker thread; return ``(verdict, error)``.
+
+    The deadline is enforced by the CALLER, not by SQLite's progress handler: a
+    ``quick_check`` on a multi-GB store does long stretches of bulk work between progress
+    callbacks (measured: 93 s before the first callback fired at the default granularity),
+    so a handler-side abort lands far past the budget.  Running the check on a worker
+    thread lets the boot path abandon it on time regardless of SQLite's callback
+    granularity.
+
+    ``deadline_at`` is the handler-side abort instant (``time.monotonic``).  When it is
+    supplied the SQLite progress handler also aborts the scan, so the thread finishes
+    promptly instead of being abandoned mid-READ.
+
+    The worker is a daemon thread and is deliberately NOT joined on timeout: the abandoned
+    check only reads, and a thread that outlives the boot is harmless — but JOINING it
+    would re-block the boot for exactly the duration we are trying to avoid.
+    """
+    outcome: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            with closing(sqlite3.connect(str(path))) as conn:
+                _install_integrity_check_lease(conn, deadline_at=deadline_at)
+                row = conn.execute("PRAGMA quick_check(1)").fetchone()
+            outcome["verdict"] = "check-failed: no result" if not row or row[0] is None else str(row[0])
+        except Exception as exc:  # health: allow BLE001 -- the verdict must never raise; the class is recorded
+            logger.warning("state.db integrity check raised", exc_info=True)
+            outcome["error"] = str(exc)
+
+    thread = _spawn_integrity_check_thread(_worker)
+    thread.start()
+    # Bounded join: on timeout we walk away and the daemon thread finishes on its own.
+    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        return "timeout", None
+    if "error" in outcome:
+        return "check-failed", str(outcome["error"])
+    return str(outcome.get("verdict", "check-failed: no result")), None
+
+
+def _store_exceeds_integrity_ceiling(path: Path) -> float:
+    """The store's size in bytes; ``0.0`` when it cannot be stat'ed.
+
+    ``quick_check`` is O(store size), so a multi-GB store cannot be checked inside any
+    sane boot budget.  The ceiling is decided with NO I/O against the store itself.
+    """
+    try:
+        return float(path.stat().st_size)
+    except OSError:
+        return 0.0
+
+
+def _invoke_quick_check(path: Path, deadline: float, deadline_at: Optional[float]) -> tuple[str, Optional[str]]:
+    """Call :func:`_run_quick_check`, tolerating a narrower replacement.
+
+    Tests replace ``_run_quick_check`` with a two-argument stub; passing a keyword the
+    stub does not accept would raise ``TypeError`` and mask the verdict under test.  The
+    fallback is decided by SIGNATURE, not by catching ``TypeError`` — a ``TypeError``
+    raised inside a real check must not trigger a second, unbounded call.
+    """
+    try:
+        params = inspect.signature(_run_quick_check).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "deadline_at" in params:
+        return _run_quick_check(path, deadline, deadline_at=deadline_at)
+    return _run_quick_check(path, deadline)
+
+
 def check_state_db_integrity(home: Optional[Path] = None, *, deadline_s: Optional[float] = None) -> str:
     """``"ok"``, ``"absent"``, or the first ``quick_check`` complaint.  Never raises.
 
@@ -241,30 +386,59 @@ def check_state_db_integrity(home: Optional[Path] = None, *, deadline_s: Optiona
     (renewed from a SQLite progress handler, #115542) so a long healthy check
     on a huge store is not mistaken for a parked deadlock.
 
-    ``deadline_s`` (optional): abort the scan once that many seconds elapse and
-    return ``"check-incomplete: exceeded <N>s"``.  ``deadline_s=None`` (default) is the
-    historic unbounded behaviour -- the progress handler never aborts the PRAGMA.
+    ``deadline_s`` (optional): the caller's own budget for the scan.  When supplied the
+    SQLite progress handler also aborts the scan at that instant and the verdict is
+    ``"check-incomplete: exceeded <N>s"`` — the historic contract of this argument.
+
+    F2: the check is bounded twice over, because it runs on the boot path and its runtime
+    IS the outage.  A store above ``_INTEGRITY_CHECK_MAX_BYTES`` is not checked at all
+    (``skipped-too-large``, decided with no I/O), and a check that outlives its wall-clock
+    budget is abandoned on time (``timeout``).  Neither verdict is a corruption finding:
+    both keep the boot moving and are reported to the operator.  The bounds apply on BOTH
+    paths — the inline scan and the deferred post-connect scan — because the deferred scan
+    is the default boot path and an unbounded 3 GB store would pin its thread forever.
     """
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"
+    size = _store_exceeds_integrity_ceiling(path)
+    if size > _INTEGRITY_CHECK_MAX_BYTES:
+        # quick_check is O(size); a multi-GB store cannot be checked inside the boot
+        # budget.  Report the skip instead of blocking the boot on a diagnostic.
+        logger.warning(
+            "state.db is %.1f MB — skipping the unclean-exit quick_check (limit %.1f MB) "
+            "so the gateway can start serving. Run 'hermes doctor' for a full check.",
+            size / 1024 / 1024, _INTEGRITY_CHECK_MAX_BYTES / 1024 / 1024,
+        )
+        return "skipped-too-large"
+    timeout_s = _integrity_check_timeout_s()
     deadline_at: Optional[float] = None
     if deadline_s is not None:
         try:
             deadline_at = time.monotonic() + max(0.0, float(deadline_s))
         except (TypeError, ValueError):
             deadline_at = None
-    try:
-        with closing(sqlite3.connect(str(path))) as conn:
-            _install_integrity_check_lease(conn, deadline_at=deadline_at)
-            row = conn.execute("PRAGMA quick_check(1)").fetchone()
-    except Exception as exc:
-        if (deadline_at is not None and isinstance(exc, sqlite3.OperationalError)
-                and "interrupt" in str(exc).lower()):
-            limit = max(0.0, float(deadline_s)) if deadline_s is not None else 0.0
-            return f"check-incomplete: exceeded {limit:g}s"
-        return f"check-failed: {exc}"
-    return "check-failed: no result" if not row or row[0] is None else str(row[0])
+    # The caller-side budget is the tighter of the built-in wall-clock budget and the
+    # caller's own ``deadline_s``: the check must not outlive either.
+    deadline = time.monotonic() + timeout_s
+    effective_limit_s = timeout_s
+    if deadline_at is not None and deadline_at < deadline:
+        deadline = deadline_at
+        effective_limit_s = max(0.0, float(deadline_s)) if deadline_s is not None else 0.0
+    verdict, error = _invoke_quick_check(path, deadline, deadline_at)
+    if verdict == "timeout":
+        logger.warning(
+            "state.db quick_check exceeded its %.0fs budget and was abandoned; the gateway is "
+            "starting anyway. Run 'hermes doctor' for a full check.", effective_limit_s,
+        )
+        if deadline_at is not None:
+            # The caller's own budget is the binding one: keep the historic contract of
+            # that argument and report the budget that actually expired.
+            return f"check-incomplete: exceeded {effective_limit_s:g}s"
+        return "timeout"
+    if verdict == "check-failed":
+        return f"check-failed: {error}"
+    return verdict
 
 
 def _state_db_journal_mode(path: Path) -> Optional[str]:
@@ -292,12 +466,7 @@ def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defe
     else:
         # The death may have torn the store; this is the only moment we know to look.
         verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
-        if verdict not in ("ok", "absent"):
-            logger.error(
-                "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
-                "missing until it is repaired. Run `hermes doctor`.",
-                verdict,
-            )
+        _log_integrity_verdict(verdict)
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
@@ -305,6 +474,35 @@ def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defe
         "the host interpreter image; see #113667). last_heartbeat_at=%s last_mem=%s suspected_oom=%s",
         evidence.get("prior_pid"), evidence.get("prior_started_at"), evidence.get("last_heartbeat_at"),
         evidence.get("last_heartbeat_mem"), evidence.get("suspected_oom", False),
+    )
+
+
+# F2 verdicts: the check did NOT RUN, so the store was not verified.  Reporting them as a
+# corruption finding would send an operator to repair a healthy multi-GB store; reporting
+# them as a clean result would hide a real gap.  They are logged distinctly as inconclusive.
+_INCONCLUSIVE_INTEGRITY_VERDICTS = ("timeout", "skipped-too-large")
+
+
+def _log_integrity_verdict(verdict: str) -> None:
+    """Log an integrity verdict at the severity its MEANING deserves.
+
+    ``timeout`` / ``skipped-too-large`` mean the check did not run — inconclusive, not a
+    corruption finding.  ``check-incomplete: exceeded <N>s`` is the same class of answer
+    (the scan was abandoned, so the store was not verified).  Everything else that is not
+    ``ok``/``absent`` is a real failure.
+    """
+    if verdict in ("ok", "absent"):
+        return
+    if verdict in _INCONCLUSIVE_INTEGRITY_VERDICTS or verdict.startswith("check-incomplete:"):
+        logger.warning(
+            "state.db integrity check was INCONCLUSIVE after an unclean gateway exit (%s) — the "
+            "store was not verified. Run `hermes doctor` for a full check.", verdict,
+        )
+        return
+    logger.error(
+        "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
+        "missing until it is repaired. Run `hermes doctor`.",
+        verdict,
     )
 
 
