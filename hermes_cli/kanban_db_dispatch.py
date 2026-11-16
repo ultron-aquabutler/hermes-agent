@@ -2914,24 +2914,47 @@ def _module_hermes_argv() -> list[str]:
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
-def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
-    """Put the running install's package root on a module-form worker's path.
+def _provision_worktree_install_state(task: Task, workspace: str) -> None:
+    """Give a worktree worker the dependency environment its worktree lacks.
 
-    ``_resolve_hermes_argv`` proves ``hermes_cli`` importable in THIS process,
-    where a store-python shim has the repo root on ``sys.path`` in-process;
-    the spawned child runs the bare ``sys.executable`` from the task workspace
-    with a scrubbed ``PYTHONPATH`` and cannot import the package the parent
-    just proved importable — it dies before any work and the board
-    auto-blocks (#122299, #122487, #122500). Same-interpreter child, so the
-    root is version-safe to propagate; ``hermes_cli.main``'s own bootstrap
-    then owns dependency activation as usual. A resolved shim path owns its
-    imports and is left alone. Same pin cron's external worker uses (#112729).
+    A worktree worker imports ``hermes_cli`` from its OWN worktree: for
+    ``python -m``, ``sys.path[0]`` is the cwd, and the cwd outranks the pinned
+    ``PYTHONPATH``. The install key hashes the checkout path, so the worktree is a
+    distinct install with no ``facts.json`` of its own, and PM's store Python --
+    which owns no dependencies -- refuses the process: "no dependency environment is
+    committed for this install". The worker dies before it does any work
+    (t_boot_defect_619cbb; ~64 burned spawns on the isolation probe).
+
+    Two layers close that, and this is the one that reaches a worktree cut before
+    the other:
+
+    * the CODE-level borrow -- the worktree's own ``pm`` resolves its owner's
+      committed generation -- which only a worktree carrying that fix has;
+    * the DATA-level borrow written HERE, by the dispatcher, which works whatever
+      ``pm`` the worktree carries: the worktree's install state points at the
+      owner's generation.
+
+    Never fatal: a worktree that cannot be provisioned still starts, and fails at
+    boot with PM's own message -- which is the behaviour this fixes, not a worse one.
     """
-    if cmd[1:3] != ["-m", "hermes_cli.main"]:
+    if getattr(task, "workspace_kind", None) != "worktree":
         return
-    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+    if not workspace:
+        return
+    root = Path(workspace)
+    if not root.is_dir():
+        return
+    try:
+        from pm.environments import provision_borrowed_install_state
 
-    pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
+        provision_borrowed_install_state(root)
+    except Exception as exc:  # pragma: no cover  # health: allow BLE001 -- a failed provision must degrade, not fail the dispatch; the worker still starts and reports PM's own missing-install message
+        # `_kb._log` is this module's logger idiom (see every other call site in
+        # this file): a bare `logger` is NOT defined here, so naming one would
+        # raise NameError inside the handler and kill the dispatch.
+        _kb._log.warning(
+            "kanban worker: could not provision install state for %s: %s", root, exc
+        )
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -3820,8 +3843,23 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # The module argv must carry the import context that made it resolvable:
-    # the shim's in-process path injection is invisible to the bare child.
-    _propagate_module_import_root(cmd, env)
+    # the shim's in-process path injection is invisible to the bare child, and
+    # the routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
+    # children must not see our tree). Same pin as cron's external worker
+    # (#112729): applied to the sanitized env, after every other decision stands.
+    # Unconditional on purpose -- the older `_propagate_module_import_root` helper
+    # only pinned the `-m hermes_cli.main` argv shape, so a console-script worker
+    # argv went unpinned and died on `No module named 'hermes_cli'`.
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+    env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+    # A worktree worker imports hermes_cli from its OWN worktree (sys.path[0] is the
+    # cwd, and cwd outranks the pinned PYTHONPATH). A worktree cut before the pm
+    # borrow fix therefore resolves an install key with no facts.json, and PM's store
+    # Python refuses the process: "no dependency environment is committed for this
+    # install" -- the worker dies before it does any work (t_boot_defect_619cbb).
+    # Provision the borrow as DATA so the worker boots whatever pm its worktree
+    # carries.
+    _provision_worktree_install_state(task, workspace)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

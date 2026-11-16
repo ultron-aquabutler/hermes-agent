@@ -326,6 +326,99 @@ def _borrowed_recorded_venv(project_root: Path) -> Path | None:
         return None
 
 
+def borrowed_install_owner(project_root: Path) -> Path | None:
+    """The checkout whose committed generation this install borrows, else ``None``.
+
+    A borrowed install state is one whose ``environments`` directory is a SYMLINK into
+    another install's tree -- the shape written by ``provision_borrowed_install_state``.
+    Reading it is how a caller tells "this install has its own generations" from "this
+    install points at someone else's", and the difference decides whether a dependency
+    sync may write here: a borrow must never be built into, or the owner's generation
+    tree is mutated from under the owner.
+
+    The owner is named by the record itself (``borrowed_from``): the install state
+    lives under the DATA root (``<root>/installs/<key>``), not under the checkout, so
+    the symlink's target says which install's tree is shared but not which checkout
+    owns it.
+    """
+    environments = install_state_dir(project_root) / "environments"
+    if not environments.is_symlink():
+        return None
+    facts = runtime_facts_path(project_root)
+    try:
+        record = json.loads(facts.read_text(encoding="utf-8-sig"))
+        owner = record.get("packages", {}).get("venv", {}).get("borrowed_from")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(owner, str) or not owner:
+        return None
+    owner_path = Path(owner)
+    if not (owner_path / "hermes_cli" / "main.py").is_file():
+        return None
+    return owner_path
+
+
+def provision_borrowed_install_state(project_root: Path) -> Path | None:
+    """Give a linked worktree an install state that borrows its owner's generation.
+
+    The code-level borrow needs the worktree's own ``pm`` to know about borrowing; a
+    worktree cut before that fix does not, and its worker dies at boot with "no
+    dependency environment is committed for this install". Writing the SAME borrow as
+    DATA makes the worktree boot whatever ``pm`` it carries:
+
+    * ``installs/<worktree-key>/environments`` is a SYMLINK to the owner's
+      ``environments`` directory. The symlink is what makes the borrow legible to an
+      older ``pm``: ``_recorded_venv`` resolves the recorded generation and requires it
+      to sit under ``<install>/environments`` -- with the symlink, both sides resolve
+      into the owner's tree, so the check passes.
+    * ``installs/<worktree-key>/facts.json`` names the owner's selected generation.
+
+    The generation is never copied or moved: the worktree and the owner share one
+    dependency tree, one interpreter and one lease directory, exactly as the
+    code-level borrow does.
+
+    Returns the state directory it wrote, or ``None`` when nothing was written (the
+    checkout already has its own state, is not a linked worktree, or its owner has
+    committed nothing). Idempotent, and safe to race: two provisions of the same
+    worktree write the same content.
+    """
+    root = Path(project_root).resolve()
+    facts = runtime_facts_path(root)
+    if facts.is_file():
+        # The checkout has its own committed state; borrowing would overwrite it.
+        return None
+    owner = worktree_owner_root(root)
+    if owner is None:
+        return None
+    try:
+        environment = _recorded_venv(owner)
+    except RuntimeError:
+        return None
+    if environment is None:
+        return None
+    owner_generations = (install_state_dir(owner) / "environments").resolve()
+    state = install_state_dir(root)
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        environments = state / "environments"
+        if environments.is_symlink():
+            if environments.resolve(strict=False) != owner_generations:
+                return None
+        elif environments.exists():
+            # A real directory here belongs to this install; never replace it.
+            return None
+        else:
+            environments.symlink_to(owner_generations, target_is_directory=True)
+        record = {
+            "schema": 1,
+            "packages": {"venv": {"environment": str(environment), "borrowed_from": str(owner)}},
+        }
+        facts.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return state
+
+
 def _recorded_venv(project_root: Path) -> Path | None:
     path = runtime_facts_path(project_root)
     try:
