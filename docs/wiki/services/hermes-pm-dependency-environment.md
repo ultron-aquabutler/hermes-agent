@@ -269,12 +269,29 @@ both from a bare `pip install` run against the store.
 
 ```bash
 # 1. Find what changed (files newer than the store's publication).
-find ~/.hermes/tools/python-3.14.7+20260901-linux-x64 -newermt '-3 days' -type f \
+#    Do NOT hardcode the store directory name: its build-date segment is
+#    rendered differently in different contexts, so a pasted literal resolves
+#    to nothing. Glob it.
+find ~/.hermes/tools/python-3.14.7* -newermt '-3 days' -type f \
   | grep -v __pycache__
 
 # 2. Re-publish the artifact through PM (never hand-edit the store).
 hermes pm repair
 ```
+
+**Checking the store without hand-editing it.** `scripts/verify_managed_store.py` recomputes
+`pm.store.tree_digest` over every managed store tree on disk and compares it with the digest
+recorded in `~/.hermes/tools/facts.json`, and separately checks that no file is newer than the
+store's publication timestamp:
+
+```bash
+python scripts/verify_managed_store.py
+```
+
+It exits 0 when the store is intact and 1 when a tree deviates from its recorded digest or
+contains a post-publication file. `__pycache__` bytecode is excluded from both checks, which is
+why running the store's own interpreter does not trip them.
+
 
 ### The pip guard
 
@@ -290,7 +307,43 @@ check verifies against.
 | `pip check`, `pip list`, `pip --version`, `pip download`, … | pass through unchanged. |
 
 Note pip's own ordering rule: `--python` must come **before** the subcommand
-(`pip --python <path> install ...`, not `pip install --python <path> ...`).
+(`pip --python <path> install ...`, not `pip install --python <path> ...`). The guard accepts
+both orderings, but pip itself only honours the first.
+
+#### Where the guard lives, and how to reinstall it
+
+The wrapper is **not** hand-written into `~/.local/bin` — that directory is rebuilt by the uv
+bootstrap, and a hand-placed file there does not survive. The source of truth is in the repo:
+
+| Path | Role |
+|---|---|
+| `scripts/pip_guard.py` | the guard itself (a Python program) |
+| `scripts/install_pip_guard.py` | idempotent installer / `--check` / `--uninstall` |
+
+Reinstall or verify it with:
+
+```bash
+python scripts/install_pip_guard.py            # install (or reinstall) to ~/.local/bin/pip
+python scripts/install_pip_guard.py --check    # report only, change nothing
+python scripts/install_pip_guard.py --uninstall
+```
+
+The installer refuses to overwrite a `~/.local/bin/pip` that is not ours, so it cannot clobber a
+real pip someone installed deliberately.
+
+#### Verifying the guard
+
+The guard's contract is asserted by `scripts/verify_pip_guard.py`, which exercises the *installed*
+`~/.local/bin/pip` as a subprocess:
+
+```bash
+python scripts/verify_pip_guard.py
+```
+
+It checks that a bare `pip install` is refused with a non-zero exit, that `--python` (both
+orderings), `--target`, `check` and `--version` reach the real pip, that the argument parser
+resolves the subcommand and scope option correctly, and — as a live proof — that a real
+`pip install` attempt leaves the managed store's digest byte-identical.
 
 ### The five install states on the hermes host (2026-10-25, before the fix)
 
@@ -312,6 +365,11 @@ Note pip's own ordering rule: `--python` must come **before** the subcommand
 
 **Ten worktrees had no install state.** The path prefix `202****0901` in older notes is a
 redaction of the build date; the real directory is `python-3.14.7+202****0901-linux-x64`.
+
+> **Never hardcode the managed store's directory name in a script.** The build-date segment is
+> rendered differently in different contexts — a literal copied from one context resolves to
+> nothing in another, and `os.path.exists()` returns False for a directory that is plainly there.
+> Always glob it (`~/.hermes/tools/python-3.14.7*`), and resolve the active entry the same way.
 
 Since the fix, a worktree that has no state of its own gets the **data-level borrow** the
 first time the dispatcher spawns a worker for it: `installs/<worktree-key>/environments`
