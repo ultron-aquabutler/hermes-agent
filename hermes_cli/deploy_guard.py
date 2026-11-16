@@ -80,9 +80,31 @@ class DeployCheckResult:
 
 
 def _agent_home() -> str:
-    env = os.environ.get("HERMES_AGENT_HOME") or os.environ.get("HERMES_AGENT")  # health: allow HX002 -- the tree to inspect is a deploy-time setting the operator pins, not a per-profile behaviour
-    if env and os.path.isabs(env) and os.path.isdir(env):
-        return env
+    """Resolve the working tree the deploy guard inspects.
+
+    Priority: ``HERMES_AGENT_HOME`` -> ``HERMES_AGENT`` -> ``<HERMES_HOME>/hermes-agent``
+    -> ``DEFAULT_AGENT_HOME``.
+
+    The ``HERMES_HOME`` rung matters for test isolation: the test suite points
+    ``HERMES_HOME`` at a tmpdir and the ``home_io_guard`` fixture asserts no
+    code touches the real ``~/.hermes``. Without this rung, any code path that
+    reaches ``check_deploy_state()`` -- including ``dispatch_once`` -- reads the
+    REAL live git tree and trips the guard (t_3d00480e).
+    """
+    for env_key in ("HERMES_AGENT_HOME", "HERMES_AGENT"):
+        env = os.environ.get(env_key)
+        if env and os.path.isabs(env) and os.path.isdir(env):
+            return env
+
+    hermes_home = os.environ.get("HERMES_HOME")  # health: allow HX002 -- the agent home is a deploy-time setting the operator pins, not a per-profile behaviour
+    if hermes_home and os.path.isabs(hermes_home):
+        # Return the candidate even when it does not exist: the guard then
+        # reports ``missing_repo`` (a non-fatal, non-drift reason) instead of
+        # silently falling back to the REAL live tree. That fallback is what
+        # made an isolated test reach into ``~/.hermes`` and trip the
+        # ``home_io_guard`` fixture (t_3d00480e).
+        return os.path.join(hermes_home, "hermes-agent")
+
     return DEFAULT_AGENT_HOME  # health: allow HX001 -- the deploy guard inspects the SHARED agent tree, not one profile's home
 
 

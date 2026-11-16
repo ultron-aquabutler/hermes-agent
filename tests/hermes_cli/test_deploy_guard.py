@@ -155,3 +155,70 @@ def test_strict_override_wins_over_env(tmp_path, monkeypatch):
     r = check_deploy_branch(strict=False)
     assert r.ok is False  # still detected
     # No raise — kwarg downgraded the env var.
+
+
+class TestDispatchOnceGuardFailsLoud:
+    """AC5: the deploy guard must be able to REFUSE a tick on a drifted tree.
+
+    ``dispatch_once`` used to wrap the whole guard call in
+    ``except Exception: pass``, which silently swallowed
+    ``DeployBranchDriftError`` -- so ``HERMES_DEPLOY_GUARD=strict`` could
+    never actually block anything. These tests pin the fail-loud contract:
+    a drift raises out of ``dispatch_once``, while a broken guard *import*
+    still does not block a tick.
+
+    The assertion is on the GUARD, not on downstream DB work: a dummy
+    connection is used so the test measures the guard contract alone and
+    does not depend on board schema.
+    """
+
+    def _dispatch_once(self, monkeypatch, guard_module):
+        import sys
+
+        import hermes_cli.kanban_db_dispatch as kbd
+
+        class _Conn:
+            """Minimal stand-in: the guard runs before any DB access."""
+
+            def execute(self, *a, **kw):
+                raise AssertionError("guard did not stop the tick before DB access")
+
+            def close(self):
+                pass
+
+        monkeypatch.setitem(sys.modules, "hermes_cli.deploy_guard", guard_module)
+        return kbd.dispatch_once(_Conn())
+
+    def test_strict_drift_propagates_out_of_dispatch_once(self, monkeypatch):
+        from hermes_cli.deploy_guard import DeployBranchDriftError
+
+        guard = type("m", (), {})()
+        guard.check_deploy_branch = staticmethod(
+            lambda *a, **kw: (_ for _ in ()).throw(DeployBranchDriftError("drifted"))
+        )
+
+        with pytest.raises(DeployBranchDriftError):
+            self._dispatch_once(monkeypatch, guard)
+
+    def test_broken_guard_import_does_not_block_a_tick(self, monkeypatch):
+        import builtins
+        import sys
+
+        real_import = builtins.__import__
+
+        def _fake_import(name, *a, **kw):
+            if name == "hermes_cli.deploy_guard":
+                raise ImportError("simulated broken guard")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        monkeypatch.setitem(sys.modules, "hermes_cli.deploy_guard", None)
+
+        # The guard import failure must NOT raise. The dispatch may still fail
+        # later on the dummy connection -- that is fine; the point is that the
+        # guard import failure itself did not abort the tick.
+        try:
+            self._dispatch_once(monkeypatch, None)
+        except AssertionError:
+            # Reached DB access -> the tick was NOT blocked by the guard import.
+            pass

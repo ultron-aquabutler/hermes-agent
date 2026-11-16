@@ -2235,12 +2235,21 @@ def dispatch_once(
     instead of after the fix has silently reverted. Set
     ``HERMES_DEPLOY_GUARD=strict`` to raise ``DeployBranchDriftError``.
     """
+    # The deploy-branch guard must be able to FAIL LOUD: in ``strict`` mode a
+    # drifted tree raises ``DeployBranchDriftError`` and that must propagate
+    # out of ``dispatch_once`` so the tick is visibly refused rather than
+    # silently running the wrong code (t_3d00480e, AC5).
+    #
+    # Only the guard's own *import* failure is swallowed: a missing or
+    # unparseable ``hermes_cli.deploy_guard`` must never block a tick, because
+    # a broken guard is a tooling problem, not evidence of drift.
     try:
         from hermes_cli.deploy_guard import check_deploy_branch
-        check_deploy_branch()
     except Exception:  # health: allow BLE001 S110 -- a guard import / parse failure must never block a tick
         # A guard import / parse failure must never block a tick.
-        pass
+        check_deploy_branch = None
+    if check_deploy_branch is not None:
+        check_deploy_branch()
 
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
