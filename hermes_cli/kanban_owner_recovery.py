@@ -2,6 +2,7 @@
 from contextlib import closing
 import json
 from pathlib import Path
+import re
 import sqlite3
 import time
 import psutil
@@ -82,6 +83,47 @@ def _host_local_lock(lock) -> bool:
     """True when ``lock`` was issued by this host — the only pids we can judge."""
     from hermes_cli import kanban_db as kb
     return bool(lock) and str(lock).startswith(kb._host_prefix())
+
+
+# The marker ``gateway/session_kanban.record_worker_failure_cause`` appends to a
+# failed managed worker's ``worker_result`` output. It names the cause the WORKER
+# itself observed (a lost persistence receipt, a missing skill, a provider fault),
+# which is strictly more specific than the owner's generic ``managed_worker_failed``.
+_WORKER_FAILURE_CAUSE_RE = re.compile(r"worker_failure_cause:\s*([^\n\r]+)")
+
+
+def worker_failure_cause(conn, task_id):
+    """The specific cause a failed managed worker observed, or ``""``.
+
+    ``record_worker_failure_cause`` appends ``worker_failure_cause: <cause>`` to
+    the attempt's ``worker_result`` event, because a worker that dies inside the
+    turn never reaches its own recording and the attempt would otherwise carry a
+    blank ``last_output``. The dispatcher builds its crash text from the worker's
+    LOG file instead of that event, so the cause was reaching the board's event
+    stream but not the board's ``last_failure_error`` — where triage actually
+    reads it. The card then said only "managed worker lost: managed_worker_failed",
+    which names a mechanism and not a cause.
+
+    Returns ``""`` when the worker recorded no cause, when the cause cannot be
+    read, or when the marker is absent. Never raises: a missing cause must not
+    change how a crash is booked.
+    """
+    row = conn.execute(
+        "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
+        "WHERE t.id=? AND e.task_id=t.id AND e.kind='worker_result' ORDER BY e.id DESC LIMIT 1",
+        (task_id,)).fetchone()
+    if row is None:
+        return ""
+    try:
+        payload = json.loads(row['payload'])
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    match = _WORKER_FAILURE_CAUSE_RE.search(str(payload.get('last_output') or ''))
+    if not match:
+        return ""
+    return match.group(1).strip()[:120]
 
 
 def bound_interpreter_gone(conn, task_id):
@@ -219,9 +261,18 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
     turn never finished, so it books as a crash and charges the breaker, and the
     protocol-violation streak (which reads the persisted payload) does not count it.
+
+    The note names the MECHANISM ("managed worker lost: managed_worker_failed"). When the
+    worker recorded the cause it observed (``worker_failure_cause: ...``), that cause is
+    folded in too: the card's ``last_failure_error`` is what triage reads, and a mechanism
+    alone sends the next reader looking for a mechanism rather than a cause.
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
+    cause = worker_failure_cause(conn, task_id)
+    if cause:
+        note = f"{note} (cause: {cause})" if note else f"cause: {cause}"
+        dead.event_payload["worker_failure_cause"] = cause
     if not note:
         return
     dead.event_payload["attempt_note"] = note
