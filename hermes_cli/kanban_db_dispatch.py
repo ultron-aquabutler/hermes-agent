@@ -1023,6 +1023,54 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# A quota wall is NOT the worker's fault, so a rate-limited requeue does not
+# charge ``consecutive_failures`` (see ``_record_task_failure``). That made the
+# requeue path UNBOUNDED: a card parked behind a quota wall was released to
+# ``ready`` forever and re-dispatched on every cooldown expiry, each attempt
+# reloading the full card + repo context into the assignee's profile. Observed:
+# t_911cf02a — 95 attempts (76 rate_limited), ``consecutive_failures`` still 1,
+# ~5.8M input tokens burned in the default profile over 3 days.
+#
+# The fix is a BOUNDED rate-limit streak, deliberately separate from both
+# ``consecutive_failures`` and the protocol-violation budget: a quota wall says
+# nothing about the card's quality, but an UNBOUNDED retry against the same
+# wall says the card can never be completed by retrying. After
+# ``_RATE_LIMIT_RETRY_LIMIT`` consecutive rate-limited requeues the breaker
+# trips and the card is surfaced for a human.
+#
+# The streak counts CONSECUTIVE rate-limited requeues only. Any other closed
+# run (a success, a crash, a protocol violation) breaks it, so a card that
+# genuinely recovers resets its budget instead of carrying the old count
+# forward forever. That is the same shape as ``_protocol_violation_streak``.
+_RATE_LIMIT_RETRY_LIMIT = 5
+
+# Closed runs to walk when counting the rate-limit streak.
+_RATE_LIMIT_SCAN_LIMIT = 50
+
+
+def _rate_limit_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of consecutive rate-limited requeues.
+
+    Walks closed runs newest-first. ``rate_limited`` runs extend the streak;
+    ANY other closed run breaks it (a success, a crash, a protocol violation
+    — all mean the worker got past the quota wall at least once). This is the
+    rate-limit analogue of ``_protocol_violation_streak``, and it exists so
+    the rate-limit requeue path has a bounded budget of its own.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _RATE_LIMIT_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        if (row["outcome"] or "") == "rate_limited":
+            streak += 1
+            continue
+        break
+    return streak
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
@@ -1465,6 +1513,69 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
+def _account_rate_limits(conn: sqlite3.Connection, task_ids: list) -> list[str]:
+    """Charge each rate-limited requeue against a BOUNDED retry budget.
+
+    A quota wall is not the worker's fault, so the rate-limit requeue path
+    deliberately does NOT charge ``consecutive_failures`` and the ordinary
+    breaker never sees it. That made the path UNBOUNDED: a card parked behind
+    a quota wall was released to ``ready`` forever and re-dispatched on every
+    cooldown expiry, each attempt reloading the full card + repo context into
+    the assignee's profile. Observed: t_911cf02a — 95 attempts (76
+    rate_limited), ``consecutive_failures`` still 1, ~5.8M input tokens burned
+    in the default profile over 3 days.
+
+    After ``_RATE_LIMIT_RETRY_LIMIT`` CONSECUTIVE rate-limited requeues the
+    card cannot be completed by retrying, so the breaker trips and the card is
+    surfaced for a human. The budget is a CONSECUTIVE streak: any other closed
+    run (success, crash, protocol violation) breaks it, so a card that
+    genuinely recovers resets its budget.
+
+    Per-task ``max_retries`` overrides the default limit, matching the
+    protocol-violation budget.
+    """
+    auto_blocked: list[str] = []
+    for tid in task_ids:
+        streak = _rate_limit_streak(conn, tid)
+        if streak <= 0:
+            continue
+        trow = conn.execute(
+            "SELECT max_retries FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        if trow is None:
+            continue  # task deleted mid-loop
+        task_override = _kb._row_get(trow, "max_retries")
+        rl_limit = (
+            int(task_override) if task_override is not None else _RATE_LIMIT_RETRY_LIMIT
+        )
+        if streak < rl_limit:
+            continue
+        # Reuse the last rate-limited run's error text — it names the quota
+        # wall and is what the operator needs to see.
+        erow = conn.execute(
+            "SELECT error FROM task_runs WHERE task_id = ? AND outcome = 'rate_limited' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        error_text = (erow["error"] if erow else None) or "rate limited (quota wall)"
+        tripped = _record_task_failure(
+            conn, tid,
+            error=error_text,
+            outcome="rate_limited",
+            failure_limit=rl_limit,
+            force_trip=True,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={
+                "rate_limit_retries": streak,
+                "rate_limit_retry_limit": rl_limit,
+            },
+        )
+        if tripped:
+            auto_blocked.append(tid)
+    return auto_blocked
+
+
 def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -1478,6 +1589,11 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    # Same for rate-limited requeues: they do not charge ``consecutive_failures``,
+    # but they DO have a bounded retry budget of their own (see
+    # ``_account_rate_limits``) so a quota wall cannot re-dispatch a card forever.
+    if sweep.rate_limited:
+        auto_blocked.extend(_account_rate_limits(conn, sweep.rate_limited))
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -2755,8 +2871,13 @@ def _provision_worktree_install_state(task: Task, workspace: str) -> None:
         from pm.environments import provision_borrowed_install_state
 
         provision_borrowed_install_state(root)
-    except Exception as exc:  # pragma: no cover - a failed provision is not a failed dispatch
-        logger.warning("kanban worker: could not provision install state for %s: %s", root, exc)
+    except Exception as exc:  # pragma: no cover  # health: allow BLE001 -- a failed provision must degrade, not fail the dispatch; the worker still starts and reports PM's own missing-install message
+        # `_kb._log` is this module's logger idiom (see every other call site in
+        # this file): a bare `logger` is NOT defined here, so naming one would
+        # raise NameError inside the handler and kill the dispatch.
+        _kb._log.warning(
+            "kanban worker: could not provision install state for %s: %s", root, exc
+        )
 
 
 def _absolute_hermes_path(path: str) -> str:

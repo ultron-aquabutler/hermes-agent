@@ -326,7 +326,17 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 ):
     """A rate-limit sentinel exit releases the task to ``ready`` and leaves
     ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    transient throttle.
+
+    The rate-limit path has its OWN bounded retry budget (a consecutive
+    streak, ``_RATE_LIMIT_RETRY_LIMIT``), separate from
+    ``consecutive_failures``: a quota wall says nothing about the card's
+    quality, but an UNBOUNDED retry against the same wall re-dispatches the
+    card forever and re-loads the full context into the assignee's profile
+    every time (t_911cf02a: 95 attempts, 76 rate_limited, ~5.8M input tokens
+    burned). This test covers the "no failure charged" half; the bounded
+    budget is covered by ``test_rate_limit_streak_trips_breaker_after_limit``.
+    """
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -337,9 +347,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
-        # If any of these counted as a failure the task would be blocked.
-        for i in range(6):
+        # Stay under the bounded rate-limit budget: these hits must requeue to
+        # ``ready`` and leave ``consecutive_failures`` at 0.
+        for i in range(_kbd._RATE_LIMIT_RETRY_LIMIT - 1):
             pid = 70000 + i
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
@@ -377,11 +387,118 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         # A ``rate_limited`` run outcome was recorded (not ``crashed``).
         outcomes = [
             r["outcome"] for r in conn.execute(
-                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,)
             ).fetchall()
         ]
         assert "rate_limited" in outcomes
         assert "crashed" not in outcomes
+
+
+def test_rate_limit_streak_trips_breaker_after_limit(
+    kanban_home, monkeypatch,
+):
+    """After ``_RATE_LIMIT_RETRY_LIMIT`` CONSECUTIVE rate-limited requeues the
+    card parks ``blocked`` instead of being re-dispatched forever.
+
+    This is the bound that was missing: the rate-limit path never charged
+    ``consecutive_failures``, so the ordinary breaker never tripped and the
+    card was released to ``ready`` on every cooldown expiry — an unbounded
+    retry loop that burned tokens in the assignee's profile (t_911cf02a).
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="rl-loop", assignee="a")
+
+        for i in range(_kbd._RATE_LIMIT_RETRY_LIMIT):
+            pid = 71000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:rl{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kbd._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+            )
+            crashed = kbd.detect_crashed_workers(conn)
+            assert tid not in crashed  # still not a crash
+
+            task = kb.get_task(conn, tid)
+            if i < _kbd._RATE_LIMIT_RETRY_LIMIT - 1:
+                assert task.status == "ready", (
+                    f"hit {i}: under the budget the card must requeue ready, "
+                    f"got {task.status}"
+                )
+                assert task.consecutive_failures == 0
+
+        # At the limit the breaker trips and the card is parked for a human.
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"at the rate-limit budget the card must park blocked, "
+            f"got {task.status}"
+        )
+        assert tid in getattr(_kbd.detect_crashed_workers, "_last_auto_blocked", [])
+
+        # The reason names the quota wall so an operator can act on it.
+        assert task.last_failure_error and "rate-limited" in task.last_failure_error
+
+        # And it stays parked: recompute_ready must not resurrect it.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_rate_limit_streak_resets_on_a_successful_run(
+    kanban_home, monkeypatch,
+):
+    """A non-rate-limited run BREAKS the rate-limit streak, so a card that
+    genuinely recovers resets its budget instead of carrying the old count
+    forward forever. Same shape as the protocol-violation budget."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="rl-reset", assignee="a")
+
+        # One rate-limited hit.
+        kb.claim_task(conn, tid, claimer=f"{host}:rl0")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (72000, tid))
+        conn.commit()
+        _kbd._record_worker_exit(
+            72000, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        )
+        kbd.detect_crashed_workers(conn)
+        assert _kbd._rate_limit_streak(conn, tid) == 1
+
+        # A completed run breaks the streak.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'completed', 'completed', ?, ?)",
+            (tid, 1, 2),
+        )
+        conn.commit()
+        assert _kbd._rate_limit_streak(conn, tid) == 0
+
+        # So a fresh burst of rate-limits starts from zero again and does NOT
+        # trip the breaker on the second burst's first hit.
+        for i in range(_kbd._RATE_LIMIT_RETRY_LIMIT - 1):
+            kb.claim_task(conn, tid, claimer=f"{host}:rlb{i}")
+            conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (72100 + i, tid))
+            conn.commit()
+            _kbd._record_worker_exit(
+                72100 + i, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+            )
+            kbd.detect_crashed_workers(conn)
+            assert kb.get_task(conn, tid).status == "ready"
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
