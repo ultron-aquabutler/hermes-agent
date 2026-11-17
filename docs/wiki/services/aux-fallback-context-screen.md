@@ -209,6 +209,45 @@ production.
 > `required_tokens` argument:
 > `grep -c 'required_tokens' agent/auxiliary_client.py`.
 
+**Every cron job fails at once with an opaque
+`Restart-safe cron worker dispatch failed: cron external worker exited before
+ownership acknowledgement (exit 1)`.**
+
+Not a per-job problem — this file is on the shared cron import chain, so a
+syntax error in `agent/auxiliary_client.py` kills **every** job that touches
+the chain on the next tick. The traceback (truncated in the job's
+`last_error`) ends at this file:
+
+```
+cron/scheduler.py:3979      from gateway.run_startup import GatewayStartupMixin
+gateway/run_startup.py:22   from gateway.delivery import looks_like_telegram_private_chat_id
+gateway/delivery.py:14      from .session import SessionSource
+gateway/session.py:23       from gateway.session_transcript import SessionTranscriptMixin
+gateway/session_transcript.py:12  from agent.turn_context import extract_api_content_sidecar
+agent/turn_context.py:20    from agent.conversation_compression import recover_rotated_compression_session
+agent/conversation_compression.py:31  from agent.auxiliary_client import AuxiliaryExplicitCancellation
+agent/auxiliary_client.py   <-- the error lands here
+```
+
+Triage: read the **full** traceback (not the truncated job error) — the
+durable record is the job's `last_failure.detail` in
+`~/.hermes/cron/jobs.json`. Check the file parses, then find the fix:
+
+```bash
+git log --oneline --since="<failure-window>" -- agent/auxiliary_client.py
+```
+
+If N distinct job IDs carry the *identical* error, it is one tree break, not
+N job breaks — do not triage them one card at a time. Each one will file its
+own Mission Control `cron_fail_2x` alert card.
+
+This happened on 2026-11-11: a malformed signature in this file raised
+`SyntaxError: unmatched ')'` at line 4136 and took out the whole cron fleet
+for roughly one hour. It was repaired by commit `80f5f10ec2` (2026-11-11
+22:08 UTC). Affected jobs included `70ad14397f81`
+(kanban-dispatch-pump), `2a8b793667`, and `12f476f318da` — all reported
+"recovered since" with `failure_streak: 0`.
+
 ## Dependencies
 
 | Dependency | Used for |
@@ -224,6 +263,8 @@ production.
 - `docs/wiki/services/duplicate-tool-call-ids.md` — the sibling land-on-the-live-branch
   port, and the same `deploy-tree-hygiene` shape.
 - `docs/wiki/services/lsp-gateway-cgroup-footprint.md`
+- `~/.hermes/skills/workflow/cron-live-tree-blast-radius/SKILL.md` — the cron-side
+  triage playbook for the whole-fleet tree break this file can cause.
 - Original commit: `57335d6bd20f2fabb1bff35fab7a46c5ec9f941e` on `canonical-deploy`.
 - Incident card: `t_e94832a1` (2026-10-23 MiniMax plan-cap outage).
 - Re-land card: `t_a08511cd`.
