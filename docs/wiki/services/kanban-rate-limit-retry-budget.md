@@ -150,6 +150,27 @@ When the budget is exhausted the card is parked `blocked` with a
 `last_failure_error` naming the quota wall, so it surfaces in the normal
 blocked-card review path.
 
+### Scope: the budget is evaluated BOARD-WIDE
+
+The budget is **not** charged only when a worker dies in the current sweep.
+On every reclaim phase the dispatcher evaluates it across every card that is
+actually **dispatchable** — `ready` and `running`. Cards that are already
+`blocked`, `done`, `scheduled`, `archived` or `cancelled` are skipped: they
+are not going to be re-dispatched, so charging them would only churn the
+board.
+
+This matters. The narrow version — charging only inside
+`detect_crashed_workers`, i.e. only for workers that died in the current
+sweep — bounded only the **next** loop. A card whose rate-limited runs were
+recorded *earlier* but which was still sitting in `ready` (waiting out its
+cooldown, or never re-dispatched because the quota is still exhausted) was
+never re-evaluated, so an already-over-budget card stayed dispatchable
+forever.
+
+Live proof of that gap: `t_778ba4e0` (ready, streak 5) and `t_0fefaf72`
+(running, streak 5) sat unparked across repeated dispatcher ticks under the
+narrow version.
+
 ### Verified behaviour
 
 An end-to-end run against an isolated board, driving the production
@@ -259,6 +280,44 @@ If a `completed` or `crashed` run sits between the `rate_limited` runs, the
 streak resets at that point. A card that genuinely recovers should not carry an
 old quota-wall budget forever.
 
+### A card is over budget but still `ready`
+
+The budget is evaluated board-wide over dispatchable cards on every reclaim
+phase, so this should not happen. Check that the running gateway actually
+loaded the fix — the dispatcher lives in the gateway process, so a code change
+needs a gateway restart to take effect:
+
+```bash
+cd /home/serveradmin/.hermes/hermes-agent
+git log -1 --format='%h %s'                       # expected: e1f6421ca8 or later
+systemctl --user show hermes-gateway.service -p ActiveState
+```
+
+Then confirm the card is actually a candidate and what its streak is:
+
+```bash
+cd /home/serveradmin/.hermes/hermes-agent && ./venv/bin/python3 -c "
+import sqlite3, sys
+sys.path.insert(0, '.')
+from hermes_cli import kanban_db_dispatch as kd
+c = sqlite3.connect('file:/home/serveradmin/.hermes/kanban/boards/homelab/kanban.db?mode=ro', uri=True)
+c.row_factory = sqlite3.Row
+tid = '<task_id>'
+print('streak   :', kd._rate_limit_streak(c, tid), '/', kd._RATE_LIMIT_RETRY_LIMIT)
+print('candidate:', tid in kd._rate_limit_candidates(c))
+"
+```
+
+Note the `c.row_factory = sqlite3.Row` line — the streak helper reads
+`row["outcome"]`, so a plain tuple row raises `TypeError`.
+
+If the card is `ready`, has a streak at or over the limit, and is a candidate,
+but is still being dispatched — the running gateway is running stale code.
+Restart it (the dispatcher is in-process, so a restart is required).
+
+If the card is `blocked`/`done`/`scheduled`, it is *not* a candidate — that is
+by design, since it will not be re-dispatched.
+
 ### `RuntimeError: write_txn: already inside a transaction`
 
 A regression that means `_account_rate_limits` was called from inside the
@@ -285,4 +344,5 @@ sweep's transaction. It must run outside — see *Architecture* above.
 
 | Date | Change | Commit |
 |---|---|---|
-| 2026-11-16 | Bounded rate-limit retry budget added: `_rate_limit_streak()`, `_account_rate_limits()`, `_RATE_LIMIT_RETRY_LIMIT=5`. Fixes the unbounded quota-wall requeue loop on `t_911cf02a` (95 attempts, breaker never tripped). | see `git log` for `kanban_db_dispatch.py` |
+| 2026-11-17 | Budget is now evaluated **board-wide** over dispatchable cards (`ready`, `running`) on every reclaim phase, via `_rate_limit_candidates()`. The first version charged only inside `detect_crashed_workers`, so an already-over-budget card sitting in `ready` was never re-evaluated — the budget bounded only the *next* loop. | `e1f6421ca8` |
+| 2026-11-16 | Bounded rate-limit retry budget added: `_rate_limit_streak()`, `_account_rate_limits()`, `_RATE_LIMIT_RETRY_LIMIT=5`. Fixes the unbounded quota-wall requeue loop on `t_911cf02a` (95 attempts, breaker never tripped). | `ba9fd7de95` |
