@@ -1915,6 +1915,20 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Profile names that have been RETIRED and must never accept a new card
+        # (list or comma-separated string). None = the guard is inert and the
+        # historical lane behaviour is preserved for every install.
+        #
+        # An assignee whose profile does not exist on disk is normally a
+        # control-plane lane (e.g. a Claude Code terminal that pulls cards via
+        # `claim_task`) and is silently bucketed as `skipped_nonspawnable`.
+        # A RETIRED profile is not a lane: nothing will ever claim its cards,
+        # so the silent bucket strands them in 'ready' forever with no board
+        # evidence — 22 cards were stranded that way under the dead 'vision'
+        # label (kanban card t_252663de). Names listed here are refused at
+        # creation time and, if a card still carries one, the dispatcher parks
+        # it 'blocked'/needs_input with a loud event instead of skipping it.
+        "retired_assignees": None,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

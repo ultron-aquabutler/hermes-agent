@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli import kanban_retired_assignee as _kra
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -1235,6 +1236,19 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # A retired profile must not accept new cards. The dispatcher already
+    # fails loudly for one (see ``_fail_retired_assignee``), but refusing at
+    # creation is the real guard: a card that is never created cannot be
+    # stranded, and the operator gets the error at the point of the mistake
+    # instead of a warning in a journal nobody reads (kanban card
+    # t_252663de — the dead ``vision`` label accepted cards for six weeks
+    # after the profile was retired).
+    if assignee and _kra.is_retired_assignee(assignee):
+        raise _kra.RetiredAssigneeError(
+            f"assignee {assignee!r} is a retired profile "
+            f"(kanban.retired_assignees); assign it to a live profile or to "
+            f"the human lane instead"
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo

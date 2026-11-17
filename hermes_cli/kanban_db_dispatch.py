@@ -2611,6 +2611,64 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _fail_retired_assignee(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    assignee: str,
+    result: DispatchResult,
+    *,
+    lane: str,
+    dry_run: bool,
+) -> bool:
+    """Surface a card whose assignee is an explicitly RETIRED profile name.
+
+    A retired profile (operator-declared in ``kanban.retired_assignees``) is
+    not a control-plane lane: nothing will ever claim the card, so parking it
+    in the silent ``skipped_nonspawnable`` bucket strands it in ``ready``
+    forever with no board evidence and no journal trace — exactly what
+    happened to 22 cards under the dead ``vision`` label (kanban card
+    t_252663de).
+
+    Instead:
+      * append a distinct ``assignee_retired`` board event naming the profile,
+      * log a WARNING (visible in the gateway journal), and
+      * park the card ``blocked`` with ``block_kind='needs_input'`` so it
+        surfaces on the board as needing a human.
+
+    A dry run writes nothing. Returns False (no spawn slot consumed).
+    """
+    task_id = row["id"]
+    reason = (
+        f"assignee {assignee!r} is a RETIRED profile (kanban.retired_assignees) — "
+        f"no worker will ever claim this card; reassign it to a live profile "
+        f"or to the human lane"
+    )
+    if dry_run:
+        return False
+
+    _kb._log.warning(
+        "kanban dispatch: card %s assigned to RETIRED profile %r — parking as "
+        "blocked/needs_input instead of silently skipping it",
+        task_id, assignee,
+    )
+    with _kb.write_txn(conn):
+        # Write the event once per distinct (assignee) so a repeated tick does
+        # not append a row every minute — same discipline as the
+        # ``skipped_nonspawnable`` event above (#101015).
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+        payload = {"assignee": assignee, "reason": reason}
+        if (last is None or last["kind"] != "assignee_retired"
+                or last["payload"] != _kb._json_or_null(payload)):
+            _kb._append_event(conn, task_id, "assignee_retired", payload)
+    # ``block_task`` owns the status/kind transition and the ``blocked``
+    # audit event; a card that is already blocked (or gone) is a no-op.
+    _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+    result.auto_blocked.append(task_id)
+    return False
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2637,6 +2695,17 @@ def _dispatch_lane_task(
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
+        # A RETIRED profile name is not a lane. Nobody will ever claim these
+        # cards, so the silent bucket strands them in ``ready`` forever — the
+        # defect behind kanban card t_252663de, where a label left over from
+        # the 2026-10-05 ``vision`` retirement stranded 22 cards over six
+        # weeks. The operator names the retired profiles explicitly in
+        # ``kanban.retired_assignees``; those get a loud, board-visible
+        # failure instead of the silent skip.
+        if _kra.is_retired_assignee(assignee):
+            return _fail_retired_assignee(
+                conn, row, assignee, result, lane=lane, dry_run=dry_run,
+            )
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
         # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
@@ -3824,3 +3893,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli import kanban_retired_assignee as _kra
