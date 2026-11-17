@@ -153,9 +153,65 @@ async def _await_receipt(client, params, board_db, claim):
     return receipt
 
 
+def _board_terminal_outcome(board_db, params):
+    """The terminal verdict the BOARD already holds for this exact attempt.
+
+    ``task_runs.outcome`` is written by ``_end_run`` when the card reaches a
+    terminal transition -- ``completed``, ``blocked``, ``review_requested``,
+    ``gave_up``, ``changes_requested``. It is the board's own record of the
+    attempt's fate, keyed to the run, and it survives the owner losing the
+    worker afterwards.
+
+    Returns the outcome string, or None when the run has no terminal verdict
+    yet (still running, crashed, or reclaimed).
+    """
+    import sqlite3
+    from pathlib import Path
+    try:
+        conn = sqlite3.connect(Path(board_db).resolve().as_uri() + '?mode=ro', uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    try:
+        row = conn.execute(
+            'SELECT outcome FROM task_runs WHERE id=? AND task_id=?',
+            (params['run_id'], params['task_id']),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row:
+        return None
+    outcome = row[0]
+    return outcome if outcome in _TERMINAL_BOARD_OUTCOMES else None
+
+
+# The board transitions that mean the attempt reached a verdict of its own.
+# ``crashed``/``reclaimed``/``timed_out`` are NOT here: they are the absence of
+# a verdict, booked by the dispatcher's sweep after the worker went away.
+_TERMINAL_BOARD_OUTCOMES = frozenset({
+    'completed', 'blocked', 'review_requested', 'gave_up', 'changes_requested',
+})
+
+
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
+        # The owner settled the admission 'unknown' -- but the board may already
+        # hold this attempt's terminal verdict. The worker's own
+        # ``kanban_complete``/``kanban_block``/``kanban_request_review`` writes
+        # to the board directly, so it can land BEFORE the owner loses the
+        # worker: the verdict is durable, and the receipt's 'unknown' only
+        # says the owner could not confirm the handshake.
+        #
+        # Reading 'unknown' as a failure discarded a verdict that had already
+        # been recorded, which the dispatcher then booked as a crash and
+        # re-claimed -- so a card whose work was done kept looping. Ask the
+        # board first: a terminal outcome for THIS run is the authority.
+        outcome = _board_terminal_outcome(board_db, params)
+        if outcome is not None:
+            print(f'Kanban attempt already terminal on the board: {outcome}', file=sys.stderr)
+            return 0
         raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)

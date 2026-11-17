@@ -431,11 +431,59 @@ def worker_exit_code(path, params):
 KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'is_bot': True}
 
 
-def _run_task_turns(agent, frame, history, context):
+def _skill_preload_notice(missing):
+    """The model-facing note for skills this profile could not preload.
+
+    A skill identifier on a card is advisory context, not a precondition. The
+    preload list travels with the CARD, but skills resolve against the ACTIVE
+    profile's own skills dir (``tools/skills_tool.py:_skills_dir``), so a card
+    that names one profile's skill names it for every assignee. Saying so
+    plainly lets the worker proceed and still reach the skill with
+    ``skill_view`` when the profile carries it under another name.
+    """
+    return (
+        '[Skill preload notice: the skill(s) ' + ', '.join(missing) + ' could not be preloaded '
+        'because this profile does not carry them. They are advisory context, not a '
+        'requirement: continue with the task. If one of them is loadable by another name, '
+        'use skill_view to read it before acting on its subject.]'
+    )
+
+
+def _preload_task_skills(context, session_id):
+    """The card's skill-preload prompt, or raise when the operator withheld skills.
+
+    A missing skill used to be fatal here, which killed the worker BEFORE its
+    first turn: the owner settled the admission ``unknown``, the submitter
+    exited rc=1 with "Kanban execution unknown", and the dispatcher re-claimed
+    the card forever. On t_b6107c56 that produced 92 identical deaths and zero
+    productive iterations -- a crash loop with nothing to fix on the card.
+
+    The gateway's own session path already treats a missing skill as
+    non-fatal ("a typo among good names is logged and skipped"; see
+    ``gateway/session_policy.py``), and the CLI's ``hermes -s <skill>`` skips
+    what it cannot resolve. So the kanban worker path now matches: log it,
+    tell the model which names did not resolve, and keep going.
+
+    A SAFE-WORKER policy is different: it withholds skills ON PURPOSE, and
+    ``build_preloaded_skills_prompt`` reports every identifier as missing for
+    exactly that reason. That refusal is the operator's, so it still raises.
+    """
     from agent.skill_commands import build_preloaded_skills_prompt
-    skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
-    if missing and not loaded:
+    skills, _loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=session_id)
+    if not missing:
+        return skills
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
         raise ValueError('kanban_skills_unavailable')
+    import logging
+    logging.getLogger(__name__).warning(
+        'Kanban card %s: skill(s) not available to this profile, continuing without: %s',
+        context.get('task_id'), ', '.join(missing))
+    return '\n\n'.join(p for p in (skills, _skill_preload_notice(missing)) if p)
+
+
+def _run_task_turns(agent, frame, history, context):
+    skills = _preload_task_skills(context, agent.session_id)
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 
