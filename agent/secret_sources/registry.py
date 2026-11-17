@@ -309,9 +309,19 @@ class _Applier:
     """Apply phase state for one orchestrated pass: sequential, first-wins, attributed."""
 
     def __init__(self, env: MutableMapping[str, str], report: ApplyReport,
-                 protected: dict[str, str], preserve: frozenset) -> None:
+                 protected: dict[str, str], preserve: frozenset,
+                 profile_owned: frozenset = frozenset()) -> None:
         self.env, self.report, self.protected, self.preserve = env, report, protected, preserve
         self.claimed: dict[str, str] = {}  # var → source name that won it
+        # Names the HOME'S OWN .env defines. A BULK source (secrets.command helper) returns ONE
+        # canonical value per process, so that value belongs to exactly one profile — letting it
+        # overwrite a sibling profile's own .env credential aliases one bot's identity into another
+        # profile's scope. A cluster-level `secrets.command` that emits TELEGRAM_BOT_TOKEN therefore
+        # overwrote the default profile's own token with the `ultron` (or `friday`) bot's, and the
+        # default profile then posted to Telegram as the wrong bot (t_43eff563).
+        # The .env is authoritative for any key it defines — the same rule
+        # ``agent.secret_scope.build_profile_secret_scope`` already applies to the per-profile scope.
+        self.profile_owned = profile_owned
 
     def apply_source(self, source: SecretSource, cfg: dict, result: FetchResult,
                      profile: str, supplied_directly: set) -> None:
@@ -323,9 +333,17 @@ class _Applier:
             override = source.override_existing(cfg)
         except Exception:
             override = False
+        # A bulk source may not override a name the home's own .env defines (see _Applier.profile_owned).
+        bulk_cannot_override = source.shape == "bulk"
 
         for var, value in result.secrets.items():
             if not isinstance(var, str) or not isinstance(value, str):
+                continue
+            if bulk_cannot_override and var in self.profile_owned and not self._claimed_by_other_source(var):
+                sr.skipped_existing.append(var)
+                sr.result.warnings.append(
+                    f"{var}: kept the profile's own .env value — a bulk secret source returns one "
+                    f"value per process, so it cannot own a per-profile credential")
                 continue
             if not self._try_apply(sr, source, override, var, value) or not profile:
                 continue
@@ -333,6 +351,10 @@ class _Applier:
             if (alias and alias not in supplied_directly and alias not in self.claimed
                     and self._try_apply(sr, source, override, alias, value)):
                 result.warnings.append(f"applied profile-scoped {var} as {alias} (active profile {profile!r})")
+
+    def _claimed_by_other_source(self, var: str) -> bool:
+        """True when a MAPPED source already supplied this name in this pass."""
+        return var in self.claimed
 
     def _try_apply(self, sr: SourceReport, source: SecretSource, override: bool,
                    var: str, value: str) -> bool:
@@ -411,7 +433,35 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     # An alias never shadows a var some source supplies by its real name.
     supplied_directly = {v for _, _, r in fetches if r.ok for v in r.secrets if isinstance(v, str)}
 
-    applier = _Applier(env, report, protected, preserve)
+    applier = _Applier(env, report, protected, preserve, _profile_owned_names(home_path))
     for source, cfg, result in fetches:
         applier.apply_source(source, cfg, result, profile, supplied_directly)
     return report
+
+
+def _profile_owned_names(home_path: Path) -> frozenset:
+    """Names the home's OWN ``.env`` defines as REAL values — the ones a bulk source may not override.
+
+    A bulk source (``secrets.command``) emits ONE canonical value per process, so its value
+    belongs to exactly one profile. Letting it overwrite a profile's own ``.env`` credential
+    aliases one bot's identity into another profile's runtime — the default profile posting to
+    Telegram as the ``ultron`` bot (t_43eff563). The ``.env`` is authoritative for any key it
+    defines, which is the rule ``agent.secret_scope.build_profile_secret_scope`` already applies
+    to the per-profile scope; the process-global path now applies the same rule.
+
+    A PLACEHOLDER value (``__<SOURCE>_MANAGED__``) is excluded: it means "this credential is
+    source-managed", and the source is authoritative for it (the #74265 flow — the source resolves
+    the placeholder, and a later dotenv reload must not write the placeholder back).
+
+    Fail-open: an unreadable ``.env`` yields an empty set (the source's normal precedence applies).
+    """
+    try:
+        from agent.secret_scope import load_env_file
+
+        defined = load_env_file(Path(home_path) / ".env")
+    except Exception:  # an unreadable .env must not block secret resolution
+        return frozenset()
+    return frozenset(
+        name for name, value in defined.items()
+        if value and not (value.strip().startswith("__") and value.strip().endswith("__"))
+    )

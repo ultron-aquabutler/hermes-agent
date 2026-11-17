@@ -125,6 +125,8 @@ async def send_draft(adapter: Any, chat_id: str, draft_id: int, content: str, me
         try:
             if await _await_with_thread_deadline(
                 adapter._bot.send_message_draft(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False):
+                # The draft LANDED: record which bot posted it (the bot id is not a secret).
+                adapter._note_outbound_send(kwargs.get("chat_id"), "draft")
                 return SendResult(success=True, message_id=None)
             return SendResult(success=False, error="draft_rejected")
         except Exception as e:  # health: allow BLE001 -- draft boundary (moved from adapter.py): any failure falls back to edit streaming
