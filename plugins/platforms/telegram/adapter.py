@@ -1447,6 +1447,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             message_id = getattr(msg, "message_id", None)
         if message_id is not None:
             await self._record_rich_sent(chat_id, message_id, content)
+        # The rich message LANDED: record which bot posted it (the bot id is not a secret).
+        self._note_outbound_send(chat_id, "rich")
         return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
@@ -1503,7 +1505,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id), "rich_message": self._rich_message_payload(content)}
         payload.update(self._thread_kwargs_for_draft(chat_id, metadata))
         try:
-            return bool(await _await_with_thread_deadline(
+            sent = bool(await _await_with_thread_deadline(
                 self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
         except Exception as exc:
@@ -1518,6 +1520,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     "[%s] sendRichMessageDraft transient failure (%s) — legacy draft this frame", self.name,
                     _redact_telegram_error_text(exc))
             return False
+        if sent:
+            # The draft frame LANDED: record which bot posted it.
+            self._note_outbound_send(chat_id, "rich draft")
+        return sent
 
     async def _drain_polling_connections(self) -> None:
         """Reset the httpx pool used for getUpdates polling before a reconnect.
@@ -2373,6 +2379,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             topic = await self._bot.create_forum_topic(**kwargs)
             thread_id = topic.message_thread_id
             logger.info("[%s] Created DM topic '%s' in chat %s -> thread_id=%s", self.name, name, chat_id, thread_id)
+            # The topic LANDED: record which bot created it (the bot id is not a secret).
+            self._note_outbound_send(chat_id, "topic")
             return thread_id
         except Exception as e:
             error_text = str(e).lower()
@@ -3291,13 +3299,16 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             return _await_with_thread_deadline(self._bot.send_message(text=text, parse_mode=send_mode, **send_kwargs),
                                                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         try:
-            return await send(chunk, mode)
+            result = await send(chunk, mode)
         except Exception as md_error:
             if not is_entity_parse_error(md_error):  # an HTML 5xx page is no refusal: it may be in the chat
                 raise
             logger.warning("[%s] %s parse failed, falling back to plain text: %s", self.name, mode, md_error)
             fallback = _strip_mdv2(chunk) if mode == ParseMode.MARKDOWN_V2 else strip_html_tags(chunk)
-            return await send(fallback, None)
+            result = await send(fallback, None)
+        # The message LANDED: record which bot posted it.
+        self._note_outbound_send(send_kwargs.get("chat_id"), "message")
+        return result
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
@@ -3436,6 +3447,48 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if isinstance(tracked, set):
             tracked.add(task)
             task.add_done_callback(tracked.discard)
+
+    def _outbound_bot_id(self) -> Optional[str]:
+        """The numeric bot id this adapter POSTS AS, or None when it has none.
+
+        The bot id is NOT a secret — the token is. It is the only way to answer "which bot
+        spoke?" from a log: counting ``bot<id>/sendMessage`` URLs in the log was the only
+        option before ``tools.telegram_identity`` landed, and that is exactly how the
+        t_43eff563 mis-post (a default-profile worker posting as the ultron bot) went
+        unnoticed for a day.
+
+        Resolved from THIS adapter's own ``config.token`` — the token the profile's config
+        resolved — so the id is the identity this adapter actually authenticates with, not
+        an ambient value.
+        """
+        cached = getattr(self, "_outbound_bot_id_cache", None)
+        if cached is not None:
+            return cached[0]
+        resolved = None
+        try:
+            from tools.telegram_identity import bot_id_from_token
+
+            resolved = bot_id_from_token(getattr(self.config, "token", None))
+        except Exception:
+            # Logging must never break a send.
+            logger.debug("could not resolve the outbound Telegram bot id", exc_info=True)
+        # ``None`` is a valid answer (a self-hosted Bot API server has no numeric id), so the
+        # cache sentinel is a 1-tuple rather than the bare value.
+        self._outbound_bot_id_cache = (resolved,)
+        return resolved
+
+    def _note_outbound_send(self, chat_id: Any, kind: str = "message") -> None:
+        """Record WHICH bot posted, on every outbound send.
+
+        The bot id is not a secret — the token is. Without this line, the only way to tell
+        which bot spoke was to count ``bot<id>/sendMessage`` URLs in the log, which is
+        exactly how the t_43eff563 mis-post went unnoticed.
+        """
+        bot_id = self._outbound_bot_id()
+        logger.info(
+            "[%s] telegram outbound %s bot_id=%s chat=%s",
+            self.name, kind, bot_id if bot_id else "unknown", chat_id,
+        )
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -4886,8 +4939,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         reset_media: Optional[Any] = None, **media_kwargs: Any) -> Any:
         """Send one native media payload with thread routing + DM-topic anchor retry."""
         _, kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
-        return await self._send_with_dm_topic_reply_anchor_retry(
+        result = await self._send_with_dm_topic_reply_anchor_retry(
             send_fn, {**kwargs, **media_kwargs}, metadata, media_label, reset_media=reset_media)
+        # The media LANDED: record which bot posted it (the bot id is not a secret).
+        self._note_outbound_send(chat_id, media_label)
+        return result
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:

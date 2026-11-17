@@ -853,8 +853,60 @@ def load_gateway_config() -> GatewayConfig:
 
     config = GatewayConfig.from_dict(gw_data)
     _apply_env_overrides(config)
+    _reassert_profile_scoped_tokens(config, _home)
     _validate_gateway_config(config)
     return config
+
+
+def _reassert_profile_scoped_tokens(config: "GatewayConfig", home) -> None:
+    """Re-resolve each platform's token from the PROFILE'S OWN credential sources.
+
+    ``_apply_env_overrides`` reads the token through ``gateway.config._getenv``, which falls back
+    to the process-global ``os.environ`` when no secret scope is bound. ``os.environ`` is shared by
+    every profile in the process, so a value another profile's ``.env`` wrote there (a routed cron
+    fire's dotenv load, a cluster-level ``secrets.command`` helper) could become THIS profile's
+    bot token — the default profile then builds its Telegram adapter with the ``ultron`` bot's
+    token and posts to Bryan's DM as Ultron (t_43eff563).
+
+    The profile's own ``.env`` is authoritative for any key it defines (the rule
+    ``agent.secret_scope.build_profile_secret_scope`` already applies to the per-profile scope).
+    This re-asserts that rule for the process-global load path: a token the profile's own ``.env``
+    defines always wins over the ambient env.
+
+    Narrow by design: only the credential names that identify a PLATFORM IDENTITY are re-asserted
+    (a bot token IS an identity), only when the profile's own ``.env`` actually defines the name,
+    and only when the ambient value differs. Everything else keeps today's precedence.
+
+    Fail-open: an unreadable ``.env`` leaves the config untouched.
+    """
+    try:
+        from pathlib import Path
+
+        from agent.secret_scope import load_env_file
+
+        own = load_env_file(Path(home) / ".env")
+    except Exception:
+        # An unreadable .env must not break config loading.
+        logger.debug("could not read the profile's own .env for token re-assertion", exc_info=True)
+        return
+    if not own:
+        return
+
+    for platform, env_name in PLATFORM_TOKEN_ENV_NAMES.items():
+        expected = own.get(env_name)
+        if not expected:
+            continue  # the profile does not define it — the ambient value stands
+        pconfig = config.platforms.get(platform)
+        if pconfig is None:
+            continue
+        if pconfig.token == expected:
+            continue  # already correct
+        if pconfig.token:
+            logger.warning(
+                "%s: the resolved token does not match this profile's own .env — using the profile's "
+                "token. A token from another profile's environment would make this profile post as "
+                "the wrong bot.", env_name)
+        pconfig.token = expected
 
 
 def _validate_gateway_config(config: GatewayConfig) -> None:
