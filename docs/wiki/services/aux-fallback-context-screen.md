@@ -256,19 +256,51 @@ durable signal is "does the file compile right now", not "which commit
 broke it".
 
 Later cards for the same burst, each of which filed its own
-`cron_fail_2x` alert:
+`cron_fail_2x` alert. The burst produced **ten** alerts across **ten**
+jobs (verified against `mc.alert_history` for the
+`2026-11-11T20:50Z`–`22:00Z` window — the authoritative list, cross-checked
+against the local `cron_incidents` table and `jobs.json`):
 
-| Job | Name | Alert | Status |
-|---|---|---|---|
-| `70ad14397f81` | kanban-dispatch-pump | `cron_fail_2x:70ad14397f81` | recovered |
-| `33b73d3ad935` | kanban-progress-cron | `cron_fail_2x:33b73d3ad935` | recovered |
-| `d03b9c4f77ff` | Curator Board Dispatch | `cron_fail_2x:d03b9c4f77ff` | recovered |
-| `8824a67d950b` | kanban-board-watcher-mcp-infra | `cron_fail_2x:8824a67d950b` | recovered |
+| Alert | Job | Name | Fired | Cleared |
+|---|---|---|---|---|
+| 50681 | `2a8b793667` | mission-control-docker-context-probe | 21:05:37 | 21:50:50 |
+| 50682 | `33b73d3ad935` | kanban-progress-cron | 21:05:37 | 21:50:50 |
+| 50683 | `70ad14397f81` | kanban-dispatch-pump (homelab+aquabutler) | 21:05:37 | 21:50:50 |
+| 50684 | `8824a67d950b` | kanban-board-watcher-mcp-infra | 21:05:37 | 21:50:50 |
+| 50685 | `c76254d06ebe` | Auto-Promote Dependent Tasks | 21:05:37 | 21:50:50 |
+| 50686 | `f6547e7a6a23` | hub-blocked-dm-relay | 21:05:37 | 21:50:50 |
+| 50687 | `08c98ba49a36` | Librarian Board Dispatch | 21:11:49 | 21:50:50 |
+| 50688 | `12f476f318da` | blocked-DM queue liveness watchdog | 21:11:49 | 21:50:50 |
+| 50689 | `39e2ca1e4dd6` | kanban-board-watcher-homelab | 21:11:49 | 21:50:50 |
+| 50690 | `d03b9c4f77ff` | Curator Board Dispatch | 21:11:49 | 21:50:50 |
+
+All ten share one `cleared_at` timestamp — `2026-11-11 21:50:50.322216+00:00` —
+because the condition stopped holding for all of them at the same detector
+tick. Every one of the eight jobs that carry a local `cron_incidents` row
+has `failure_type: delivery`, `first_seen_at` inside
+`21:02:16`–`21:08:22`, and the identical
+`SyntaxError: unmatched ')'` in its `last_failure.detail`.
 
 Each alert auto-cleared via `mc.alert_history.cleared_at` within ~40 min of
 the burst ending. A card filed days later for one of these alerts is a
 stale artifact — verify the alert's `cleared_at` and the job's current
 `last_status` before doing any repair work.
+
+**Verify the clear before touching the job.** The read-only MC password
+lives at `~/.hermes/secrets/mc_ro_password`; the MC venv at
+`/home/serveradmin/mission-control/.venv` has `psycopg` installed:
+
+```sql
+SELECT id, subject, fired_at, cleared_at, occurrences
+FROM mc.alert_history
+WHERE dedupe_key = 'cron_fail_2x:<job_id>';
+```
+
+A `cleared_at` that is not null means the condition stopped holding — the
+card is an artifact of the burst, not a live fault. Pair it with the live
+job state (`mc.cron_snapshot.last_status` for the newest snapshot row, and
+`failure_streak` in `~/.hermes/cron/jobs.json`) before deciding that no
+repair is needed.
 
 ## Dependencies
 
