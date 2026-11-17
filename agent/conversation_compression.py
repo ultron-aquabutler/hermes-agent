@@ -1530,7 +1530,8 @@ def _automatic_compression_gate_blocks(
 
 def compression_blocked_transiently(agent: Any) -> bool:
     """Type-pinned read of the transient-block signal.
-    Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown or structural backoff).
+    Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown, structural
+    backoff, the minimum compaction interval, or the usage-less compaction-loop pause).
     Consumers must defer, not count it toward ``compression_exhausted``, or an overflow auto-reset wipes a
     session that was merely cooling down. The permanent ``ineffective`` breaker never sets it.
 
@@ -1547,9 +1548,14 @@ def compression_blocked_transiently(agent: Any) -> bool:
 
 def _mark_compression_blocked_transient(agent: Any, compressor: Any, reason: str) -> None:
     """Publish the transient-block signal when the active guard is transient.
-    ``reason`` comes from ``_compression_block_reason``: ``cooldown:*`` and ``structural_backoff:*`` are
-    transient; ``ineffective`` stays unmarked."""
-    if reason.startswith("cooldown") or reason.startswith("structural_backoff"):
+    ``reason`` comes from ``_compression_block_reason``: ``cooldown:*``, ``structural_backoff:*``,
+    ``usage_less_loop`` and ``min_interval:*`` are transient; ``ineffective`` stays unmarked."""
+    if (
+        reason.startswith("cooldown")
+        or reason.startswith("structural_backoff")
+        or reason.startswith("min_interval")
+        or reason == "usage_less_loop"
+    ):
         logger.info(
             "Skipping automatic compression re-entry: transient guard "
             "active (%s, session=%s, last failure: %s) — will retry after "

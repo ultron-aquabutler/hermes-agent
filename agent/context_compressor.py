@@ -2284,6 +2284,21 @@ class ContextCompressor(
         self._last_summary_fallback_used = self._last_feasibility_skip = False
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        # Usage-independent loop detector (see _record_usage_less_loop_verdict). Separate counters from
+        # _ineffective_compression_count on purpose: that counter's trip is a PERMANENT disarm of
+        # auto-compaction, which is too blunt for a heuristic verdict and must not be poisoned by one.
+        self._usage_less_loop_count = 0
+        self._usage_less_loop_blocked_until = 0.0
+        # Rough estimate seen at the previous compaction boundary, plus the count of consecutive
+        # boundaries at which the estimate did NOT shrink. A compaction that leaves the prompt
+        # estimate unchanged (or larger) reclaimed no window -- that is the loop signature, and it
+        # separates a genuine loop from a large-but-progressing session whose schema-heavy tool set
+        # simply keeps it over the threshold.
+        self._last_rough_tokens = 0
+        self._non_reduction_count = 0
+        # Monotonic timestamp of the last COMPLETED compaction; 0.0 = none yet. Bounds the cadence
+        # of compactions (see _MIN_COMPACTION_INTERVAL_SECONDS).
+        self._last_compression_completed_at = 0.0
         # Wall-clock probe deadline; 0.0 = unarmed (durable copy re-read via _load_anti_thrash_recovery_deadline).
         self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
         self._structural_no_op_len = 0
@@ -2487,6 +2502,190 @@ class ContextCompressor(
         self._ineffective_compression_count = count
         self._persist_ineffective_compression_count()
 
+    # ── Usage-independent compaction-loop detector ───────────────────────────────────────────
+    #
+    # The anti-thrash breaker above is adjudicated in _apply_real_prompt_verdict(), which needs the
+    # provider's REAL prompt_tokens. A provider that omits usage entirely (MiniMax, and any provider
+    # behind it) therefore never records a verdict: _ineffective_compression_count stays 0 forever,
+    # the breaker never trips, and a session whose context cannot fit compacts on every turn.
+    #
+    # Observed on the default profile's Vision DM session (2026-11-17): 56 compactions in one
+    # session, each spending 2-4 minutes on a fallback summary, each landing back near the
+    # threshold, each followed 9-11 minutes later by the next one — ~9.9M input tokens.
+    #
+    # This detector closes that gap WITHOUT provider usage. It uses the rough full-request estimate
+    # (system prompt + messages + tool schemas) captured at the compaction boundary, which is on the
+    # SAME basis as the threshold and therefore directly comparable to it.
+    #
+    # It is deliberately NOT folded into _ineffective_compression_count: tripping that counter
+    # disarms auto-compaction permanently (until the recovery probe), which is the correct response
+    # to a provider-CONFIRMED ineffective compression but far too blunt for a rough-estimate verdict.
+    # A false positive here must cost a bounded pause, not the session's ability to compact at all.
+
+    # Consecutive usage-less compactions that leave the rough estimate at/over the line before the
+    # trip. Two, not one: the first crossing may be a single fat tool result, and one strike must
+    # never pause compaction.
+    _USAGE_LESS_LOOP_TRIP_COUNT = 2
+
+    # Minimum PERCENTAGE of message tokens a compaction must reclaim for that pass to count as
+    # progress. This is the messages-vs-messages shrinkage already computed by compress()
+    # (``_last_compression_savings_pct``), so it measures what compaction can actually shrink.
+    #
+    # Why a percentage and not an absolute: a small session may legitimately reclaim a few
+    # hundred tokens and be done; a huge one may reclaim tens of thousands. The question is
+    # whether the pass made PROGRESS, not how much.
+    #
+    # Why 2% and not 0: the real runaway's own boundaries shrink the full-request estimate by
+    # 4-8% while the messages shrink much further, but a pass that trims only a rounding error
+    # (a handful of tokens out of 1.3M) is not progress -- it is the loop's signature. 2% sits
+    # above that noise floor and below every genuine reclaim observed in the runaway session.
+    _USAGE_LESS_LOOP_MIN_SAVINGS_PCT = 2.0
+
+    # The rough estimate is measured BEFORE the next tool's output is appended, and a rough estimate
+    # is a floor-ish measure (the provider's real count runs higher). Treating an estimate that sits
+    # just under the threshold as "cleared" would miss the very case that loops: the estimate reads
+    # 112K against a 120K threshold and the very next tool call pushes it back over. So the verdict
+    # compares against threshold + margin, not against threshold alone.
+    _USAGE_LESS_LOOP_MARGIN_TOKENS = 4096
+
+    # How long the detector pauses auto-compaction once it trips. Bounded: the session resumes
+    # compressing on its own afterwards, so a false positive costs a pause, never a permanent disarm.
+    _USAGE_LESS_LOOP_BLOCK_SECONDS = 300.0
+
+    # Minimum wall-clock gap between two compactions of the same session. A compaction that costs
+    # 2-4 minutes of aux-summary LLM time cannot be worth repeating within a few minutes: the
+    # transcript cannot have grown enough to need it again, so a second pass buys nothing but latency
+    # and tokens. This is the cheap first line of defence — it bounds the cadence of a loop even
+    # before the loop is proven, and it applies to EVERY provider, usage-reporting or not.
+    _MIN_COMPACTION_INTERVAL_SECONDS = 120.0
+
+    def _compression_interval_elapsed(self) -> bool:
+        """Whether enough wall-clock time has passed since the last completed compaction."""
+        if self._last_compression_completed_at <= 0.0:
+            return True
+        return (time.monotonic() - self._last_compression_completed_at) >= self._MIN_COMPACTION_INTERVAL_SECONDS
+
+    def _usage_less_loop_tripped(self) -> bool:
+        """Whether the usage-independent loop detector is currently holding compaction back."""
+        return time.monotonic() < self._usage_less_loop_blocked_until
+
+    def _maybe_record_usage_less_loop_verdict(self) -> None:
+        """Judge the rough full-request estimate when no provider usage can adjudicate the compaction.
+
+        The real-usage verdict (``_apply_real_prompt_verdict``) needs the provider's ``prompt_tokens``.
+        When the provider omits usage, that verdict never arrives and the anti-thrash breaker never
+        trips. This is the substitute signal: the rough estimate captured at the compaction boundary,
+        which is computed on the same basis as the threshold (system prompt + messages + tool schemas).
+
+        Skipped when the provider DOES report usage — the real count is authoritative and the existing
+        path handles it (no regression for providers that report usage).
+        """
+        # A real reading already arrived (or the provider is known to report usage): the existing
+        # real-usage verdict owns this case. Do not double-judge.
+        if self._provider_omits_usage is False and self.last_prompt_tokens > 0:
+            return
+        # The provider must be known to omit usage, OR we must be waiting on a real reading that
+        # never came. Without one of those, usage may still arrive and the real verdict will fire.
+        if not self._provider_omits_usage and not self.awaiting_real_usage_after_compression:
+            return
+        rough = self.last_compression_rough_tokens
+        if rough <= 0:
+            return
+        self._record_usage_less_loop_verdict(rough)
+
+    def _record_usage_less_loop_verdict(self, rough_tokens: int) -> None:
+        """Record one usage-independent loop observation; pauses compaction once the loop is proven.
+
+        ``rough_tokens`` is the rough FULL-request estimate captured at the compaction boundary
+        (system prompt + messages + tool schemas), on the same basis as ``threshold_tokens``.
+
+        Called only when the provider omits usage, so the real-usage verdict can never arrive.
+
+        Two signals are combined, and BOTH are available without provider usage:
+
+        * ``rough_tokens`` vs ``threshold_tokens`` -- is the request still over the line? If the
+          estimate is comfortably under, compaction is working and there is nothing to break.
+        * ``_last_compression_savings_pct`` -- did THIS compaction actually reclaim anything? It is
+          the messages-vs-messages shrinkage (system prompt and tool schemas are incompressible
+          floor, so comparing full-request sizes hides real progress).
+
+        The second signal is the discriminator, and it is essential. A session with a huge
+        schema-heavy tool set can sit an order of magnitude over the threshold while its MESSAGES
+        shrink healthily on every compaction; keying on size alone would pause such a session for
+        doing real work. Keying on message savings alone would miss the case where the floor, not
+        the messages, is what is over the line. Together they isolate the actual failure: the
+        request is still over the line AND compaction is no longer reclaiming anything.
+
+        Deliberately conservative in three directions:
+
+        * it never fires on the first boundary (there is no baseline to compare against yet),
+        * a boundary that DID reclaim message tokens resets the streak, so a large but progressing
+          session is never punished for being large, and
+        * it clears the streak as soon as one estimate lands comfortably under the line, because at
+          that point compaction is demonstrably working.
+
+        Measured against the real runaway session (``20261110_162723_dc65d8e8``, 24 compaction
+        boundaries) the legitimate early boundaries sat at 1.4M-1.1M tokens -- roughly 10x over the
+        120K threshold -- purely because that session's tool set is enormous, yet each of those
+        boundaries shrank its messages. That is why size alone is not the discriminator.
+        """
+        threshold = self.threshold_tokens
+        if threshold <= 0:
+            return
+        previous = self._last_rough_tokens
+        self._last_rough_tokens = rough_tokens
+
+        # Under the line with room to spare: compaction is working. Reset everything.
+        if rough_tokens > 0 and rough_tokens < threshold - self._USAGE_LESS_LOOP_MARGIN_TOKENS:
+            self._non_reduction_count = 0
+            self._usage_less_loop_count = 0
+            self._usage_less_loop_blocked_until = 0.0
+            return
+
+        # Did this compaction reclaim any message tokens? If it did, the session is making
+        # progress and must not be punished for being large.
+        savings = self._last_compression_savings_pct
+        if savings >= self._USAGE_LESS_LOOP_MIN_SAVINGS_PCT:
+            self._non_reduction_count = 0
+            self._usage_less_loop_count = 0
+            # A compaction that is reclaiming window is proof the session is healthy, so any
+            # pause from an earlier streak must lift NOW rather than serving out its full
+            # window. Otherwise a session that recovered keeps losing automatic compaction
+            # for up to _USAGE_LESS_LOOP_BLOCK_SECONDS after it demonstrably started working.
+            self._usage_less_loop_blocked_until = 0.0
+            return
+
+        # Still over the line AND compaction reclaimed nothing: this is the loop signature.
+        if previous > 0:
+            self._non_reduction_count += 1
+        else:
+            # First boundary seen: no baseline for the estimate comparison yet, but the savings
+            # signal already tells us whether this pass made progress.
+            self._non_reduction_count = 1
+
+        self._usage_less_loop_count += 1
+        if self._usage_less_loop_count < self._USAGE_LESS_LOOP_TRIP_COUNT:
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compaction did not shrink the request and no provider usage is available to "
+                    "judge it (rough_tokens=%d >= threshold=%d, message savings=%.1f%%). "
+                    "usage_less_loop_count=%d/%d — the next such boundary pauses automatic compaction.",
+                    rough_tokens, threshold, savings, self._usage_less_loop_count,
+                    self._USAGE_LESS_LOOP_TRIP_COUNT,
+                )
+            return
+        # Tripped: pause automatic compaction for a bounded window.
+        self._usage_less_loop_count = 0
+        self._usage_less_loop_blocked_until = time.monotonic() + self._USAGE_LESS_LOOP_BLOCK_SECONDS
+        if not self.quiet_mode:
+            logger.warning(
+                "Compaction loop detected without provider usage: %d consecutive compactions failed to "
+                "shrink the request (last rough_tokens=%d, threshold=%d, message savings=%.1f%%). "
+                "Automatic compaction is paused for %.0fs; manual /compress still works.",
+                self._USAGE_LESS_LOOP_TRIP_COUNT, rough_tokens, threshold, savings,
+                self._USAGE_LESS_LOOP_BLOCK_SECONDS,
+            )
+
     def _record_structural_no_op(self, reason: str, n_messages: int = 0) -> None:
         """Defer retries after a structural no-op WITHOUT striking the anti-thrash breaker.
         Nothing eligible existed, so nothing was "ineffective"; striking would permanently disarm
@@ -2515,6 +2714,15 @@ class ContextCompressor(
         # A completed boundary proves compressibility: lift any structural no-op backoff.
         self._structural_no_op_backoff_until = 0.0
         self._verify_compaction_cleared_threshold = True
+        # A real rewrite happened: start the minimum-interval clock. A feasibility skip changed
+        # nothing, so it must not start the clock (it would defer a compaction that never ran).
+        if not feasibility_skip:
+            self._last_compression_completed_at = time.monotonic()
+        # Usage-independent loop detection. The real-usage verdict below cannot fire when the provider
+        # omits usage, so judge the rough full-request estimate (same basis as the threshold) instead.
+        # Only for a REAL rewrite: a feasibility skip changed nothing, so it says nothing about progress.
+        if not feasibility_skip:
+            self._maybe_record_usage_less_loop_verdict()
         if feasibility_skip:
             # A deliberate pre-LLM summary skip (#60451, benched model) is not a summary-quality verdict: it must
             # neither extend a fallback streak (the streak decides whether the summary model is called)
@@ -3010,6 +3218,11 @@ class ContextCompressor(
             remaining = until - time.monotonic()
             if remaining > 0:
                 return f"{label}:{remaining:.0f}"
+        if self._usage_less_loop_tripped():
+            return "usage_less_loop"
+        if not self._compression_interval_elapsed():
+            remaining = self._MIN_COMPACTION_INTERVAL_SECONDS - (time.monotonic() - self._last_compression_completed_at)
+            return f"min_interval:{max(0.0, remaining):.0f}"
         return "ineffective" if self._tripped() else None
 
     def _tripped(self) -> bool:
@@ -3042,6 +3255,34 @@ class ContextCompressor(
 
     def _automatic_compression_blocked_locally(self, *, ignore_cooldown: bool = False) -> bool:
         """Evaluate the automatic-compaction gate on in-memory state only."""
+        # Usage-independent loop detector: a proven compaction loop (no provider usage to judge it)
+        # pauses AUTOMATIC compaction for a bounded window.
+        #
+        # Two bypasses, both deliberate:
+        #   * force=True (manual /compress) never reaches this gate at all — the caller checks
+        #     `if not force` before consulting it. The user's explicit request is the escape hatch.
+        #   * ignore_cooldown=True (bypass_cooldown, provider-PROVEN overflow recovery) does reach
+        #     this gate, and it skips the loop pause: the provider has already rejected the request
+        #     for exceeding its context, so compaction must be allowed through or the turn fails.
+        if not ignore_cooldown and self._usage_less_loop_tripped():
+            if not self.quiet_mode:
+                logger.debug(
+                    "Compression deferred — usage-less compaction loop detected for %.0fs more",
+                    self._usage_less_loop_blocked_until - time.monotonic(),
+                )
+            return True
+        # Minimum interval between compactions: a repeat inside the window costs 2-4 minutes of
+        # aux-summary LLM time and cannot be needed — the transcript has not grown enough to warrant
+        # another pass. Applies to every provider. Skipped on the provider-PROVEN overflow path
+        # (ignore_cooldown), where the provider has already rejected the request and compaction must
+        # be allowed through or the turn fails.
+        if not ignore_cooldown and not self._compression_interval_elapsed():
+            if not self.quiet_mode:
+                logger.debug(
+                    "Compression deferred — minimum interval since the last compaction not elapsed (%.0fs)",
+                    self._MIN_COMPACTION_INTERVAL_SECONDS,
+                )
+            return True
         # Summary-LLM cooldown: without this every turn re-fires and re-inserts the fallback marker (#11529).
         # Manual /compress passes force=True, which clears the cooldown first. Structural no-op backoff is
         # transient (in-memory, no strikes); auto-compaction resumes when it lapses.
