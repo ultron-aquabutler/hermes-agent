@@ -184,6 +184,9 @@ class DispatchResult:
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
+    reconciled_invalid_status: list[str] = field(default_factory=list)
+    """Cards whose ``status`` was outside the workflow and were repaired by
+    :func:`reconcile_invalid_status` (e.g. a card parked on ``in_progress``)."""
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
@@ -1004,6 +1007,171 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
+
+
+def reconcile_invalid_status(conn: sqlite3.Connection) -> list[str]:
+    """Repair cards whose ``status`` is not a value the dispatcher understands.
+
+    Every status-filtered query in the dispatcher matches a literal
+    (``WHERE status = 'running'`` for the crash sweep and the per-profile
+    spawn cap, ``WHERE status = 'ready'`` for dispatch). A card parked on a
+    status outside the workflow (``in_progress``, ``cancelled``, ``pending``,
+    ``completed``) is therefore invisible to ALL of them: it cannot be
+    dispatched, cannot be completed (the transition guard requires a known
+    source status), and cannot be reclaimed. It is a permanent orphan that
+    only a raw ``SELECT`` can find.
+
+    The write paths all validate (``create_task`` checks
+    ``VALID_INITIAL_STATUSES``; the dashboard plugin whitelists status verbs
+    before writing), so the value got here from outside every validated path
+    — direct SQL, a restore from an older DB, or a tool that predates the
+    workflow. The repair is therefore a BACKSTOP, not the primary fix: it
+    exists so such a card self-heals instead of haunting the board forever.
+
+    Disposition, in order of preference:
+
+    * A card with a **completed** run is finished work → ``done``.
+    * A card with a **live** run and a live worker on this host is left
+      alone (never flip a card out from under a running worker) and retried
+      next tick.
+    * A card with an **ended** run (any outcome) whose run was not a
+      completion is re-queued to ``ready`` so the dispatcher can pick it up.
+    * A card with **no run at all** → ``blocked`` with a comment. There is no
+      evidence of work in flight and no owner to infer a disposition from;
+      auto-completing it would invent one, and auto-requeueing it would put a
+      card nobody wrote into the spawn path.
+
+    The card is moved to a status the dispatcher understands, so the
+    ``in_progress`` value stops hiding it from every view.
+    """
+    now = int(time.time())
+    valid = set(_kb.VALID_STATUSES)
+    placeholders = ",".join("?" for _ in valid)
+    # Guard the query itself: never build an IN list from an empty set.
+    if not valid:
+        return []
+    rows = conn.execute(
+        f"SELECT id, status, assignee, current_run_id, worker_pid, "
+        f"       worker_started_at, completed_at "
+        f"FROM tasks WHERE status NOT IN ({placeholders})",
+        tuple(sorted(valid)),
+    ).fetchall()
+    repaired: list[str] = []
+    for row in rows:
+        tid = row["id"]
+        bad_status = row["status"]
+        # A worker on this host that is still alive owns the card, whatever
+        # its status says. Flipping it would race the live worker.
+        pid = row["worker_pid"]
+        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+            _kb._log.debug(
+                "kanban reconcile: task %s has invalid status %r but pid %s is "
+                "alive on this host — deferring", tid, bad_status, pid,
+            )
+            continue
+        # Same protection the orphan sweep uses: an attempt whose effects may
+        # still be in flight owns the card until it is provably over.
+        from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
+        if owner_reclaim_blocked(conn, tid):
+            continue
+        with _kb.write_txn(conn):
+            # Re-read under the write lock: the status may have been fixed by
+            # an operator between the SELECT and this transaction.
+            current = conn.execute(
+                "SELECT status, current_run_id, worker_pid, worker_started_at, "
+                "       completed_at FROM tasks WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            if current is None or current["status"] in valid:
+                continue
+            if owner_reclaim_blocked(conn, tid):
+                continue
+            bad_status = current["status"]
+            run_row = None
+            if current["current_run_id"]:
+                run_row = conn.execute(
+                    "SELECT id, outcome, ended_at FROM task_runs WHERE id = ?",
+                    (current["current_run_id"],),
+                ).fetchone()
+            if run_row is None:
+                # No run row for current_run_id — fall back to the latest run
+                # so a card whose run was closed out-of-band still gets a
+                # defensible disposition.
+                run_row = conn.execute(
+                    "SELECT id, outcome, ended_at FROM task_runs "
+                    "WHERE task_id = ? ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC "
+                    "LIMIT 1",
+                    (tid,),
+                ).fetchone()
+            outcome = (run_row["outcome"] if run_row else None) or ""
+            if outcome == "completed":
+                target = "done"
+                note = (
+                    "reconciliation: card had invalid status "
+                    f"{bad_status!r} but its last run completed — marked done"
+                )
+            elif run_row is not None:
+                # A run exists and did not complete → the work is unfinished,
+                # so it goes back into the dispatch path.
+                target = "ready"
+                note = (
+                    f"reconciliation: card had invalid status {bad_status!r} — "
+                    "requeued to ready so the dispatcher can act on it"
+                )
+            else:
+                # No run at all: no evidence of work, no owner to infer from.
+                # Block rather than invent a disposition.
+                target = "blocked"
+                note = (
+                    f"reconciliation: card had invalid status {bad_status!r} and "
+                    "no run history — blocked for operator triage"
+                )
+            # ``ready`` must not be granted while a parent is unfinished, or
+            # the dispatcher spawns a child whose upstream work has not
+            # completed.
+            if target == "ready" and not _kb._parents_satisfied(conn, tid):
+                target = "todo"
+                note = (
+                    f"reconciliation: card had invalid status {bad_status!r} — "
+                    "moved to todo (parents not satisfied)"
+                )
+            payload = {
+                "reason": "invalid_status",
+                "invalid_status": bad_status,
+                "target_status": target,
+                "run_outcome": outcome or None,
+                "now": now,
+            }
+            # Close a leaked open run before the status flip so the invariant
+            # ``current_run_id IS NULL <=> run row terminal`` holds.
+            _kb._reclaim_dangling_run(
+                conn, tid, statuses=(bad_status,), now=now,
+                note=f"invalid status {bad_status!r} repaired",
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                "WHERE id = ? AND status = ?",
+                (target, tid, bad_status),
+            )
+            if cur.rowcount != 1:
+                continue
+            run_id = None
+            if current["current_run_id"]:
+                run_id = _kb._end_run(
+                    conn, tid,
+                    outcome="reclaimed", status="reclaimed",
+                    error=f"invalid status {bad_status!r} repaired",
+                    metadata=payload,
+                )
+            _kb._insert_comment(conn, tid, "dispatcher", note, now)
+            _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
+            repaired.append(tid)
+        _kb._log.info(
+            "kanban reconcile: repaired task %s with invalid status %r -> %r",
+            tid, bad_status, target,
+        )
+    return repaired
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -2616,6 +2784,7 @@ def _run_reclaim_phase(
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+        result.reconciled_invalid_status = reconcile_invalid_status(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
