@@ -453,6 +453,128 @@ def test_rate_limit_streak_trips_breaker_after_limit(
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_rate_limit_budget_trips_board_wide_for_already_ready_card(
+    kanban_home, monkeypatch,
+):
+    """A card ALREADY sitting in ``ready`` with a full streak must trip the
+    budget even though no new worker died.
+
+    The narrow version of this fix only charged the budget inside
+    ``detect_crashed_workers``, i.e. only for workers that died in the current
+    sweep. A card whose rate-limited runs were recorded earlier but which was
+    still ``ready`` (waiting out its cooldown, or never re-dispatched because
+    the quota is still exhausted) was never re-evaluated — so the budget only
+    bounded the NEXT loop and an already-over-budget card stayed dispatchable
+    forever. Live proof: ``t_778ba4e0`` (ready, streak 5) and ``t_0fefaf72``
+    (running, streak 5) sat unparked for minutes while the dispatcher ran.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rl-board-wide", assignee="a")
+
+        # Build the board state directly: N CLOSED rate_limited runs and the
+        # card sitting in ``ready`` -- exactly what the reclaim leaves behind
+        # for a card released to wait out its cooldown. Constructing it
+        # directly isolates the board-wide logic under test; the per-death
+        # accounting is covered by the sibling test.
+        now = int(time.time())
+        for i in range(_kbd._RATE_LIMIT_RETRY_LIMIT):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, outcome, started_at, "
+                "ended_at, error, metadata) VALUES (?,?,?,?,?,?,?)",
+                (
+                    tid, "rate_limited", "rate_limited",
+                    now - (i + 1) * 60, now - (i + 1) * 60 + 5,
+                    "pid X exited rate-limited (quota wall) — requeued without "
+                    "counting a failure",
+                    "{}",
+                ),
+            )
+        conn.execute(
+            "UPDATE tasks SET status='ready', worker_pid=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, consecutive_failures=0, current_run_id=NULL "
+            "WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        # The card is over budget and still dispatchable.
+        assert kb.get_task(conn, tid).status == "ready"
+        assert _kbd._rate_limit_streak(conn, tid) >= _kbd._RATE_LIMIT_RETRY_LIMIT
+
+        # The board-wide candidate sweep must find it...
+        candidates = _kbd._rate_limit_candidates(conn)
+        assert tid in candidates, (
+            f"an over-budget ready card must be a budget candidate, "
+            f"candidates={candidates}"
+        )
+
+        # ...and the budget must park it, with NO new worker death involved.
+        blocked = _kbd._account_rate_limits(conn, candidates)
+        assert tid in blocked
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"an already-over-budget card must park blocked, got {task.status}"
+        )
+        assert task.last_failure_error and "rate-limited" in task.last_failure_error
+
+        # And it stays parked.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_rate_limit_candidates_skip_terminal_and_parked_cards(
+    kanban_home, monkeypatch,
+):
+    """The board-wide sweep must only consider DISPATCHABLE cards.
+
+    A card already ``blocked``/``done``/``scheduled`` needs no budget
+    accounting — it is not going to be re-dispatched, so charging it would
+    only churn the board.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+
+        made = {}
+        for label, status in (("ready", "ready"), ("running", "running"),
+                              ("blocked", "blocked"), ("done", "done")):
+            tid = kb.create_task(conn, title=f"rl-cand-{label}", assignee="a")
+            pid = 72000 + len(made)
+            kb.claim_task(conn, tid, claimer=f"{host}:{label}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=0 WHERE id=?",
+                (pid, tid),
+            )
+            conn.commit()
+            _kbd._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+            )
+            _kbd.detect_crashed_workers(conn)
+            # Force the desired terminal status for the non-dispatchable cases.
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?", (status, tid)
+            )
+            conn.commit()
+            made[label] = tid
+
+        candidates = set(_kbd._rate_limit_candidates(conn))
+        assert made["ready"] in candidates
+        assert made["running"] in candidates
+        assert made["blocked"] not in candidates
+        assert made["done"] not in candidates
+
+
 def test_rate_limit_streak_resets_on_a_successful_run(
     kanban_home, monkeypatch,
 ):

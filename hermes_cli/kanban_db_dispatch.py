@@ -1513,6 +1513,33 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
+def _rate_limit_candidates(conn: sqlite3.Connection) -> list[str]:
+    """Every task whose latest closed runs form a rate-limit streak.
+
+    ``detect_crashed_workers`` only sees workers that died in the current
+    sweep. A card whose rate-limited runs were recorded EARLIER but which is
+    still sitting in ``ready`` (waiting out its cooldown, or simply never
+    re-dispatched because the quota is still exhausted) would otherwise never
+    be re-evaluated — the budget would only ever bound the NEXT loop, never
+    catch a card already over it.
+
+    So the budget is evaluated board-wide on every reclaim phase over the
+    tasks that are actually dispatchable: ``ready`` and ``running``. A card
+    that is already ``blocked``/``done``/``scheduled`` needs no accounting.
+
+    ``t_778ba4e0`` (ready, streak 5) and ``t_0fefaf72`` (running, streak 5)
+    were the live examples that proved the narrow version did not trip.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status IN ('ready', 'running') "
+        "AND EXISTS ("
+        "  SELECT 1 FROM task_runs r "
+        "  WHERE r.task_id = tasks.id AND r.outcome = 'rate_limited'"
+        ")"
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def _account_rate_limits(conn: sqlite3.Connection, task_ids: list) -> list[str]:
     """Charge each rate-limited requeue against a BOUNDED retry budget.
 
@@ -2595,6 +2622,14 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    # The rate-limit retry budget is evaluated BOARD-WIDE, not only against
+    # workers that died in this sweep. A card already sitting in ``ready``
+    # with a full consecutive rate-limit streak must still trip the breaker —
+    # otherwise the budget only bounds the NEXT loop and a card that is
+    # already over budget stays dispatchable forever.
+    rate_limit_candidates = _rate_limit_candidates(conn)
+    if rate_limit_candidates:
+        result.auto_blocked.extend(_account_rate_limits(conn, rate_limit_candidates))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
