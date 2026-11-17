@@ -248,6 +248,28 @@ for roughly one hour. It was repaired by commit `80f5f10ec2` (2026-11-11
 (kanban-dispatch-pump), `2a8b793667`, and `12f476f318da` — all reported
 "recovered since" with `failure_streak: 0`.
 
+The break was a *working-tree* fault, not a bad commit: every committed
+revision of this file compiles (verified across the last 30 commits), and
+the fix landed an hour after the failure window closed. The tree was
+uncompilable only between the in-flight edit and the commit. So the
+durable signal is "does the file compile right now", not "which commit
+broke it".
+
+Later cards for the same burst, each of which filed its own
+`cron_fail_2x` alert:
+
+| Job | Name | Alert | Status |
+|---|---|---|---|
+| `70ad14397f81` | kanban-dispatch-pump | `cron_fail_2x:70ad14397f81` | recovered |
+| `33b73d3ad935` | kanban-progress-cron | `cron_fail_2x:33b73d3ad935` | recovered |
+| `d03b9c4f77ff` | Curator Board Dispatch | `cron_fail_2x:d03b9c4f77ff` | recovered |
+| `8824a67d950b` | kanban-board-watcher-mcp-infra | `cron_fail_2x:8824a67d950b` | recovered |
+
+Each alert auto-cleared via `mc.alert_history.cleared_at` within ~40 min of
+the burst ending. A card filed days later for one of these alerts is a
+stale artifact — verify the alert's `cleared_at` and the job's current
+`last_status` before doing any repair work.
+
 ## Dependencies
 
 | Dependency | Used for |
