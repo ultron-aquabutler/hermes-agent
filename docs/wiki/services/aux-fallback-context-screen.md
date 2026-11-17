@@ -2,12 +2,13 @@
 
 > Wiki page for the fallback context-capacity screen.
 >
-> Status: **COMMITTED ON THE PORT BRANCH — NOT YET IN THE DEPLOYED TREE.**
+> Status: **DEPLOYED.** The screen is live in the running tree as of 2026-11-11.
 >
 > The screen was first authored in commit `57335d6bd20f2fabb1bff35fab7a46c5ec9f941e`
 > ("fix(aux): screen fallback candidates by the request they must hold"), committed
-> 2026-10-24 on `canonical-deploy`. That commit is **not an ancestor of the deployed
-> HEAD** (`a7fa4d6789`), so the screen has never been live in the running tree.
+> 2026-10-24 on `canonical-deploy`. That commit was **not an ancestor of the deployed
+> HEAD** (`a7fa4d6789`), so for six days the screen existed only on a branch and was
+> never live in the running tree — the `deploy-tree-hygiene` failure shape.
 >
 > It was re-landed as a **port** onto live HEAD by `t_a08511cd`, because the live
 > branch has moved ~17 300 commits past the fork branch the original was written
@@ -15,6 +16,9 @@
 > `agent/chat_completion_helpers.py`) have been rewritten substantially in the
 > interim. The port is not a cherry-pick: it re-homes the fix's two mechanisms
 > onto today's structure.
+>
+> Landed by: `80f5f10ec2` (the port, 2026-11-11) and `9751b155f6` (records
+> `57335d6bd2` as an ancestor of the live branch).
 >
 > Original incident: 2026-10-23 MiniMax plan-cap outage.
 > Re-land task: `t_a08511cd` (repair card for the unresolved-merge tree).
@@ -191,10 +195,19 @@ Expected when the session size is unknown (`_session_context_tokens` returns
 
 **The deployed tree does not have the screen.**
 Check the deployed tree, not a branch:
-`grep -c '_fallback_candidate_context_too_small' agent/auxiliary_client.py`.
+`grep -c '_fallback_candidate_context_too_small' agent/chat_completion_helpers.py`.
 Zero means the fix is not deployed — see the status banner above. This is the
 `deploy-tree-hygiene` failure shape: a fix committed on a branch is not a fix in
 production.
+
+> Note: the agent-level twin lives in `agent/chat_completion_helpers.py`, not in
+> `agent/auxiliary_client.py`. Grepping the latter returns 0 even on a fully
+> deployed tree, and will mislead you into thinking the fix is absent.
+>
+> The auxiliary path's own screen is `_context_too_small` in
+> `agent/auxiliary_client.py`, and it is the function that takes the
+> `required_tokens` argument:
+> `grep -c 'required_tokens' agent/auxiliary_client.py`.
 
 ## Dependencies
 
