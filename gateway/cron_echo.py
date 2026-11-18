@@ -270,10 +270,12 @@ def _split_envelope(text: Any) -> Tuple[str, str, str]:
 
     job_id = ""
     id_match = _JOB_ID_RE.search(header_tail)
+    id_from_header = False
     if id_match:
         job_id = id_match.group("job_id")
         # The "(job_id: ...)" tail is envelope furniture, not part of the name.
         header_tail = header_tail[: id_match.start()].strip()
+        id_from_header = True
     else:
         # The multi-line form puts the id on the NEXT line.
         id_match = _JOB_ID_RE.search(remainder)
@@ -284,21 +286,45 @@ def _split_envelope(text: Any) -> Tuple[str, str, str]:
     job_name = _DIVIDER_INLINE_RE.split(header_tail, maxsplit=1)[0].strip()
 
     # The payload is what sits under the divider.
-    if newline:
+    #
+    # Three physical shapes have to agree on where the payload starts:
+    #
+    #   multi-line   header \n (job_id) \n --------- \n <payload>
+    #   flattened    <header> ------------- <payload>          (all one line)
+    #   half-flat    <header> ------------- <payload> \n <footer>
+    #
+    # The half-flat shape is the trap: the header carries the job id AND the
+    # inline divider, but a newline follows the header, so a naive "the header
+    # has a newline after it, so look in the remainder" branch searches the
+    # remainder for a divider that is not there — and takes an offset that
+    # belongs to the header line. The payload then comes back empty.
+    #
+    # An empty payload is not cosmetic. The escalation exemption keys on the
+    # payload: with no payload, an envelope that carries a genuine
+    # blocked-card escalation reads as a machine ping and gets SUPPRESSED —
+    # silencing the escalation the gate exists to protect.
+    #
+    # So: find the inline divider in the HEADER LINE, wherever it physically
+    # is, and take the payload from there — falling through to the remainder
+    # only when the header has no inline divider at all.
+    inline_divider = _DIVIDER_INLINE_RE.search(header_line, len(CRON_ENVELOPE_HEADER))
+    if inline_divider is not None and inline_divider.end() <= len(header_line):
+        # The header line itself carries the divider; the payload starts right
+        # after it and may continue into the remainder.
+        payload = header_line[inline_divider.end():] + remainder
+    elif newline:
         divider = _DIVIDER_RE.search(remainder)
         if divider:
             payload = remainder[divider.end():]
-        elif id_match is not None:
-            # The flattened form with a newline after the header: the divider
-            # run follows the id on the same line.
+        elif id_match is not None and not id_from_header:
+            # The multi-line form: the id is on the next line and the divider
+            # follows it on that same line.
             flat = _DIVIDER_INLINE_RE.search(remainder, id_match.end())
             payload = remainder[flat.end():] if flat else remainder
         else:
             payload = remainder
     else:
-        # Single line: the id and the divider are both on the header line.
-        flat = _DIVIDER_INLINE_RE.search(header_line, len(CRON_ENVELOPE_HEADER))
-        payload = header_line[flat.end():] if flat else ""
+        payload = ""
 
     # The delivery layer's footer is not payload.
     footer = _FOOTER_RE.search(payload)

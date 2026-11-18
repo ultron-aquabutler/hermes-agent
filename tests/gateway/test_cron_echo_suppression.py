@@ -18,6 +18,7 @@ from gateway.cron_echo import (
     CRON_ENVELOPE_HEADER,
     CronEchoSettings,
     CronEchoSuppressor,
+    _split_envelope,
     is_cron_envelope,
     load_settings,
     parse_cron_envelope,
@@ -664,3 +665,160 @@ async def test_a_suppressed_cron_ping_does_not_consume_the_bot_loop_budget(suppr
     normal = MessageEvent(text="a real question", message_id="m2", source=_bot_source())
     await runner._hm_admit_event(normal)
     assert len(charged) == 1
+
+
+# ---------------------------------------------------------------------------
+# The HALF-flattened envelope: a flattened header with the payload on the
+# NEXT line.
+#
+# The delivery layer writes the envelope multi-line:
+#
+#     Cronjob Response: <job>
+#     (job_id: <id>)
+#     -------------
+#     <payload>
+#
+# The receiving gateway normally sees the whole thing collapsed onto one line
+# (Telegram cannot carry a raw newline in a caption). But the collapse is not
+# guaranteed to be total: a caption that Telegram renders with a line break
+# after the header, or a delivery path that flattens only the header lines,
+# yields:
+#
+#     Cronjob Response: <job> (job_id: <id>) -------------  <payload>
+#     <footer>
+#
+# In that shape `_split_envelope` took the "the header has a newline after it"
+# branch and searched for the inline divider in the REMAINDER — the text after
+# the first newline — using an offset that belonged to the HEADER line. The
+# search found nothing, so the payload came back empty.
+#
+# The consequence is not cosmetic. The escalation exemption keys on the
+# payload: with an empty payload, `is_escalation` is False, the envelope looks
+# like a machine ping, and the gate SUPPRESSES it. A genuine blocked-card
+# escalation riding inside a cron envelope would be silenced — the exact
+# failure this gate exists to prevent, inverted.
+#
+# These tests pin every physical form the envelope can arrive in.
+# ---------------------------------------------------------------------------
+
+
+def _half_flat_envelope(
+    job: str = "mac-ssh-key-watchdog",
+    job_id: str = JOB_ID,
+    payload: str = "OK",
+    separator: str = "\n",
+) -> str:
+    """A flattened header with the payload/footer after a newline."""
+    return (
+        f"{CRON_ENVELOPE_HEADER} {job} (job_id: {job_id}) -------------  {payload}"
+        f"{separator}"
+        'To stop or manage this job, send me a new message (e.g. "stop reminder").'
+    )
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_the_half_flattened_envelope_is_recognised(separator):
+    assert is_cron_envelope(_half_flat_envelope(separator=separator)) is True
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_the_half_flattened_envelope_yields_the_job_id(separator):
+    verdict = parse_cron_envelope(_half_flat_envelope(separator=separator))
+    assert verdict is not None
+    assert verdict.job_id == JOB_ID
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_the_half_flattened_envelope_yields_a_clean_job_name(separator):
+    verdict = parse_cron_envelope(_half_flat_envelope(separator=separator))
+    assert verdict is not None
+    assert verdict.job_name == "mac-ssh-key-watchdog"
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_the_half_flattened_envelope_yields_the_payload(separator):
+    """The payload must not come back empty — that is what silences an
+    escalation."""
+    verdict = parse_cron_envelope(_half_flat_envelope(payload="probe OK", separator=separator))
+    assert verdict is not None
+    assert "probe OK" in _split_envelope(
+        _half_flat_envelope(payload="probe OK", separator=separator)
+    )[2]
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_the_half_flattened_envelope_is_suppressed(separator):
+    """A plain machine ping is still suppressed in this shape."""
+    verdict = CronEchoSuppressor().verdict(_half_flat_envelope(separator=separator))
+    assert verdict.is_envelope is True
+    assert verdict.suppress is True
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_a_half_flattened_escalation_is_still_admitted(separator):
+    """THE REGRESSION: an escalation in a half-flattened envelope must reach
+    the operator. With an empty payload it was suppressed."""
+    payload = "I need help with **Patroni disk usage** -- volume full"
+    verdict = CronEchoSuppressor().verdict(_half_flat_envelope(payload=payload, separator=separator))
+    assert verdict.is_escalation is True
+    assert verdict.suppress is False
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_every_physical_form_agrees_on_the_fingerprint(separator):
+    """The fingerprint must not depend on how the envelope happened to be
+    flattened, or a job reads as changed every delivery."""
+    multi = payload_fingerprint(_envelope(payload="probe OK for mac-mini"))
+    flat = payload_fingerprint(_flat_envelope(payload="probe OK for mac-mini"))
+    half = payload_fingerprint(_half_flat_envelope(payload="probe OK for mac-mini", separator=separator))
+    assert multi == flat == half
+
+
+@pytest.mark.asyncio
+async def test_a_half_flattened_escalation_still_reaches_the_agent(suppressor):
+    """End to end through the real admission seam: a half-flattened envelope
+    carrying a blocked-card escalation must reach the agent."""
+    from gateway.platforms.event import MessageEvent
+
+    runner = _runner(suppressor)
+    event = MessageEvent(
+        text=_half_flat_envelope(
+            payload="I need help with **Patroni disk usage** -- volume full", separator="\n"
+        ),
+        message_id="m1", source=_bot_source(),
+    )
+    assert (await runner._hm_admit_event(event))[0] is event
+
+
+@pytest.mark.asyncio
+async def test_a_half_flattened_ping_still_honours_the_change_rule(tmp_path):
+    """The change rule must work in this shape too."""
+    from gateway.platforms.event import MessageEvent
+
+    runner = _runner(_change_suppressor(tmp_path))
+    first = MessageEvent(text=_half_flat_envelope(payload="probe OK for mac-mini", separator="\n"),
+                         message_id="m1", source=_bot_source())
+    assert (await runner._hm_admit_event(first))[0] is first
+
+    same = MessageEvent(text=_half_flat_envelope(payload="probe OK for mac-mini", separator="\n"),
+                        message_id="m2", source=_bot_source())
+    assert await runner._hm_admit_event(same) is None
+
+    changed = MessageEvent(
+        text=_half_flat_envelope(payload="probe FAILED for mac-mini: host key mismatch", separator="\n"),
+        message_id="m3", source=_bot_source(),
+    )
+    assert (await runner._hm_admit_event(changed))[0] is changed
+
+
+@pytest.mark.asyncio
+async def test_a_half_flattened_ping_from_a_human_still_reaches_the_agent(suppressor):
+    """Only a bot sender is silenced, in this shape too."""
+    from gateway.platforms.event import MessageEvent
+
+    runner = _runner(suppressor)
+    event = MessageEvent(
+        text=_half_flat_envelope(payload="why is this firing every four hours?", separator="\n"),
+        message_id="m1", source=_human_source(),
+    )
+    assert (await runner._hm_admit_event(event))[0] is event
