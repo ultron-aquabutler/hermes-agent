@@ -1418,6 +1418,13 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         ),
         protect_first=protect_first,
         abort_on_summary_failure=_cfg_flag(cfg, "abort_on_summary_failure", False),
+        # Opt-in: a summary failure caused by an access/quota/payment error on the auxiliary
+          # compression provider must NOT be retried on the main agent model. The main model is
+          # usually the same budget the operator is trying to protect, so the retry converts a
+          # cheap provider outage into a direct charge on the main provider. When enabled, the
+          # failure degrades to the deterministic fallback summary instead of aborting compression
+          # (#quota-leak).
+        quota_failure_degrades=_cfg_flag(cfg, "quota_failure_degrades", False),
         # Per-model threshold overrides: keys substring-matched against the model name
         # (longest match wins); {} = global threshold for all models.
         model_thresholds={
@@ -1853,6 +1860,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             api_key=getattr(agent, "api_key", ""), config_context_length=_effective_context_length,
             provider=agent.provider, api_mode=agent.api_mode,
             abort_on_summary_failure=cs.abort_on_summary_failure,
+            quota_failure_degrades=cs.quota_failure_degrades,
             max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
             threshold_tokens_cap=cs.threshold_tokens,
             proactive_prune_tokens=cs.proactive_prune_tokens,

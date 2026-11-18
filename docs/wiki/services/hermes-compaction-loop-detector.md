@@ -16,8 +16,19 @@ this page covers the loop detector and the cadence guard specifically.
 anti-thrash breaker (`_ineffective_compression_count`) reaches its verdict in
 `update_from_response()` — that is, it depends on the provider **reporting usage**.
 
-**MiniMax omits usage.** So that verdict never arrives, the breaker never trips,
-and the session compacts forever.
+**A provider that omits usage never gets that verdict**, so the breaker never
+trips and the session can compact forever.
+
+> **Correction (2026-11-18).** This page originally stated flatly that
+> *"MiniMax omits usage."* That was **wrong for the transport we actually run**.
+> MiniMax via `api_mode: anthropic_messages` reports usage normally — the
+> fleet-wide log contains **0** occurrences of `usage=unavailable`, and
+> `in=` / `out=` / `total=` are populated on every call. The premise the
+> detector was built on therefore does not hold for MiniMax, and the detector
+> is **inert** there. A compaction treadmill on a usage-reporting provider is
+> caused by something else — most often the auxiliary-provider chain charging
+> the main model, or a trigger far below the model's real window. See
+> *Auxiliary-provider quota failures bill the main model* under Troubleshooting.
 
 Observed on the Vision/default profile: session `20261110_162723_dc65d8e8`
 reached **56 compactions in one session**, roughly one every **9–11 minutes**. The
@@ -174,13 +185,94 @@ provider-confirmed path can produce it.
 
 ## Configuration
 
-No new configuration keys. Both guards are unconditional, and their constants
-are class attributes on `ContextCompressor`.
+No new configuration keys for the two guards. Both are unconditional, and their
+constants are class attributes on `ContextCompressor`.
 
 The only related knob remains `compression.threshold_tokens` (the line the
 detector compares against) and `compression.enabled`.
 
+### `compression.quota_failure_degrades` (added 2026-11-18)
+
+Opt-in, default `false`. See *Auxiliary-provider quota failures* under
+Troubleshooting for what it changes.
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `compression.quota_failure_degrades` | bool | `false` | On an access/quota/payment error from the **auxiliary** compression provider: do **not** retry the summary on the main agent model, and do **not** abort compression. The failure degrades to the deterministic fallback summary and a cooldown is recorded. |
+
+It is read with the same legacy flag semantics as the other `compression`
+booleans (`_cfg_flag`): `"true"`, `"1"` and `"yes"` are true; anything else is
+false.
+
+### `compression.threshold_tokens`
+
+The compaction trigger. It is clamped to the model's context window at
+apply-time (`_effective_threshold_cap` → `min(cap, context_length)`), so a
+threshold above the window is safe by construction — the effective trigger
+follows the model down.
+
 ## Troubleshooting
+
+### Auxiliary-provider quota failures bill the main model
+
+**Symptom.** A session compacts every few minutes even though the context
+shrinks on each pass, and the provider bill is much larger than the
+compaction count suggests. The agent log shows:
+
+```
+credential pool copilot: no available entries (all exhausted or empty)
+Auxiliary: marking copilot unhealthy for 600s (payment / credit error)
+Auxiliary compression: payment error on copilot — falling back to main agent model minimax (MiniMax-M3)
+```
+
+**Cause.** The auxiliary compression provider and the main agent model are
+usually two ends of the **same budget**. When the auxiliary provider runs out
+of credit, the historical behaviour was:
+
+1. `_fallback_to_main_for_compression()` cleared `summary_model` and retried the
+   summary on the main model — a direct charge on the provider being protected.
+2. The cleared `summary_model` was **never restored**, so every later
+   compaction in that session also went to the main model, even after the
+   auxiliary provider recovered.
+3. The same error set `_last_summary_auth_failure`, which makes `compress()`
+   **abort**. The session then grows past the threshold again and compacts
+   again, repeating the cycle.
+
+**Fix.** Set `compression.quota_failure_degrades: true`. With it on:
+
+- the main model is **not** charged for the summary;
+- compression is **not** aborted — it degrades to the deterministic fallback
+  summary (`_fallback_summary_for_window`);
+- a failure cooldown is recorded, so the auxiliary provider is retried after it
+  recovers;
+- the configured auxiliary summary model is **restored** once a summary
+  succeeds, so the session stops riding the main model.
+
+**Verify.** The agent log should show:
+
+```
+Context compression: auxiliary summary failed with an access/quota error;
+degrading to the deterministic fallback summary without charging the main model
+(compression.quota_failure_degrades=true).
+```
+
+and, once the provider recovers:
+
+```
+Context compression: restored the configured auxiliary summary model '<model>'
+after a successful summary.
+```
+
+**Note on the usage-less detector.** The detector described in this page is
+*inert* for a provider that reports usage. MiniMax via
+`api_mode: anthropic_messages` **does** report usage (0 occurrences of
+`usage=unavailable` in the fleet-wide log), so `note_usage_less_response()`
+never fires and `_maybe_record_usage_less_loop_verdict()` returns early. If the
+provider reports usage, the compaction treadmill is **not** a usage-less loop —
+check the auxiliary-provider chain above, and check the trigger itself:
+a `threshold_tokens` far below the model's real window turns every ordinary
+context growth into a compaction, and a protected tail plus tool schemas that
+exceed the trigger means compaction *cannot* land under it.
 
 ### A session compacts repeatedly but the context does not shrink
 
