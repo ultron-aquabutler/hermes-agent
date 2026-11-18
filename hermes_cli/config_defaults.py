@@ -647,6 +647,13 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
+        # When True, an access/quota/payment error from the auxiliary compression provider does
+        # NOT retry the summary on the main agent model and does NOT abort compression. The main
+        # model is usually the same budget the operator is protecting, so the retry turns a cheap
+        # provider outage into a direct charge on the protected provider; the failure degrades to
+        # the deterministic fallback summary instead, and the configured auxiliary model is
+        # restored once the provider answers again. Off by default (unchanged behaviour).
+        "quota_failure_degrades": False,
         # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
         # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
         # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
@@ -1891,6 +1898,13 @@ DEFAULT_CONFIG = {
         # Assignee when the orchestrator can't match one to an installed profile; "" = default
         # profile. A task never ends up with assignee=None.
         "default_assignee": "",
+        # No-progress detector for a dispatcher-owned kanban worker: the number of
+        # consecutive iterations that neither write durable state nor call a board
+        # tool before the worker is nudged toward a terminal board call, and the
+        # second consecutive breach after that nudge stops the turn. 0 disables it.
+        # Measured against the 2026-11-18 burn: workers made 244 rounds with only
+        # 9 distinct tools, 80% read-only, and never called a terminal board tool.
+        "no_progress_streak_limit": 12,
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.

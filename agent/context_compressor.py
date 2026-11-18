@@ -3009,6 +3009,7 @@ class ContextCompressor(
         summary_target_ratio: float = 0.20, quiet_mode: bool = False, summary_model_override: str | None = None,
         base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "",
         api_mode: str = "", abort_on_summary_failure: bool = False, max_tokens: int | None = None,
+        quota_failure_degrades: bool = False,
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
@@ -3056,6 +3057,10 @@ class ContextCompressor(
         # non-numeric, <=0) means "no reservation" so the threshold arithmetic never sees a non-int (e.g. a
         # test MagicMock).
         self.abort_on_summary_failure = abort_on_summary_failure
+        # When True, an access/quota/payment failure on the auxiliary compression provider does NOT
+        # retry on the main agent model (the main model is usually the budget being protected) and
+        # does NOT abort compression; the compressor degrades to the deterministic fallback summary.
+        self.quota_failure_degrades = quota_failure_degrades
 
         # Micro-compaction is OFF by default: each pass breaks the prompt-cache prefix every turn.
         self._micro_compact_enabled = False
@@ -3091,6 +3096,12 @@ class ContextCompressor(
         self.last_prompt_tokens = self.last_completion_tokens = 0
         self._reset_real_usage_pairing()
         self.summary_model = summary_model_override or ""
+        # The configured auxiliary summary model, remembered so a temporary fallback to the main
+        # model does not pin the compressor to the main model for the rest of the session. The
+        # auxiliary provider's quota is the thing that actually recovers; keeping the pin would
+        # mean every later compaction is billed to the main model even after the auxiliary
+        # provider is healthy again (#quota-leak).
+        self._configured_summary_model = self.summary_model
         self._session_db: Any = None
         self._session_id: str = ""
         # Per-session state (also reset by /new, /reset and session end).
@@ -4182,6 +4193,18 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self._summary_model_fallen_back = False
         self._last_summary_error = None
         self._clear_terminal_summary_failures()
+        # The provider answered again: restore the configured auxiliary summary model so the
+        # compressor stops using the main model. A temporary fallback (for example an auxiliary
+        # provider that ran out of quota) must not pin every later compaction to the main model
+        # for the rest of the session (#quota-leak).
+        configured = getattr(self, "_configured_summary_model", "") or ""
+        if configured and not self.summary_model:
+            self.summary_model = configured
+            self._summary_model_fallen_back = False
+            logger.info(
+                "Context compression: restored the configured auxiliary summary model '%s' after a "
+                "successful summary.", configured,
+            )
         # The provider answered a summary again: the sustained-overload budget restarts (#123167).
         self._reset_consecutive_overload_aborts()
 
@@ -4347,9 +4370,19 @@ Write only the summary body. Do not include any preamble or prefix."""
         verdict = classify_api_error(e)
         kind = _classify_summary_failure(e, verdict)
         access_error = _is_summary_access_or_quota_error(e, verdict)
+        # ``quota_failure_degrades`` (compression.quota_failure_degrades) changes what an
+        # access/quota/payment failure on the auxiliary compression provider means:
+        #   * it must NOT retry on the main agent model — the main model is normally the very
+        #     budget the operator is trying to protect, so the "one-shot main-model retry" turns a
+        #     cheap provider outage into a direct charge on the protected provider (#quota-leak);
+        #   * it must NOT abort compression — aborting freezes the session and the context keeps
+        #     growing until it compacts again, repeating the cycle every few minutes.
+        # Instead the failure degrades to the deterministic fallback summary and a cooldown is
+        # recorded so the auxiliary provider is retried once it recovers.
+        degrade_quota_failure = bool(access_error and getattr(self, "quota_failure_degrades", False))
         # Auth/permission/quota failures are not retryable: flag so compress() preserves the
         # session. A distinct summary_model still gets the one-shot main-model fallback.
-        if access_error:
+        if access_error and not degrade_quota_failure:
             # Field name kept for caller compatibility; now covers the whole access/quota class.
             self._last_summary_auth_failure = True
         if kind.json_decode and not kind.model_not_found and not kind.timeout:
@@ -4366,10 +4399,30 @@ Write only the summary body. Do not include any preamble or prefix."""
         _route_model = str(
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
-        if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+        if (
+            _route_model
+            and _route_model != self.model
+            and not getattr(self, "_summary_model_fallen_back", False)
+            and not degrade_quota_failure
+        ):
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+
+        if degrade_quota_failure:
+            # Auxiliary provider is out of credit/quota: do not bill the main model, and do not
+            # abort. Record a cooldown so the next compression pass waits for the provider to
+            # recover, then let compress() fall through to the deterministic summary.
+            err_text = _short_error_text(e)
+            self._record_compression_failure_cooldown(_SUMMARY_FAILURE_COOLDOWN_SECONDS, err_text)
+            self._last_summary_error = err_text
+            logger.warning(
+                "Context compression: auxiliary summary failed with an access/quota error; "
+                "degrading to the deterministic fallback summary without charging the main model "
+                "(compression.quota_failure_degrades=true). provider=%s summary_model=%s err=%s",
+                self.provider or "auto", self.summary_model or "(main)", err_text,
+            )
+            return None
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
         # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung; truncation
