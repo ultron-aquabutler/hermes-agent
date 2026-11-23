@@ -51,6 +51,20 @@ def _ended_run_id(conn, tid):
 AUTH_ERROR = "HTTP 401 unauthorized: invalid api key from provider"
 
 
+def _end_run_at(conn, run_id, ts):
+    """End a run at ``ts``.
+
+    Both ``started_at`` and ``ended_at`` are set: the guard's auth cooldown
+    anchors on ``started_at`` (when the attempt that produced the auth text
+    began), falling back to ``ended_at`` for legacy rows.
+    """
+    conn.execute(
+        "UPDATE task_runs SET outcome='crashed', status='failed', "
+        "started_at=?, ended_at=? WHERE id=?",
+        (ts, ts, run_id),
+    )
+
+
 def _seed_auth_failure(conn, tid, ended_at, error_text=AUTH_ERROR):
     """Leave a task in ``ready`` carrying an auth-flavoured failure stamp."""
     conn.execute(
@@ -69,10 +83,7 @@ def test_auth_blocker_parks_within_cooldown(kanban_home, monkeypatch):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="auth-in-window", assignee="a")
         run_id = _ended_run_id(conn, tid)
-        conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
-            (now, run_id),
-        )
+        _end_run_at(conn, run_id, now)
         _seed_auth_failure(conn, tid, now)
 
         monkeypatch.setattr(kbd.time, "time", lambda: now + 100)
@@ -91,10 +102,7 @@ def test_auth_blocker_cooldown_elapses_and_allows_reprobe(kanban_home, monkeypat
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="auth-out-window", assignee="a")
         run_id = _ended_run_id(conn, tid)
-        conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
-            (now, run_id),
-        )
+        _end_run_at(conn, run_id, now)
         _seed_auth_failure(conn, tid, now)
 
         # 29 minutes in -> still parked.
@@ -137,13 +145,49 @@ def test_auth_block_cooldown_disabled_allows_immediate_reprobe(kanban_home, monk
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="auth-disabled", assignee="a")
         run_id = _ended_run_id(conn, tid)
-        conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? WHERE id=?",
-            (now, run_id),
-        )
+        _end_run_at(conn, run_id, now)
         _seed_auth_failure(conn, tid, now)
 
         monkeypatch.setattr(kbd.time, "time", lambda: now + 1)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_auth_block_cooldown_anchors_on_run_start_not_run_end(kanban_home, monkeypatch):
+    """The cooldown anchors on when the attempt STARTED, not when it ended.
+
+    Regression guard for the anchor choice. ``ended_at`` records when a run
+    finished, which for a long or replayed run can be arbitrarily old while
+    the provider refusal it recorded is fresh. Anchoring on ``ended_at``
+    silently expires the cooldown and lets a brand-new auth failure re-probe
+    immediately — which is how three pre-existing respawn-guard tests broke
+    when the anchor was first put on ``ended_at``.
+
+    ``started_at`` is when the attempt (and hence the provider call that
+    produced the auth text) began: the honest answer to "how long ago did the
+    provider last refuse us".
+    """
+    monkeypatch.setenv("HERMES_KANBAN_AUTH_BLOCK_SECONDS", "1800")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="auth-stale-ended-at", assignee="a")
+        run_id = _ended_run_id(conn, tid)
+        # The attempt began at ``now`` but the run did not END until a day
+        # later — so ``ended_at`` is stale relative to the failure.
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='failed', "
+            "started_at=?, ended_at=? WHERE id=?",
+            (now, now + 86400, run_id),
+        )
+        _seed_auth_failure(conn, tid, now)
+
+        # One minute in: still parked. The failure is one minute old, and the
+        # cooldown must be measured from the attempt, not from a stale end.
+        monkeypatch.setattr(kbd.time, "time", lambda: now + 60)
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+        # 31 minutes in: the cooldown has genuinely elapsed.
+        monkeypatch.setattr(kbd.time, "time", lambda: now + 31 * 60)
         assert kbd.check_respawn_guard(conn, tid) is None
 
 

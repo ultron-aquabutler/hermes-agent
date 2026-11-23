@@ -2091,7 +2091,7 @@ def check_respawn_guard(
     #    reaches the breaker.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "SELECT outcome, started_at, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
@@ -2186,13 +2186,25 @@ def check_respawn_guard(
         # dispatcher writes that column in the same transaction that ends the run,
         # so the latest ended run is the right anchor for a real failure.
         #
-        # NO ended run means the stamp did not come from a completed run: a legacy
+        # The anchor is the run's ``started_at`` — when the attempt that produced
+        # the auth text BEGAN — not its ``ended_at``. ``ended_at`` is when the run
+        # finished, which for a long or replayed run can be arbitrarily old while
+        # the provider refusal it recorded is fresh; anchoring there silently
+        # expires the cooldown and lets a brand-new auth failure re-probe
+        # immediately (the failure mode this bound exists to prevent). Legacy
+        # rows with no ``started_at`` fall back to ``ended_at``.
+        #
+        # NO run at all means the stamp did not come from a completed run: a legacy
         # row, or a hand-written/imported ``last_failure_error`` with no run
         # behind it. There is nothing to date the cooldown against, and an
         # undated auth stamp is indistinguishable from a dead credential — so it
         # keeps parking, exactly as before this bound existed. Returning None here
         # instead would turn a genuine 401 into a hot retry loop.
-        anchor = _kb._to_epoch(latest_run["ended_at"]) if latest_run is not None else None
+        anchor = None
+        if latest_run is not None:
+            anchor = _kb._to_epoch(latest_run["started_at"])
+            if anchor is None:
+                anchor = _kb._to_epoch(latest_run["ended_at"])
         if anchor is None:
             return "blocker_auth"
         if (now - anchor) < auth_block:

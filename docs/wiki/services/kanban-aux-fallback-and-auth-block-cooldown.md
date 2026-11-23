@@ -127,15 +127,25 @@ Two things did **not** change, and both are load-bearing:
 So the ladder gained exactly one new capability: an explicit-provider task may
 now use the DECLARED `fallback_providers` chain. Nothing else moved.
 
-### The cooldown anchors on the run that stamped the failure
+### The cooldown anchors on the attempt that produced the failure
 
-The cooldown is keyed to the `ended_at` of the **latest ended run** — the run
-whose end-of-run transaction wrote `last_failure_error`. If there is **no**
-ended run (a legacy row, or a hand-written/imported `last_failure_error`),
-there is nothing to date the cooldown against, and an undated auth stamp is
-indistinguishable from a dead credential — so it **keeps parking**, exactly as
-before this bound existed. Returning `None` there would turn a genuine 401 into
-a hot retry loop.
+The cooldown is keyed to the `started_at` of the **latest ended run** — the run
+whose end-of-run transaction wrote `last_failure_error`. `started_at` is when
+the attempt *began*, which is the honest answer to "how long ago did the
+provider last refuse us".
+
+It deliberately does **not** anchor on `ended_at`. `ended_at` is when the run
+*finished*, and for a long or replayed run that can be arbitrarily old while
+the provider refusal it recorded is fresh. Anchoring there silently expires
+the cooldown and lets a brand-new auth failure re-probe immediately — the
+exact failure mode this bound exists to prevent. Legacy rows with no
+`started_at` fall back to `ended_at`.
+
+If there is **no** ended run at all (a legacy row, or a hand-written/imported
+`last_failure_error`), there is nothing to date the cooldown against, and an
+undated auth stamp is indistinguishable from a dead credential — so it **keeps
+parking**, exactly as before this bound existed. Returning `None` there would
+turn a genuine 401 into a hot retry loop.
 
 The separate `consecutive_failures` breaker remains the durable safety net: a
 credential that is genuinely dead still ends up parked for a human. This bound
@@ -321,3 +331,4 @@ sqlite3 -header -column \
 | Date | Change | Commit |
 |---|---|---|
 | 2026-11-23 | Auxiliary ladder now honours the DECLARED `fallback_providers` chain for an explicit-provider auth failure, and the refusal message distinguishes "nothing declared" from "declared but exhausted". `blocker_auth` given a bounded cooldown (`DEFAULT_AUTH_BLOCK_SECONDS`, 30 min) so a provider outage cannot park the ready queue forever. Fixes the 2026-11-23 minimax outage (0 workers spawned for ~2h45m, 12:49→15:01). | `t_498b52ce` |
+| 2026-11-23 | The cooldown anchor moved from the run's `ended_at` to its `started_at` (with `ended_at` as the legacy fallback). `ended_at` can be arbitrarily old for a long or replayed run while the provider refusal it recorded is fresh, which silently expired the cooldown and let a brand-new auth failure re-probe immediately. | `t_498b52ce` |
