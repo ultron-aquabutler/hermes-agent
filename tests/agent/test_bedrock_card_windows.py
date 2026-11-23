@@ -71,7 +71,13 @@ class TestCardSizedOpenAIModels:
         assert not [m for m in BEDROCK_OPENAI_RESPONSES_MODEL_IDS if m not in BEDROCK_CONTEXT_LENGTHS]
 
     def test_terra_compression_trigger_uses_the_card_window(self):
-        """Through the real resolver and compressor with no live probe: main compressed at 96,000."""
+        """Through the real resolver and compressor with no live probe: main compressed at 96,000.
+
+        The card window sizes the CONTEXT (1,050,000), and the ratio trigger on it would be
+        525,000 -- but the fleet ceiling clamps the trigger to 120,000, so the card window
+        shows up in the context length, not in the trigger.
+        """
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
         from agent.context_compressor import ContextCompressor
         compressor = ContextCompressor(
             model="us.openai.gpt-6.1-terra", provider="bedrock", threshold_percent=0.5,
@@ -79,7 +85,7 @@ class TestCardSizedOpenAIModels:
         )
         with patch("agent.bedrock_adapter.probe_bedrock_context_length", return_value=None):
             assert compressor.context_length == TERRA_CARD_WINDOW
-            assert compressor.threshold_tokens == TERRA_CARD_WINDOW // 2
+            assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 class TestThirdPartyCardRows:

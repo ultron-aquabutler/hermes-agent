@@ -1153,7 +1153,11 @@ class TestBedrockContextLength:
     def test_gpt61_sol_profile_compression_trigger_honours_the_configured_cap(self):
         """Field report: a 400K-capped session on us.openai.gpt-6.1-sol compressed at 96,000
         (128K fallback x the small-window 75% floor). Through the real resolver and compressor,
-        with the live probe unavailable, the trigger is the operator's cap."""
+        with the live probe unavailable, the trigger is the operator's cap -- clamped by the
+        fleet ceiling, because a cap may only TIGHTEN the trigger and never raise it above
+        120,000. A configured cap below the ceiling is still honoured exactly.
+        """
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
         from agent.context_compressor import ContextCompressor
         compressor = ContextCompressor(
             model="us.openai.gpt-6.1-sol", provider="bedrock", threshold_percent=0.5,
@@ -1162,7 +1166,8 @@ class TestBedrockContextLength:
         )
         with patch("agent.bedrock_adapter.probe_bedrock_context_length", return_value=None):
             assert compressor.context_length == 1_000_000
-            assert compressor.threshold_tokens == 400_000
+            # 400,000 is ABOVE the ceiling, so it is clamped down to it.
+            assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
     def test_no_region_skips_probe_uses_table(self):

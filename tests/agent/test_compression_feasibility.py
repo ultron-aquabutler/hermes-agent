@@ -14,6 +14,7 @@ import pytest
 
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
+from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +69,13 @@ def _make_agent(
 
 @pytest.mark.parametrize("main_context,aux_context", [(1_000_000, 512_000), (400_000, 80_000)])
 def test_aux_sync_keeps_lean_tail_policy(main_context, aux_context):
-    """Lowering only the trigger must not change window-relative retention."""
+    """Lowering only the trigger must not change window-relative retention.
+
+    The trigger the aux sync installs is ``min(aux_context, fleet ceiling)``: the fleet
+    ceiling (agent/compression_fleet_ceiling.py) is a CODE-level floor on the trigger, and
+    config may only tighten it further. An aux window above the ceiling (512,000) is clamped
+    to it; one below it (80,000) is honoured exactly.
+    """
     agent = _make_agent(main_context=main_context)
     compressor = agent.context_compressor = ContextCompressor(
         "test-main-model", config_context_length=main_context,
@@ -80,7 +87,7 @@ def test_aux_sync_keeps_lean_tail_policy(main_context, aux_context):
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(client, "aux")), \
          patch("agent.model_metadata.get_model_context_length", return_value=aux_context):
         agent._check_compression_model_feasibility()
-        assert compressor.threshold_tokens == aux_context
+        assert compressor.threshold_tokens == min(aux_context, FLEET_COMPRESSION_CEILING_TOKENS)
         assert compressor.tail_token_budget == before
         # Repeated feasibility and subsequent model recalibration retain policy.
         agent._check_compression_model_feasibility()
@@ -90,7 +97,17 @@ def test_aux_sync_keeps_lean_tail_policy(main_context, aux_context):
 
 
 def test_aux_sync_legacy_tail_follows_lowered_threshold():
-    """Explicit legacy retention follows the current trigger, not its old cache."""
+    """Explicit legacy retention follows the current trigger, not its old cache.
+
+    The trigger the aux sync installs is clamped to the fleet ceiling, so a 512,000 aux
+    window on a 1M main window installs 120,000 -- not the 512,000 the window alone would
+    imply. The legacy tail then tracks THAT trigger.
+
+    The tail does not MOVE here, and that is the ceiling, not a stale cache: the ceiling had
+    already bound the trigger to 120,000 before the sync, so there is nothing left for the
+    sync to lower. The property under test -- the tail follows the CURRENT trigger -- is
+    asserted directly against the trigger's own value.
+    """
     agent = _make_agent(main_context=1_000_000)
     compressor = agent.context_compressor = ContextCompressor(
         "test-main-model", config_context_length=1_000_000,
@@ -102,9 +119,12 @@ def test_aux_sync_legacy_tail_follows_lowered_threshold():
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(client, "aux")), \
          patch("agent.model_metadata.get_model_context_length", return_value=512_000):
         agent._check_compression_model_feasibility()
-    assert compressor.threshold_tokens == 512_000
-    assert compressor.tail_token_budget < before
+    assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
+    # The tail tracks the CURRENT trigger -- the property this test exists for.
     assert compressor.tail_token_budget == int(compressor.threshold_tokens * compressor.summary_target_ratio)
+    # And it is not a stale cache: the ceiling had already bound the trigger before the sync,
+    # so the tail legitimately lands on the same value it had before.
+    assert compressor.tail_token_budget == before
 
 
 def test_fallback_activation_on_never_probed_session_stays_lazy():
@@ -244,7 +264,7 @@ def test_a_moved_compression_route_reprobes_a_warm_agent_and_drops_the_old_ceili
             ensure_compression_feasibility_checked(agent, 200_000)
     assert aux_client.call_count == 2
     assert compressor._aux_context_ceiling is None
-    assert compressor.threshold_tokens == 750_000
+    assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 @pytest.mark.parametrize("first_probe", ["main_model_switch", "first_compaction"])
@@ -275,7 +295,7 @@ def test_a_route_change_reprobes_after_any_path_that_latched_the_probe(first_pro
             ensure_compression_feasibility_checked(agent, 200_000)
     assert aux_client.call_count == 2
     assert compressor._aux_context_ceiling is None
-    assert compressor.threshold_tokens == 750_000
+    assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 def test_a_moved_providers_entry_reprobes_a_warm_agent():
@@ -328,7 +348,7 @@ def test_a_replacement_summariser_is_measured_with_its_own_context_length_pin():
         with session_auxiliary_scope(new):
             ensure_compression_feasibility_checked(agent, 200_000)
     assert compressor._aux_context_ceiling is None
-    assert compressor.threshold_tokens == 750_000
+    assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 def test_an_unreadable_compression_route_never_stops_the_main_request():
@@ -395,7 +415,7 @@ def test_a_bypass_session_measures_with_the_entries_from_agent_start(monkeypatch
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(client, "small")), \
          session_auxiliary_scope({"compression": {}}):
         check_compression_model_feasibility(agent)
-    assert compressor.threshold_tokens == 750_000
+    assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 # ── Core warning logic ──────────────────────────────────────────────
@@ -689,7 +709,12 @@ def _warm_agent_on(home, entries):
 
 def test_a_changed_provider_context_pin_reprobes_a_warm_agent(monkeypatch, tmp_path):
     """Only the provider entry's per-model ``context_length`` changes (900K to 80K): the next request
-    re-probes and the trigger lands on the new pin, through the same path a turn takes."""
+    re-probes and the trigger lands on the new pin, through the same path a turn takes.
+
+    Both ends of the two-sided contract show up here: a 900K pin on a 1M window would put the
+    ratio trigger at 750,000, but the fleet ceiling clamps it to 120,000; a pin BELOW the
+    ceiling (80,000) is honoured exactly.
+    """
     import json
     from agent.conversation_compression_feasibility import ensure_compression_feasibility_checked
     home = tmp_path / "home"
@@ -701,7 +726,7 @@ def test_a_changed_provider_context_pin_reprobes_a_warm_agent(monkeypatch, tmp_p
     client = MagicMock(base_url="http://gateway.invalid/v1", api_key="test-key")
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(client, "small")):
         ensure_compression_feasibility_checked(agent, 200_000)
-        assert agent.context_compressor.threshold_tokens == 750_000
+        assert agent.context_compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
         entry["models"]["small"]["context_length"] = 80_000
         (home / "config.yaml").write_text(json.dumps({
             "auxiliary": {"compression": {"provider": "work-gateway", "model": "small"}},
@@ -728,7 +753,7 @@ def test_a_changed_provider_pin_reprobes_a_task_that_sets_its_own_url(monkeypatc
     client = MagicMock(base_url=url, api_key="test-key")
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(client, "small")):
         ensure_compression_feasibility_checked(agent, 200_000)
-        assert agent.context_compressor.threshold_tokens == 750_000
+        assert agent.context_compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
         entry["models"]["small"]["context_length"] = 80_000
         (home / "config.yaml").write_text(json.dumps({"auxiliary": {"compression": task}, "custom_providers": [entry]}))
         ensure_compression_feasibility_checked(agent, 200_000)
