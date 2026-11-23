@@ -13,7 +13,7 @@ every single call, no matter how often you compact it.
 
 Written 2026-11-16, landed 2026-11-23 (Hermes commits `3a799be276` — the port —
 `0b668a5881` and `ffe089f6a7` — the threshold-cap test alignments —
-`23c7357482` — the docs — on `canonical-deploy-live`, kanban
+`23c7357482`, `b11bfe6b21` and `c24f5fca6a` — the docs — on `canonical-deploy-live`, kanban
 `t_4770e5b3`; originating card `t_6abebfd8`). Obsidian mirror:
 `Homelab/10-Services/Services/hermes-compaction-fleet-ceiling.md` — the vault copy is the
 canonical published page and carries the same content.
