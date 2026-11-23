@@ -2867,9 +2867,22 @@ class ContextCompressor(
         return base_percent, effective_percent, threshold
 
     def _effective_threshold_cap(self, context_length: int) -> int | None:
-        """The configured ``threshold_tokens`` cap clamped to the window; None when no cap is configured."""
+        """The effective absolute cap on the trigger: the configured ``threshold_tokens`` clamped to
+        the window AND to the fleet ceiling. Never None — the fleet ceiling always applies.
+
+        The ceiling is a code-level floor on the trigger (see
+        ``agent/compression_fleet_ceiling.py``): a 1M-window model with the ratio trigger at 0.5
+        would otherwise compact at ~500K tokens, which no long session ever reached, so it never
+        compacted and every call re-read the whole context from cache. A configured cap may only
+        TIGHTEN the trigger below the ceiling; it can never raise it above.
+        """
+        from agent.compression_fleet_ceiling import fleet_compression_ceiling
+
+        ceiling = fleet_compression_ceiling(context_length)
         cap = self.threshold_tokens_cap
-        return min(cap, context_length) if cap is not None and cap > 0 else None
+        if cap is None or cap <= 0:
+            return ceiling
+        return min(int(cap), int(context_length) if context_length > 0 else int(cap), int(ceiling))
 
     def preview_threshold_tokens(self, model: str, context_length: int, provider: str = "") -> int:
         """The trigger ``update_model`` would install, without mutating state."""

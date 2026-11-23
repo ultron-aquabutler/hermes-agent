@@ -573,10 +573,14 @@ DEFAULT_CONFIG = {
         # are floored at 0.75 (raise-only) so compaction doesn't fire with half the window free; set
         # above 0.75 to override the floor.
         "threshold": 0.50,
-        # threshold_tokens: optional absolute token cap — when set, compression triggers at the
+        # threshold_tokens: absolute token cap — when set, compression triggers at the
         # lower of the ratio threshold and this count. Clamped to the model's context length.
-        # Off by default: no single count suits windows from 64K to 1M+, so the ratio decides.
-        "threshold_tokens": None,
+        # Defaults to the fleet ceiling (120K): the ratio alone decides on a 1M-window model
+        # (~500K), which no long session ever reached, so it never compacted and every call
+        # re-read the whole context from cache (84% of fleet spend). The code-level ceiling
+        # in agent/compression_fleet_ceiling.py enforces the same bound, so this default
+        # cannot be raised above it by config; set a LOWER value to compact earlier.
+        "threshold_tokens": 120000,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
@@ -615,8 +619,29 @@ DEFAULT_CONFIG = {
         "micro_compact_every_n_turns": 1,
         # Once the rolling summary exceeds this many tokens, the next pass re-summarizes it.
         "micro_compact_defrag_threshold_tokens": 2000,
-        # Gateway session-hygiene force-compress threshold, by message count.
-        "hygiene_hard_message_limit": 5000,
+        # Gateway session-hygiene force-compress threshold, by message count. The safety valve for
+        # the "no token data" case (a disconnect leaves no token count, so the 85% token trigger
+        # cannot fire). 400 matches the live fleet: 5000 let an unbounded session accumulate until
+        # its context was hundreds of thousands of tokens.
+        "hygiene_hard_message_limit": 400,
+        # Runaway routed-session guard: max age of ONE live context segment, in hours. A segment
+        # is bounded by the LIVE TRANSCRIPT (the rows with messages.active=1), not by
+        # sessions.started_at: the default in-place compression keeps the session id and never
+        # rewrites started_at, so started_at measures the CONVERSATION's age instead. 336h = 14
+        # days. Sized against the live fleet (segment age median 1,730h, max 3,898h over 11,262
+        # measured segments) — long-lived routes are normal here, so age alone is never the trip
+        # signal; it is ANDed with runaway_max_live_chars. Set 0 to disable this half.
+        "runaway_max_segment_hours": 336,
+        # Same guard, by live-transcript size in characters. ~800,000 chars is roughly 200K tokens
+        # of transcript; the live runaway's segment held 162K-659K chars while the healthy
+        # population's 95th percentile is 477K. ANDed with runaway_max_segment_hours — a segment
+        # trips only when it is BOTH oversized AND long-lived. Set 0 to disable this half.
+        "runaway_max_live_chars": 800000,
+        # Same guard, by message count in the live segment. A last-resort backstop, not a routine
+        # cap: the live runaway segment held 242-465 active rows, and a legitimate long Kanban
+        # session can run into the thousands before compaction rotates the transcript. Set 0 to
+        # disable.
+        "runaway_max_session_messages": 5000,
         # Max seconds the gateway waits for pre-agent hygiene compression WITHOUT forward progress.
         # Inactivity budget: a slow model still streaming tokens extends the wait.
         "hygiene_timeout_seconds": 30,

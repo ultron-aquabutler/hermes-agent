@@ -146,8 +146,58 @@ class SessionLifecycleMixin:
             return False
 
     def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
-        """Only explicit suspension replaces a routed conversation; time never does."""
-        return "suspended" if entry.suspended else None
+        """The reset reason that replaces a routed conversation, or None to keep it.
+
+        **Only explicit suspension replaces a routed conversation; time never does.** That
+        invariant still holds for ordinary age — this method does not reinterpret it. The
+        runaway guard below is a SEPARATE, explicitly-configured rule with its own reset reason
+        (``runaway_limit``): it exists because a route whose live transcript stays huge keeps
+        re-reading that transcript from the prompt cache on every turn (the live friday Telegram
+        DM route reached 484.2M cache-read tokens, ~$30/day), which no amount of compaction
+        fixes while the transcript itself stays large.
+
+        The guard is deliberately narrow (see ``gateway/runaway_session_guard.py``): it trips
+        only when the live transcript is BOTH oversized AND long-lived, and a lookup failure
+        never rotates a live conversation.
+        """
+        if entry.suspended:
+            return "suspended"
+        return self._runaway_reset_reason(entry)
+
+    def _runaway_reset_reason(self, entry: SessionEntry) -> Optional[str]:
+        """``runaway_limit`` when this route's live context segment has run away, else None."""
+        from gateway.runaway_session_guard import RunawayLimits, check_route_runaway
+
+        try:
+            # ``load_config()`` merges DEFAULT_CONFIG, so a key that lives only in the defaults
+            # (the runaway_* knobs) is still read. The gateway's own ``_load_gateway_config()``
+            # deliberately does NOT merge defaults (it is the presence-sensitive reader), so it
+            # would report every unset runaway_* key as absent.
+            from hermes_cli.config import load_config
+            limits = RunawayLimits.from_config(load_config())
+        except Exception:  # pragma: no cover - defensive: a config read never blocks routing
+            logger.debug("runaway guard: could not load config", exc_info=True)
+            return None
+        if not limits.enabled:
+            return None
+        # ``_db_for_key`` lives on the sibling SessionPersistenceMixin (both mixins compose
+        # into the gateway class at runtime), so it is fetched defensively rather than
+        # assumed: a missing resolver must never rotate a live conversation.
+        db_for_key = getattr(self, "_db_for_key", None)
+        if db_for_key is None:
+            return None
+        try:
+            db = db_for_key(entry.session_key)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("runaway guard: could not resolve db for %s", entry.session_key, exc_info=True)
+            return None
+        verdict = check_route_runaway(
+            db=db,
+            session_id=entry.session_id,
+            session_key=entry.session_key,
+            limits=limits,
+        )
+        return verdict.reset_reason if verdict.tripped else None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
         """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing
