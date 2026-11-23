@@ -11,7 +11,8 @@ The ceiling bounds *when compaction fires*. The guard bounds *one route's lifeti
 compaction alone cannot help — a transcript that stays large is re-read from the prompt cache on
 every single call, no matter how often you compact it.
 
-Written 2026-11-16, landed 2026-11-23 (Hermes commit on `canonical-deploy-live`, kanban
+Written 2026-11-16, landed 2026-11-23 (Hermes commits `3a799be276` — the port — and
+`0b668a5881` — the threshold-cap test alignment — on `canonical-deploy-live`, kanban
 `t_4770e5b3`; originating card `t_6abebfd8`). Obsidian mirror:
 `Homelab/10-Services/Services/hermes-compaction-fleet-ceiling.md` — the vault copy is the
 canonical published page and carries the same content.
@@ -61,6 +62,14 @@ compression.threshold_tokens = 60000   -> trigger 60,000   (tighter: honoured)
 compression.threshold_tokens = 500000  -> trigger 120,000  (raised: clamped)
 compression.threshold_tokens unset     -> trigger 120,000  (ceiling still applies)
 ```
+
+The ceiling applies as `min(ratio trigger, configured cap, fleet ceiling, window)`, so it can
+only ever pull the trigger **down**. Two consequences worth knowing:
+
+- A configured cap **below** 120,000 is honoured exactly — config can still tighten the trigger.
+- A configured cap **above** 120,000 is clamped to the ceiling, whatever the window and ratio
+  say. On a 400K window at ratio 0.50 the ratio trigger would be 200,000; the ceiling pulls it
+  to 120,000.
 
 `agent/compression_fleet_ceiling.py` also exports `clamp_to_fleet_ceiling()` for callers that want
 the same clamp outside the compressor.
