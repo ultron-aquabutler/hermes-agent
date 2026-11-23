@@ -76,9 +76,12 @@ def test_prunes_below_compression_threshold():
     """The whole point: prune fires at 120k tokens, far below the ~500k
     (50% of 1M) full-compression trigger that would otherwise never run."""
     c = _compressor(proactive_prune_tokens=48_000, proactive_prune_min_result_chars=8_000)
-    assert c.should_compress(prompt_tokens=120_000) is False  # compression would NOT run
+    # The fleet ceiling puts the full-compression trigger at 120k, so prune must fire BELOW it.
+    assert c.threshold_tokens == 120_000
+    assert c.should_compress(prompt_tokens=120_000) is True   # compression WOULD run
+    assert c.should_compress(prompt_tokens=60_000) is False   # below the trigger
     msgs = _build(8, big_indices={0, 1, 2})
-    result, pruned = c.prune_tool_results_only(msgs, current_tokens=120_000)
+    result, pruned = c.prune_tool_results_only(msgs, current_tokens=60_000)
     assert pruned >= 3
     assert len(result) == len(msgs)
     for cid in ("call_0", "call_1", "call_2"):

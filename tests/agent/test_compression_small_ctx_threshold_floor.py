@@ -35,16 +35,21 @@ class TestSmallContextThresholdFloor:
 
 
     def test_update_model_rederives_floor_both_directions(self):
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
         comp = _make(128_000, pct=0.50)
         assert comp.threshold_percent == 0.75
-        # small -> large: back to the configured 50%
+        # small -> large: back to the configured 50%, then the fleet ceiling pulls the trigger
+        # down to 120K (a 1M window at 50% would otherwise compact at 500K).
         comp.update_model("big", 1_000_000)
         assert comp.threshold_percent == 0.50
-        assert comp.threshold_tokens == 500_000
+        assert comp.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
         # large -> small: floor re-applies
         comp.update_model("small", 200_000)
         assert comp.threshold_percent == 0.75
-        assert comp.threshold_tokens == 150_000
+        # The 200K window floors at 75% (150K) and the fleet ceiling (120K) is the tighter
+        # bound, so the trigger lands on the ceiling.
+        assert comp.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 class TestReasoningExcludedFromSummarizer:

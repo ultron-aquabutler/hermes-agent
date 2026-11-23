@@ -1874,7 +1874,11 @@ class TestMoAContextLength:
             )
 
         assert compressor.context_length == configured_context
-        assert compressor.threshold_tokens == configured_context // 2
+        # The fleet ceiling bounds the trigger: the 600K window at 50% would compact at 300K,
+        # and the 120K fleet ceiling pulls it down.
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
+        assert compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
         endpoint_probe.assert_not_called()
 
 

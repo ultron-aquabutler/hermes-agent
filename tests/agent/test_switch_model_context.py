@@ -179,7 +179,11 @@ def test_switch_model_reapplies_checked_auxiliary_compression_limit():
         agent.switch_model(
             "other-main-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1",
         )
-    assert agent.context_compressor.threshold_tokens == 300_000
+    # The main-model trigger is restored — bounded by the fleet ceiling (the 400K window at 50%
+    # would otherwise compact at 200K).
+    from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
+    assert agent.context_compressor.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 def test_switch_model_omitted_base_url_preserves_direct_openai_capability():

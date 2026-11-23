@@ -48,7 +48,10 @@ class TestContextCompressorModelThresholds:
         )
         # 1M context >= 512K, so no small-context floor — override wins
         assert cc.threshold_percent == 0.40
-        assert cc.threshold_tokens == int(1_000_000 * 0.40)
+        # The fleet ceiling still caps the trigger: config/ratio may only tighten it.
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
+        assert cc.threshold_tokens == min(int(1_000_000 * 0.40), FLEET_COMPRESSION_CEILING_TOKENS)
 
 
 
@@ -89,7 +92,10 @@ class TestContextCompressorModelThresholds:
         )
         # 1M >= 512K → no floor; override 0.25 applies directly
         assert cc.threshold_percent == 0.25
-        assert cc.threshold_tokens == int(1_000_000 * 0.25)
+        # The fleet ceiling still caps the trigger: the ratio may only tighten it.
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
+        assert cc.threshold_tokens == min(int(1_000_000 * 0.25), FLEET_COMPRESSION_CEILING_TOKENS)
 
 
 

@@ -2300,23 +2300,34 @@ class TestThresholdTokensCap:
 
 
     def test_no_cap_uses_ratio_only(self):
-        """Without a cap, the ratio-based threshold is used."""
+        """Without a cap, the ratio-based threshold is used -- but the fleet ceiling still applies.
+
+        The fleet ceiling (agent/compression_fleet_ceiling.py) is a CODE-level floor on the
+        trigger: a 1M-window model at ratio 0.5 would otherwise compact at ~500K tokens, which
+        no long session ever reached, so it never compacted and every call re-read the whole
+        context from cache. Config may only TIGHTEN the trigger below the ceiling.
+        """
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
             )
             _ = comp.context_length
-        assert comp.threshold_tokens == 500_000
+        assert comp.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
         assert comp.threshold_tokens_cap is None
 
     @pytest.mark.parametrize("context_length", [128_000, 1_000_000])
     def test_default_config_compacts_at_the_ratio_trigger(self, context_length):
-        """Shipped defaults carry no token cap: every window compacts at its ratio trigger, so a 1M
-        window is not cut to a fixed count that suits some models and not others."""
+        """Shipped defaults carry the fleet ceiling as the token cap: the trigger is the lower
+        of the ratio threshold and the ceiling, so a 1M window is not cut to a fixed count that
+        suits some models and not others -- it is cut to the fleet ceiling."""
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
         from hermes_cli.config import DEFAULT_CONFIG
 
         default_pct = DEFAULT_CONFIG["compression"]["threshold"]
         default_cap = DEFAULT_CONFIG["compression"]["threshold_tokens"]
+        assert default_cap == FLEET_COMPRESSION_CEILING_TOKENS
         with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
             ratio_only = ContextCompressor("model-a", threshold_percent=default_pct, quiet_mode=True)
             comp = ContextCompressor(
@@ -2324,23 +2335,21 @@ class TestThresholdTokensCap:
             )
             _ = ratio_only.context_length, comp.context_length
 
-        assert comp.threshold_tokens_cap is None
-        assert comp.threshold_tokens == ratio_only.threshold_tokens
-
-
-
-
-
+        assert comp.threshold_tokens_cap == default_cap
+        assert comp.threshold_tokens == min(ratio_only.threshold_tokens, FLEET_COMPRESSION_CEILING_TOKENS)
 
     def test_invalid_cap_treated_as_none(self):
-        """Non-numeric, zero, or negative cap values are treated as None."""
+        """Non-numeric, zero, or negative cap values are treated as None -- and the fleet
+        ceiling then supplies the trigger on its own."""
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp0 = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=0,
             )
             assert comp0.threshold_tokens_cap is None
-            assert comp0.threshold_tokens == 500_000
+            assert comp0.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
             comp_neg = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
@@ -2357,20 +2366,38 @@ class TestThresholdTokensCap:
     def test_should_compress_fires_at_cap_below_ratio_threshold(self):
         """Behavioral: with a cap below the ratio-based threshold,
         should_compress() fires once usage crosses the cap — even though
-        the percentage threshold has not been reached (first-fires-wins)."""
+        the percentage threshold has not been reached (first-fires-wins).
+
+        A cap of 200K sits ABOVE the 120K fleet ceiling, so the ceiling is the tighter bound and
+        the trigger is 120K. A cap below the ceiling (60K) is honoured as-is."""
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=200_000,
             )
-        # Ratio-based would be 500K; cap pulls the trigger down to 200K.
-        assert comp.should_compress(150_000) is False   # below cap
-        assert comp.should_compress(200_000) is True    # at cap (below 500K pct)
-        assert comp.should_compress(250_000) is True    # above cap
+            tighter = ContextCompressor(
+                "model-a", threshold_percent=0.50, quiet_mode=True,
+                threshold_tokens_cap=60_000,
+            )
+        # Ratio-based would be 500K; the fleet ceiling pulls the trigger down to 120K.
+        assert comp.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
+        assert comp.should_compress(110_000) is False   # below the ceiling
+        assert comp.should_compress(120_000) is True    # at the ceiling (below the 500K pct)
+        assert comp.should_compress(250_000) is True    # above the ceiling
+
+        # A cap BELOW the ceiling is honoured: config may tighten the trigger.
+        assert tighter.threshold_tokens == 60_000
+        assert tighter.should_compress(50_000) is False
+        assert tighter.should_compress(60_000) is True
 
     def test_explicit_cap_survives_model_switch(self):
         """A user-set cap remains effective when the active model changes."""
-        cap = 200_000
+        from agent.compression_fleet_ceiling import FLEET_COMPRESSION_CEILING_TOKENS
+
+        # A cap below the ceiling survives the switch unchanged.
+        cap = 60_000
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, threshold_tokens_cap=cap, quiet_mode=True)
             _ = comp.context_length
@@ -2378,6 +2405,15 @@ class TestThresholdTokensCap:
         assert comp.threshold_tokens == cap
         comp.update_model("model-b", context_length=2_000_000)
         assert comp.threshold_tokens == cap
+
+        # A cap ABOVE the ceiling is clamped to the ceiling and stays clamped across a switch.
+        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+            over = ContextCompressor("model-a", threshold_percent=0.50, threshold_tokens_cap=200_000, quiet_mode=True)
+            _ = over.context_length
+
+        assert over.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
+        over.update_model("model-b", context_length=2_000_000)
+        assert over.threshold_tokens == FLEET_COMPRESSION_CEILING_TOKENS
 
 
 
