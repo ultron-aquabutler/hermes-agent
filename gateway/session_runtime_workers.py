@@ -12,11 +12,44 @@ def executing_sessions(authority):
             yield sid, live, execution['execution_generation']
 
 
+def managed_worker_is_live(worker) -> bool:
+    """True when the managed worker's *process* is still running.
+
+    ``worker.closed`` is set by the owner's reap path, which runs on the owner
+    loop. A worker whose process has already exited but whose ``closed`` event
+    was never set is a STALE CLAIM: nothing is executing, but the claim still
+    counts. Such a claim must not hold a shutdown drain open -- that is how a
+    drain burned its full timeout with every counter at zero.
+
+    ``process.poll()`` reaps the child if it is gone, so this is safe to call
+    from the owner loop and never blocks. A worker with no process handle (a
+    launcher trampoline that never reported one) is treated as live: absent
+    evidence of death is not evidence of death.
+    """
+    closed = getattr(worker, 'closed', None)
+    if closed is not None and closed.is_set():
+        return False
+    process = getattr(worker, 'process', None)
+    if process is None:
+        return True
+    try:
+        return process.poll() is None
+    except Exception:
+        # A worker we cannot interrogate is not a dead worker.
+        return True
+
+
 def uncounted_runtime_work(runner):
-    """Count claims absent from the ordinary agent map, including pre-bootstrap managed turns."""
+    """Count claims absent from the ordinary agent map, including pre-bootstrap managed turns.
+
+    A managed claim counts only while its process is alive (see
+    :func:`managed_worker_is_live`): a claim left behind by a worker that
+    exited without being reaped is stale and must not keep the gateway waiting
+    through a shutdown drain.
+    """
     running = getattr(runner, '_running_agents', {})
     authorities = all_authorities(runner)
-    managed = sum(not worker.closed.is_set() for authority in authorities
+    managed = sum(managed_worker_is_live(worker) for authority in authorities
                   for worker in getattr(authority, '_managed_workers', {}).values())
     return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
                 for authority in authorities for sid, live, _ in executing_sessions(authority))
@@ -24,9 +57,15 @@ def uncounted_runtime_work(runner):
 
 
 def managed_worker_units(authority):
-    """One ``active_work`` entry per live managed worker of *authority*: its session and its own process."""
+    """One ``active_work`` entry per live managed worker of *authority*: its session and its own process.
+
+    Liveness is the same test ``uncounted_runtime_work`` counts with
+    (:func:`managed_worker_is_live`), so the named units and the count agree:
+    a stale claim is neither counted nor named.
+    """
     return [{'kind': 'managed', 'session': sid, 'pid': (worker.worker or (worker.process.pid,))[0]}
-            for sid, worker in list(getattr(authority, '_managed_workers', {}).items()) if not worker.closed.is_set()]
+            for sid, worker in list(getattr(authority, '_managed_workers', {}).items())
+            if managed_worker_is_live(worker)]
 
 
 def uncounted_runtime_work_units(runner, pid):

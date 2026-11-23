@@ -1883,10 +1883,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info(
             "Shutdown phase: drain done at +%.2fs (drain took %.2fs, timed_out=%s, active_at_start=%d, "
             "active_now=%d, cron_at_start=%d, cron_now=%d, api_at_start=%d, api_now=%d, "
-            "deferred_at_start=%d, deferred_now=%d)", ctx.elapsed(), ctx.drain_elapsed,
+            "deferred_at_start=%d, deferred_now=%d, managed_turns_now=%d)",
+            ctx.elapsed(), ctx.drain_elapsed,
             ctx.timed_out, len(ctx.active_agents), self._running_agent_count(), _cron_at_start,
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
-            _deferred_at_start, ctx.deferred_count(),
+            _deferred_at_start, ctx.deferred_count(), managed_turn_count(self),
         )
         if ctx.timed_out:
             return
@@ -1904,9 +1905,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         from gateway.run import GatewayRunner
         logger.warning(
             "Gateway drain timed out after %.1fs with %d active agent(s), "
-            "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
-            "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
+            "%d in-flight cron job(s), %d api_server run(s), %d deferred agent worker(s), "
+            "and %d managed turn(s); interrupting remaining work.",
+            ctx.drain_elapsed, self._running_agent_count(),
             self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
+            managed_turn_count(self),
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
