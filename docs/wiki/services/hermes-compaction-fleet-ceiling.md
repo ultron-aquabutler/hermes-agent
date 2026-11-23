@@ -339,6 +339,22 @@ sessions compact and grow:
 *and still in daily use*, and their transcripts stay small because they compact. Age and cost are
 anti-correlated here: the older routes are old because they are still working.
 
+### Known pre-existing failures in the compression suite
+
+`tests/agent/ -k compress` reports **1191 passed, 3 failed, 2 skipped** at the landed tree. The 3
+failures are **not** caused by this work — they are identical at the pre-change baseline
+`c70345da5c`, verified by running the same tests in a throwaway worktree at that commit:
+
+| failing test | file |
+|---|---|
+| `test_fallback_boundaries_wait_for_real_effectiveness_verdict` | `tests/agent/test_compression_anti_thrash_recovery.py` |
+| `test_aborted_record_after_a_commit_describes_its_own_attempt[_abort_on_stale_snapshot-post_tool-snapshot_stale]` | `tests/agent/test_compression_attempt_effect.py` |
+| `test_aborted_record_after_a_commit_describes_its_own_attempt[_abort_at_the_commit_fence-post_tool-commit_fence_cancelled]` | `tests/agent/test_compression_attempt_effect.py` |
+
+They are also **order-dependent**: run in isolation they produce a *fourth* failure
+(`[_refuse_on_a_saturated_pool-unknown-pool_saturated]`) that does not appear in the full sweep, at
+baseline and at HEAD alike. Treat the full-sweep count (3) as the canonical number.
+
 ## See Also
 
 - `docs/wiki/services/hermes-compaction-loop-detector.md` — the usage-independent loop detector
