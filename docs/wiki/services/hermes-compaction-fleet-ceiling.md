@@ -11,8 +11,9 @@ The ceiling bounds *when compaction fires*. The guard bounds *one route's lifeti
 compaction alone cannot help — a transcript that stays large is re-read from the prompt cache on
 every single call, no matter how often you compact it.
 
-Written 2026-11-16, landed 2026-11-23 (Hermes commits `3a799be276` — the port — and
-`0b668a5881` — the threshold-cap test alignment — on `canonical-deploy-live`, kanban
+Written 2026-11-16, landed 2026-11-23 (Hermes commits `3a799be276` — the port —
+`0b668a5881` and `ffe089f6a7` — the threshold-cap test alignments —
+`23c7357482` — the docs — on `canonical-deploy-live`, kanban
 `t_4770e5b3`; originating card `t_6abebfd8`). Obsidian mirror:
 `Homelab/10-Services/Services/hermes-compaction-fleet-ceiling.md` — the vault copy is the
 canonical published page and carries the same content.
@@ -166,6 +167,28 @@ mitigation no longer has any effect once this code is running.
 `runaway_max_segment_hours` (336), `runaway_max_live_chars` (800000) and
 `runaway_max_session_messages` (5000) resolve from `DEFAULT_CONFIG` on every home even though no
 profile `config.yaml` sets them — `load_config()` merges the defaults, so the guard sees them.
+
+### The two-sided contract
+
+The ceiling is a **one-way clamp**. Config may *tighten* the trigger; it can never raise it above
+120,000:
+
+| Trigger source | Result | Why |
+|---|---|---|
+| ratio on a 1M window (750,000) | **120000** | clamped by the ceiling |
+| configured `threshold_tokens: 300000` | **120000** | clamped by the ceiling |
+| configured cap 400,000 (Bedrock) | **120000** | clamped by the ceiling |
+| aux/summariser window 512,000 | **120000** | clamped by the ceiling |
+| aux/summariser window 80,000 | **80000** | below the ceiling — honoured exactly |
+| configured cap 80,000 | **80000** | below the ceiling — honoured exactly |
+| 64k model window | **64000** | the window itself binds first |
+
+So "I set `threshold_tokens` to 80,000 and compaction still fires late" is not a bug — but "I set
+it to 300,000 and compaction fires at 300,000" **is** the bug the ceiling exists to prevent.
+
+Both ends of that contract are asserted in the suite: `tests/agent/test_compression_feasibility.py`
+covers the aux-window arm, `tests/agent/test_bedrock_adapter.py` the configured-cap arm, and
+`tests/agent/test_bedrock_card_windows.py` the card-window arm.
 
 ### Verifying the guard
 
