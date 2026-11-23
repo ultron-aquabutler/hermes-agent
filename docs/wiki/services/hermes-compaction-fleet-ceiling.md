@@ -311,6 +311,29 @@ cache-read-per-call of 212k-361k (the healthy band is 17k-43k):
 Zero false positives: the healthy long-lived routes (root at 242 rows/1,678h, ultron main at
 353 rows/1,190h) have small transcripts and do not trip.
 
+**Re-measured 2026-11-23** (the guard's own quantities, read straight from every live profile
+`state.db` — active rows, `SUM(LENGTH(content))`, and segment age from `MIN(timestamp)`; note
+`messages.timestamp` is a Unix epoch REAL, not an ISO string):
+
+| metric | value |
+|---|---|
+| live segments measured (7 profiles) | **21,165** |
+| large (live chars >= 800,000) | 5 |
+| old (segment age >= 336h) | 13,317 |
+| **ANDed trips** | **5 (0.02%)** |
+| message-count backstop (>= 5,000 rows) | 0 |
+
+The trip roster has shifted with live traffic — the count and rate hold, the membership moves as
+sessions compact and grow:
+
+| profile | active rows | live chars | segment age | session |
+|---|---|---|---|---|
+| librarian | 1,089 | 2,253,684 | 1,713.3h | `20260913_000707_ba3837` |
+| librarian | 864 | 2,001,319 | 1,768.0h | `20260910_172430_e38901` |
+| friday | 625 | 1,120,167 | 488.9h | `20261103_002712_570738` |
+| friday | 718 | 996,784 | 446.4h | `20261104_190210_265cd3` |
+| root | 303 | 803,712 | 707.5h | `20261024_215722_f17a4d46` |
+
 **Why age alone is not a trip signal.** Across 11,262 measured live segments the age median is
 1,730h and the max 3,898h — long-lived routes are *normal* on this fleet, because they are old
 *and still in daily use*, and their transcripts stay small because they compact. Age and cost are
