@@ -155,6 +155,30 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # ``HERMES_KANBAN_QUOTA_BLOCK_SECONDS``.
 DEFAULT_QUOTA_BLOCK_SECONDS = 900  # 15 minutes
 
+# Bounded cooldown for the ``blocker_auth`` family. The auth family is normally
+# terminal — a 401 needs a human, and parking indefinitely is correct for a
+# genuinely dead credential. But a provider OUTAGE is not a credential problem:
+# an unreachable provider yields the same "auth"-flavoured text, and parking on
+# it strands the entire ready queue. Live proof (t_498b52ce): minimax was
+# unavailable on 2026-11-23 and the friday kanban dispatcher spawned 0 workers
+# for ~2h45m while the ready queue stayed non-empty; the "consecutive ticks"
+# counter climbed to 36 with nothing but ``blocker_auth`` holding the line.
+#
+# This bound was introduced on the ``fix/blocker-auth-outcome-based-t_258dc2c3``
+# line (165954667c) and LOST when 342ff1ce1f restored the respawn-guard
+# quota/auth split onto the live dispatch path — so the live tree parked on auth
+# forever again. Restored here, alongside the quota cooldown it parallels.
+#
+# 30 minutes is deliberately short relative to the outage it has to cover: a
+# provider outage should re-probe on the order of a dispatcher tick cycle, not
+# on the order of a human's lunch break. A genuinely dead credential does NOT
+# become a hot loop here — the card simply re-probes every 30 minutes, and the
+# separate ``consecutive_failures`` breaker still trips it to ``blocked`` for a
+# human after the normal number of failures. Overridable via
+# ``HERMES_KANBAN_AUTH_BLOCK_SECONDS``; ``0`` disables the cooldown (matches the
+# quota / rate-limit escape hatches).
+DEFAULT_AUTH_BLOCK_SECONDS = 1800  # 30 minutes
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -2026,8 +2050,11 @@ def check_respawn_guard(
     CRASH/TIMEOUT, not a clean ``rate_limited`` requeue — wait one
     ``DEFAULT_QUOTA_BLOCK_SECONDS`` and probe again; if the cooldown has
     elapsed, return ``None`` so the next tick can attempt the work), then
-    ``"blocker_auth"`` (auth pattern in ``last_failure_error`` — retrying
-    won't help; surface for a human; the breaker still trips eventually), then
+    ``"blocker_auth"`` (auth pattern in ``last_failure_error`` — surfaces for a
+    human; the breaker still trips eventually) UNTIL the bounded
+    ``DEFAULT_AUTH_BLOCK_SECONDS`` cooldown elapses, after which the next tick
+    re-probes the provider (t_498b52ce — an auth-flavoured text from a provider
+    OUTAGE used to park the card forever and strand the ready queue), then
     for the ready lane only ``"recent_success"`` (completed run within the
     window, unless a re-queue event arrived after it — a deliberate re-run)
     and ``"active_pr"`` (PR URL in a recent comment; re-spawning risks a
@@ -2118,7 +2145,9 @@ def check_respawn_guard(
         # below is intentionally NOT consulted for quota text.
         return None
 
-    # 3. Auth blocker: retrying will not help. Surface for a human.
+    # 3. Auth blocker: retrying will not help. Surface for a human — UNTIL the
+    #    bounded auth cooldown elapses, after which the next tick re-probes the
+    #    provider (t_498b52ce).
     #
     # A plain CRASH needs care: its persisted error carries the worker's last
     # captured output, which is context rather than a diagnosis and may contain
@@ -2132,12 +2161,47 @@ def check_respawn_guard(
     # So on a crash we only park when the auth text is present in the
     # dispatcher's own preamble (or appears in BOTH halves, meaning the
     # diagnosis was ours too).
+    #
+    # The cooldown exists because "auth-flavoured text" and "the provider is
+    # down" are indistinguishable here, and only one of them needs a human.
+    # Parking on the second one strands the ready queue: the 2026-11-23
+    # minimax outage produced auth-flavoured dispatcher text on every spawn and
+    # the friday dispatcher spawned 0 workers for ~2h45m with the queue
+    # non-empty (the "consecutive ticks" counter reached 36). The breaker
+    # (separate ``consecutive_failures`` counter) still trips a repeat
+    # offender — this bound just stops a single outage from latching forever.
+    # ``HERMES_KANBAN_AUTH_BLOCK_SECONDS=0`` returns None immediately (matches
+    # the quota / rate-limit escape hatches).
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
     if err and _RESPAWN_AUTH_RE.search(err):
         if latest_outcome == "crashed" and not _auth_text_in_dispatcher_preamble(err):
             # Auth words only inside the worker's captured output — context.
             return None
-        return "blocker_auth"
+        auth_block = _kb._resolve_auth_block_seconds()
+        if auth_block <= 0:
+            # Disabled — respawn immediately, skipping the parked state so the
+            # stamped auth text doesn't re-trap the task.
+            return None
+        # Anchor the cooldown on the run that STAMPED ``last_failure_error``. The
+        # dispatcher writes that column in the same transaction that ends the run,
+        # so the latest ended run is the right anchor for a real failure.
+        #
+        # NO ended run means the stamp did not come from a completed run: a legacy
+        # row, or a hand-written/imported ``last_failure_error`` with no run
+        # behind it. There is nothing to date the cooldown against, and an
+        # undated auth stamp is indistinguishable from a dead credential — so it
+        # keeps parking, exactly as before this bound existed. Returning None here
+        # instead would turn a genuine 401 into a hot retry loop.
+        anchor = _kb._to_epoch(latest_run["ended_at"]) if latest_run is not None else None
+        if anchor is None:
+            return "blocker_auth"
+        if (now - anchor) < auth_block:
+            return "blocker_auth"
+        # Cooldown elapsed — the next tick re-probes the provider. The breaker
+        # (separate ``consecutive_failures`` counter) still trips a repeat
+        # offender, so a credential that is genuinely dead still ends up parked
+        # for a human — it just stops latching on the FIRST tick.
+        return None
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.

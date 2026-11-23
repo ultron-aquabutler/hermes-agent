@@ -340,6 +340,21 @@ def _resolve_quota_block_seconds() -> int:
     return _env_int("HERMES_KANBAN_QUOTA_BLOCK_SECONDS", DEFAULT_QUOTA_BLOCK_SECONDS)
 
 
+def _resolve_auth_block_seconds() -> int:
+    """``HERMES_KANBAN_AUTH_BLOCK_SECONDS`` (0 = next tick, for tests) else default.
+
+    Bounds how long a card stays parked under ``blocker_auth``. The auth family
+    is normally terminal (a 401 needs a human), but a provider OUTAGE is not a
+    credential problem: the provider being unreachable produces the same
+    "auth"-flavoured text, and parking on it indefinitely strands the whole
+    ready queue. The cooldown lets the dispatcher re-probe the provider instead
+    of latching forever (t_498b52ce: minimax unavailable → 0 workers spawned
+    for ~2h45m while the ready queue stayed non-empty). The
+    ``consecutive_failures`` breaker remains the durable safety net.
+    """
+    return _env_int("HERMES_KANBAN_AUTH_BLOCK_SECONDS", DEFAULT_AUTH_BLOCK_SECONDS)
+
+
 # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
 _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
@@ -4297,6 +4312,7 @@ from hermes_cli.kanban_db_workspace import (
     _scratch_workspace,
 )
 from hermes_cli.kanban_db_dispatch import (
+    DEFAULT_AUTH_BLOCK_SECONDS,
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_QUOTA_BLOCK_SECONDS,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,

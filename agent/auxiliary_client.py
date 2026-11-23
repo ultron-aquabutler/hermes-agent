@@ -4395,6 +4395,31 @@ def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optio
     return client, resolved_model
 
 
+def _declared_main_fallback_chain() -> list[dict[str, Any]]:
+    """The operator's DECLARED top-level fallback chain (``fallback_providers`` + legacy
+    ``fallback_model``), read through the same ``get_fallback_chain`` the main agent uses.
+
+    The distinction this helper exists for: a *declared* chain is a provider the operator
+    pointed this profile at, so using it is not "guessing another logged-in provider"; an
+    *undeclared* one is. ``_discovery_chain_allowed`` refuses the latter (#34777's
+    "bills an account they never pointed this session at" hazard).
+
+    The auxiliary recovery ladder used to treat "no task-level ``fallback_chain``" as
+    "no fallback at all" for an EXPLICIT-provider task, so a declared
+    ``fallback_providers`` chain was never consulted and a provider outage parked the
+    task forever (t_498b52ce: the 2026-11-23 minimax outage left the friday kanban
+    dispatcher with 0 workers spawned for ~2h45m). An empty list means nothing was
+    declared and the explicit-provider boundary still holds.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+        return get_fallback_chain(load_config_readonly())
+    except Exception as exc:
+        logger.debug("Auxiliary: could not load declared main fallback chain: %s", exc)
+        return []
+
+
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None, skip_lanes=(),
@@ -4560,10 +4585,25 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
     compression silently charged to a Nous Portal balance)."""
     if (main_provider or "").strip().lower() in {"", "auto"}:
         return True
-    logger.warning(
-        "Auxiliary %s: main provider %s is unavailable and no fallback_chain / fallback_providers is "
-        "configured — refusing to guess another logged-in provider. Re-authenticate (`hermes model`) "
-        "or declare a fallback.", task or "call", main_provider)
+    # The refusal here is about the DISCOVERY chain specifically. Say which declared
+    # routes exist, so the warning does not claim "no fallback_providers is configured"
+    # while a ``fallback_providers`` list is plainly in the config (t_498b52ce: the
+    # 2026-11-23 "no fallback_chain / fallback_providers is configured" message was
+    # read as "the key is spelled wrong" when the real cause was that the ladder never
+    # consulted the declared chain for an explicit-provider task).
+    declared = _declared_main_fallback_chain()
+    if declared:
+        logger.warning(
+            "Auxiliary %s: main provider %s is unavailable and the built-in discovery chain is "
+            "disabled for an install with a selected main provider — refusing to guess another "
+            "logged-in provider. The DECLARED fallback_providers chain was already tried and did "
+            "not yield a usable client. Re-authenticate (`hermes model`) or extend "
+            "fallback_providers.", task or "call", main_provider)
+    else:
+        logger.warning(
+            "Auxiliary %s: main provider %s is unavailable and no fallback_chain / fallback_providers "
+            "is configured — refusing to guess another logged-in provider. Re-authenticate "
+            "(`hermes model`) or declare a fallback.", task or "call", main_provider)
     return False
 
 
@@ -7785,16 +7825,24 @@ def _ladder_credential_rungs(
 def _next_fallback_after_quarantine(
     task: Optional[str], resolved_provider: str, is_auto: bool, route: _LadderRoute,
     failed_model: Optional[str], failure_scope: Any, *, task_chain_only: bool = False, skip_lanes=(),
-    required_tokens: Optional[int] = None,
+    required_tokens: Optional[int] = None, allow_declared_main_chain: bool = False,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Next candidate after a fallback entry was quarantined mid-request (dead credential or a
     capacity error): remaining configured entries (task chain, then main chain on auto) before the
     discovery chain, past this walk's ``skip_lanes``. ``task_chain_only`` (explicit-provider auth error)
-    stops at the task chain — the user never opted that task into discovery or the main model."""
+    stops at the task chain — the user never opted that task into discovery or the main model.
+    ``allow_declared_main_chain`` (explicit-provider auth error WITH a declared top-level
+    ``fallback_providers``) additionally permits the DECLARED main chain on the re-walk: it is a
+    route the operator pointed this profile at, not the main session's model and not a guess
+    (t_498b52ce)."""
     walk = dict(reason="fallback candidate unavailable", failed_base_url=route.base_info,
                 failure_scope=failure_scope, skip_lanes=skip_lanes, required_tokens=required_tokens)
     fb = _try_configured_fallback_chain(task, resolved_provider or "auto", failed_model=failed_model, **walk)
     if task_chain_only:
+        if not allow_declared_main_chain:
+            return fb
+        if fb[0] is None:
+            fb = _try_main_fallback_chain(task, resolved_provider or "auto", failed_model=failed_model, **walk)
         return fb
     if fb[0] is None and is_auto:
         fb = _try_main_fallback_chain(task, resolved_provider or "auto", failed_model=failed_model, **walk)
@@ -7821,10 +7869,17 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
     is_capacity_error = reason not in (None, aux_errors.AUTH_ERROR)
     task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
     has_task_fallback_chain = isinstance(task_chain, list) and bool(task_chain)
-    explicit_auth_with_task_chain = (
-        reason == aux_errors.AUTH_ERROR and not is_auto and has_task_fallback_chain
+    # A DECLARED top-level ``fallback_providers`` chain is an operator-declared route, so
+    # an explicit-provider auth failure may use it — it is not a guess at some other
+    # logged-in provider. The explicit-provider boundary still holds when nothing was
+    # declared: no task chain AND no declared main chain means there is nowhere to go,
+    # and the ladder refuses rather than inventing a route (t_498b52ce).
+    has_declared_main_chain = bool(_declared_main_fallback_chain())
+    explicit_auth_with_chain = (
+        reason == aux_errors.AUTH_ERROR and not is_auto
+        and (has_task_fallback_chain or has_declared_main_chain)
     )
-    if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
+    if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_chain):
         return None
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) that sent the failed request unhealthy, so later aux
@@ -7860,16 +7915,25 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
         required_tokens=required_tokens)
-    if fb_client is None and is_auto:
+    # An explicit-provider AUTH failure may walk the DECLARED top-level chain
+    # (``fallback_providers``) — the operator pointed this profile at those providers,
+    # so this is a declared route, not a guess at another logged-in account. It must
+    # NOT reach the main-agent-model rung: that is the main session's own model, which
+    # the explicit pin deliberately excluded (#t_e94832a1 context-size leak).
+    explicit_auth_via_declared_chain = (
+        explicit_auth_with_chain and not is_auto and not has_task_fallback_chain
+        and has_declared_main_chain
+    )
+    if fb_client is None and (is_auto or explicit_auth_via_declared_chain):
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
             required_tokens=required_tokens)
-        if fb_client is None:
+        if fb_client is None and is_auto:
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None and not explicit_auth_with_task_chain:
+    elif fb_client is None and not explicit_auth_with_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
@@ -7895,8 +7959,9 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
-            task_chain_only=explicit_auth_with_task_chain, skip_lanes=tried_lanes,
-            required_tokens=required_tokens)
+            task_chain_only=explicit_auth_with_chain, skip_lanes=tried_lanes,
+            required_tokens=required_tokens,
+            allow_declared_main_chain=explicit_auth_via_declared_chain)
     # All fallback layers exhausted: one user-visible warning (#26882), then the caller re-raises.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
                    "(fallback_chain + main agent model). Raising the primary error.",
