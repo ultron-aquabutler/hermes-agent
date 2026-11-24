@@ -4670,13 +4670,25 @@ Write only the summary body. Do not include any preamble or prefix."""
     def _latest_user_task_snapshot(cls, messages: list[dict[str, Any]]) -> Optional[str]:
         """Return a deterministic task-snapshot line from the newest real user turn.
         The summarizer must not invent the active-task anchor from a prompt example or a stale prior
-        summary; this grounds it in the exact compacted turns."""
+        summary; this grounds it in the exact compacted turns.
+
+        The snapshot carries the user's REQUEST, never the in-flight replay DIRECTIVE. A turn that
+        survived a compaction carries ``_INFLIGHT_TASK_REPLAY_HEADER`` ("... Continue it; do not
+        start over."); copied verbatim it landed inside the historical section, which SUMMARY_PREFIX
+        explicitly tells the model to discard. The two directives then contradicted each other in one
+        prompt and the model resolved it by continuing the task — measured on the live fleet as an
+        answered request being redone after every compaction, with the snapshot growing as each
+        summary nested the previous one. ``_restated_request_text`` strips the header (and any
+        header stacked by an earlier compaction) and keeps the request text.
+        """
         # Reuse the runtime's real-user predicate so scaffolding rows can never anchor.
         from agent.conversation_compression import _is_real_user_message
         for msg in reversed(messages):
             if msg.get("role") != "user" or not _is_real_user_message(msg):
                 continue
-            text = _redact_compaction_text(_typed_user_text(_content_text_for_contains(msg.get("content"))).strip())
+            # Strip any in-flight replay header (and a previous compaction's summary) so the
+            # snapshot restates the request without the "continue it" directive.
+            text = _redact_compaction_text(_restated_request_text(msg.get("content")).strip())
             if not text:
                 continue
             if len(text) > _ACTIVE_TASK_MAX_CHARS:
