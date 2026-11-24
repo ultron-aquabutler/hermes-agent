@@ -480,6 +480,53 @@ class SessionMaintenanceMixin:
             self._record_db_file_identity()
         return optimized
 
+    def prune_retired_tombstones(self, older_than_seconds: Optional[int] = None) -> int:
+        """Reclaim gateway terminal/admission tombstones that have aged past the exact-retry horizon.
+
+        The gateway writes one ``gateway.terminal_worker.v1.*`` admission proof plus a
+        ``gateway.admission.result.v1.*`` result per admitted request, and each proof carries an
+        unbounded ``receipts`` array. :func:`hermes_state_mutation_retirement.prune_retired_tombstones`
+        already knows how to reclaim them safely: it stamps ``retired_at`` on pre-existing rows,
+        then drops the ones older than the horizon along with their result and identity rows.
+
+        The terminal tombstones are EVIDENCE of a settled request, not the deletion fence, so they
+        age out at the horizon whoever retired the session. The FENCE is the
+        ``gateway.retired_session.v1.*`` marker, which a user delete keeps forever (it holds no
+        ``expires`` marker) and which therefore still refuses the re-bind, the re-admit and the
+        exact retry after the evidence is gone.
+
+        Those tombstones are NOT reachable from :meth:`prune_sessions`: that path deletes
+        ``messages``/``sessions`` rows only and never touches ``state_meta``. So without this call
+        the terminal namespace grows without bound and is the dominant consumer of ``state_meta``
+        (~78 MB in a 1.7 GB store).
+
+        Returns the number of ``state_meta`` rows reclaimed. Never VACUUMs: a prune does not shrink
+        the file, and a VACUUM needs exclusive access plus free space to rewrite the whole store.
+        """
+        from hermes_state_mutation_retirement import prune_retired_tombstones as _prune
+        from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX
+        if older_than_seconds is None:
+            from hermes_state_mutation_retirement import RETRY_HORIZON_S
+            older_than_seconds = RETRY_HORIZON_S
+
+        _globs = (WORKER_PREFIX + "*", ADMISSION_PREFIX + "*", RESULT_PREFIX + "*")
+
+        def _do(conn):
+            before = conn.execute(
+                "SELECT count(*) FROM state_meta WHERE key GLOB ? OR key GLOB ? OR key GLOB ?",
+                _globs).fetchone()[0]
+            _prune(conn, older_than=older_than_seconds)
+            after = conn.execute(
+                "SELECT count(*) FROM state_meta WHERE key GLOB ? OR key GLOB ? OR key GLOB ?",
+                _globs).fetchone()[0]
+            return max(0, before - after)
+
+        try:
+            return int(self._execute_write(_do) or 0)
+        except Exception as exc:
+            logger.warning("state.db tombstone prune skipped: %s", exc)
+            return 0
+
     def maybe_auto_prune_and_vacuum(
         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,
         sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 30,

@@ -85,7 +85,12 @@ _TRANSCRIPT_FIELDS = frozenset({'messages', 'last_reasoning', 'tools', '_turn_us
 def _compact_result(conn, admission_id):
     """A retired result keeps the exact-retry outcome (final response, flags, usage/accounting)
     but not the transcript copies a turn result carries (cumulative ``messages``, reasoning, the
-    settled ``_turn_user_row``)."""
+    settled ``_turn_user_row``).
+
+    The row is stamped with ``retired_at`` so it carries its own age. A result row is otherwise
+    undated, and without a date the sweep has no way to reclaim one whose admission tombstone is
+    already gone (the orphan case) — it would sit in ``state_meta`` forever.
+    """
     from hermes_state_terminal import RESULT_PREFIX, encode_result, load_result
     saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (RESULT_PREFIX + admission_id,)).fetchone()
     if saved is None:
@@ -94,6 +99,7 @@ def _compact_result(conn, admission_id):
     result = value.get('result')
     if isinstance(result, dict):
         value['result'] = {**{k: v for k, v in result.items() if k not in _TRANSCRIPT_FIELDS}, 'messages': []}
+    value['retired_at'] = time.time()
     conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(encode_result(value)), RESULT_PREFIX + admission_id))
 
 
@@ -415,19 +421,48 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
     retired-session marker or shared routing fence. A user delete's marker is the deletion fence itself and is never
     reclaimed: it holds only ``retired_at``, and without it a deleted id could be recreated,
     re-admitted or reissued as a Bot Chat generation.
-    Tombstones written before ``retired_at`` existed are stamped now and age from this pass."""
+    Tombstones written before ``retired_at`` existed are stamped now and age from this pass.
+
+    The terminal admission/worker tombstones are EVIDENCE of a settled request, not the deletion
+    fence, so they age out at the horizon whoever retired the session. The fence is the
+    ``RETIRED_PREFIX`` marker, which a user delete keeps forever (it holds no ``expires``) and
+    which therefore still refuses the re-bind, the re-admit and the exact retry after the
+    evidence is gone.
+    """
     from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
     prefixes = (ADMISSION_PREFIX, WORKER_PREFIX)
     now = time.time()
     for prefix in prefixes:
         conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key GLOB ? "
                      "AND json_valid(value) AND json_extract(value, '$.retired_at') IS NULL", (now, prefix + '*'))
+    # A RESULT row written before it learned to carry ``retired_at`` is stamped now and ages from
+    # this pass, the same way the tombstones are. Without this an undated row is unreachable by
+    # every age-based reclaim path.
+    conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key GLOB ? "
+                 "AND json_valid(value) AND json_extract(value, '$.retired_at') IS NULL",
+                 (now, RESULT_PREFIX + '*'))
     cutoff = now - older_than
+    # The terminal ADMISSION is EVIDENCE, not the fence: it ages out at the horizon whoever
+    # deleted the session. The fence is the ``RETIRED_PREFIX`` marker (reclaimed by
+    # :func:`_reclaim_expired`, which requires its own ``expires`` marker), so dropping the
+    # evidence here does not let a deleted id come back — the marker still refuses the re-bind
+    # (``gateway/session_api.py``), the re-admit (``hermes_state_mutations.py``) and the exact
+    # retry (``hermes_state_terminal.py``).
     for key, raw in conn.execute(f'SELECT key,value FROM state_meta WHERE key GLOB ? AND {_EXPIRED}',
                                  (ADMISSION_PREFIX + '*', cutoff)).fetchall():
         row = json.loads(raw)
         conn.execute('DELETE FROM state_meta WHERE key IN (?,?,?)', (key, RESULT_PREFIX + row['admission_id'],
                      identity_key(row['principal_id'], row['target_session_id'], row['request_id'])))
+    # The terminal WORKER tombstone is evidence too, and ages out the same way.
     conn.execute(f'DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED}', (WORKER_PREFIX + '*', cutoff))
+    # An ORPHANED result row: its admission tombstone is already gone (or never was), so the
+    # triple-delete above can never reach it — it has no parent to key on. It still carries its
+    # own ``retired_at``, so it ages out on the same horizon. Without this the result namespace
+    # keeps a residue forever (293 such rows on one profile).
+    conn.execute(
+        f"DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED} "
+        f"AND NOT EXISTS (SELECT 1 FROM state_meta a WHERE a.key = ? || "
+        f"substr(state_meta.key, length(?)+1))",
+        (RESULT_PREFIX + '*', cutoff, ADMISSION_PREFIX, RESULT_PREFIX))
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
         _reclaim_expired(conn, prefix, cutoff)

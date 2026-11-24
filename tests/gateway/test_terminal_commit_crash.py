@@ -79,7 +79,12 @@ def test_terminal_commit_before_publication_survives_kill(tmp_path):
                 assert reply['choices'][0]['message']['content'] == saved['result']['final_response']
             await async_wait_until(lambda: snapshot()[0][follower] == 'terminal', timeout=25, what='the follower ran after restart')
             assert snapshot()[0]['once'] == 'terminal'
-            assert snapshot()[1] == saved
+            # The stored ENVELOPE gains bookkeeping fields as the session retires (``retired_at``
+            # is stamped on the result row), which are not part of the RESULT the crash must
+            # preserve. Compare the result payload itself.
+            after = snapshot()[1]
+            assert after is not None, 'the stored result row disappeared across the restart'
+            assert after['result'] == saved['result']
 
     try:
         with daemon(root, home, env, barrier=True, fixture='terminal_commit_daemon.py') as (proc, _desc):

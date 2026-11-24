@@ -4364,6 +4364,14 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     by sessions.min_interval_hours (VACUUM additionally by its own throttles). Opens its own
     SessionDB — SQLite connections are thread-bound.
 
+    Also reclaims gateway terminal/admission tombstones (see
+    :meth:`SessionDB.prune_retired_tombstones`). Those live in ``state_meta`` and are NOT reachable
+    from ``prune_sessions``, so without this the namespace grows without bound — it was the single
+    largest consumer of ``state_meta`` (~78 MB in a 1.7 GB store) and the reason a store's file
+    size never shrank. The tombstone sweep has its OWN horizon (the exact-retry horizon, 7 days)
+    and is deliberately NOT gated on ``sessions.auto_prune``: the tombstones are gateway admission
+    proofs, not session history, so a profile that never prunes sessions still leaks them.
+
     Profile-scoped by its caller: ``acquire()``, ``get_hermes_home()`` and ``load_config()`` all
     resolve through the active scope, so an unscoped run swept only the LAUNCH profile's store with
     the LAUNCH profile's retention settings and a multiplexed secondary was never archived, pruned
@@ -4373,10 +4381,18 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     from hermes_cli.config import load_config as _load_full_config
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
-        return
     _adb = acquire()
     try:
+        # Tombstone sweep first: it is cheap (indexed GLOB deletes) and runs regardless of the
+        # session-retention switches below.
+        try:
+            _reclaimed = _adb.prune_retired_tombstones()
+            if _reclaimed:
+                logger.info("state.db tombstone sweep reclaimed %s gateway tombstone row(s)", _reclaimed)
+        except Exception as exc:
+            logger.warning("state.db tombstone sweep skipped: %s", exc)
+        if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
+            return
         if _sess_cfg.get("auto_archive", False):
             _adb.maybe_auto_archive(
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
