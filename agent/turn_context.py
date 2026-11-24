@@ -684,6 +684,12 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
     agent._tool_guardrails.reset_for_turn()
+    # The no-answer budget is per TURN: a turn that concluded must not be charged
+    # for the previous turn's probes, or a long session would end its next turn
+    # having already spent a budget it never used.
+    _nab = getattr(agent, "_no_answer_budget", None)
+    if _nab is not None:
+        _nab.reset(getattr(_nab, "budget", None))
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()

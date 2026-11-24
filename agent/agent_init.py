@@ -43,6 +43,9 @@ from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
+from agent.no_answer_budget import (
+    DEFAULT_NO_ANSWER_TOOL_BUDGET, NoAnswerBudgetState, budget_from_config,
+)
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -1150,6 +1153,23 @@ def _apply_display_config(agent, _agent_cfg, platform):
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+
+    # Per-turn "no answer yet" tool-call budget (#137500 family). Every other tool-loop
+    # guardrail needs a REPEAT to fire; a run of distinct, successful probes that never
+    # concludes evades all of them. This one bounds the run itself, so the turn is asked
+    # to write up instead of probing forever. The budget is a code-level default, so a
+    # later deploy or config sync cannot silently remove the bound.
+    try:
+        agent._no_answer_budget = NoAnswerBudgetState(
+            budget=budget_from_config(
+                _agent_cfg.get("tool_loop_guardrails", {}), platform=platform,
+            )
+        )
+    except Exception as _nab_err:
+        _ra().logger.warning("No-answer budget config ignored: %s", _nab_err)
+        agent._no_answer_budget = NoAnswerBudgetState(
+            budget=DEFAULT_NO_ANSWER_TOOL_BUDGET,
+        )
 
 
 def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):

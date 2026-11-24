@@ -12,6 +12,7 @@ import logging
 from typing import Any, Callable, Dict, Optional
 
 from agent.message_metadata import append_message
+from agent.no_answer_budget import budget_state
 from agent.reasoning_promotion import answer_in_reasoning_capability
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.stream_delivery import publish_held_final_row
@@ -172,6 +173,12 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+    # The turn produced a real answer: the no-answer budget is satisfied and the
+    # "stop and write up" directive must not fire again this turn (#137500 family).
+    if final_response and not assistant_message.tool_calls:
+        _nab_state = budget_state(agent)
+        if _nab_state is not None:
+            _nab_state.mark_answered()
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False

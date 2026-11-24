@@ -1377,6 +1377,7 @@ class AIAgent(
     _execute_tool_calls_concurrent = _forward("agent.tool_executor", "execute_tool_calls_concurrent")
     _execute_tool_calls_sequential = _forward("agent.tool_executor", "execute_tool_calls_sequential")
     _handle_max_iterations = _forward("agent.chat_completion_helpers", "handle_max_iterations")
+    _handle_no_answer_budget = _forward("agent.chat_completion_helpers", "handle_no_answer_budget")
 
     def _conversation_root_id(self) -> Optional[str]:
         """Session-lineage ROOT id for Portal usage attribution, so one conversation keeps a single

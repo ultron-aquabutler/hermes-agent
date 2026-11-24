@@ -48,6 +48,7 @@ from agent.message_sanitization import (
     _sanitize_messages_surrogates, _sanitize_surrogates, _repair_tool_call_arguments,
     normalize_finish_reason as _normalize_finish_reason, sanitize_outbound_kwargs, strip_images_for_rejecting_model,
 )
+from agent.no_answer_budget import budget_state
 from agent.reasoning_summaries import (
     append_streamed_reasoning_detail, separate_glued_reasoning_blocks, streamed_reasoning_detail_text)
 from agent.local_prompt_progress import prompt_progress, with_prompt_progress
@@ -2327,7 +2328,45 @@ _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthrop
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    return _request_summary(
+        agent, messages,
+        warning=f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...",
+        request=MAX_ITERATIONS_SUMMARY_REQUEST,
+        failure_site="max_iterations_no_summary",
+        failure_limit=agent.max_iterations,
+    )
+
+
+def handle_no_answer_budget(agent, messages: list, api_call_count: int) -> str:
+    """Request a summary when the turn spent its no-answer tool budget.
+
+    The turn still has API iterations left — the model simply kept probing instead of
+    concluding. One extra toolless request turns the work already done into an answer
+    instead of leaving the user with a silent stop (#137500 family).
+    """
+    state = budget_state(agent)
+    used = getattr(state, "calls", 0)
+    budget = getattr(state, "budget", None)
+    return _request_summary(
+        agent, messages,
+        warning=(
+            f"⚠️  Tool-call budget spent without an answer ({used}/{budget}). "
+            "Requesting summary..."
+        ),
+        request=NO_ANSWER_BUDGET_SUMMARY_REQUEST,
+        failure_site="no_answer_budget_no_summary",
+        failure_limit=budget,
+    )
+
+
+def _request_summary(
+    agent, messages: list, *, warning: str, request: str, failure_site: str, failure_limit,
+) -> str:
+    """One extra toolless API request asking the model to write up what it has.
+
+    Shared by the iteration-budget and the no-answer-budget paths: both end a turn that
+    ran out of room to keep going, and both want the same shape of answer.
+    """
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
         # NOT the gate — the interactive CLI runs quiet_mode=True by default and must see this (#93220 class).
@@ -2340,8 +2379,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     # Shared constant so compaction recognizers can identify this runtime nudge by its stable
     # content after SessionDB projection strips metadata flags.
-    from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
-    nudge = append_message(messages, {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
+    from agent.context_compressor import (
+        MAX_ITERATIONS_SUMMARY_REQUEST, NO_ANSWER_BUDGET_SUMMARY_REQUEST,
+    )
+    nudge = append_message(messages, {"role": "user", "content": request})
 
     try:
         api_messages = _iteration_summary_api_messages(agent, messages)
@@ -2372,7 +2413,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         from agent.turn_failure_copy import site_copy
-        final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
+        final_response = site_copy(failure_site, limit=failure_limit)
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
@@ -4044,6 +4085,7 @@ __all__ = [
     "build_assistant_message",
     "cleanup_task_resources",
     "handle_max_iterations",
+    "handle_no_answer_budget",
     "interruptible_api_call",
     "interruptible_streaming_api_call",
     "try_activate_fallback",

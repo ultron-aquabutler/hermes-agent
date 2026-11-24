@@ -344,6 +344,15 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response "
     "summarizing what you've found and accomplished so far, without calling any more tools."
 )
+#: The no-answer budget's summary request. Sent when a turn spent its tool-call
+#: budget without ever producing an answer: the model has plenty of iterations left
+#: but keeps probing instead of concluding. Mirrors ``MAX_ITERATIONS_SUMMARY_REQUEST``
+#: so compaction recognizers see a stable, identifiable nudge.
+NO_ANSWER_BUDGET_SUMMARY_REQUEST = (
+    "You have used this turn's tool-call budget without delivering an answer. Stop investigating "
+    "and provide a final response now: what you found, what you did not find, and what the user "
+    "should do next. Do not call any more tools."
+)
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
 
 

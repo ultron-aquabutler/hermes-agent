@@ -722,6 +722,12 @@ def _dispatch_authorized_once(
 
     guardrail_decision = None
     if block_body is None:
+        # Charge this call to the turn's no-answer budget. It counts every
+        # dispatched call (blocked or not) so a run of probes cannot escape the
+        # budget by failing its way through the run.
+        _nab = getattr(agent, "_no_answer_budget", None)
+        if _nab is not None:
+            _nab.count_call(ref.name)
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
         if guardrail_decision.allows_execution:
             guardrail_decision = None

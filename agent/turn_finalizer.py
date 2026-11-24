@@ -20,6 +20,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.no_answer_budget import budget_state
 from agent.served_model import result_model_fields
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
@@ -637,6 +638,44 @@ def finalize_turn(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
         logger=logger,
     )
+
+    # The no-answer tool budget is spent and the turn still has no answer: the model
+    # burned its budget probing and never concluded. Before the generic silent-stop
+    # handling below can mint a "send continue" message, ask the model for the summary
+    # it was sitting on — one extra toolless request turns the work into an answer
+    # instead of leaving the user with a dead turn (#137500 family).
+    if not final_response and not interrupted and not failed:
+        _nab_state = budget_state(agent)
+        if _nab_state is not None and _nab_state.exhausted:
+            _turn_exit_reason = "no_answer_budget_exhausted"
+            logger.warning(
+                "No-answer tool budget exhausted (%s/%s) without an answer — requesting summary",
+                getattr(_nab_state, "calls", 0), getattr(_nab_state, "budget", None),
+            )
+            agent._emit_diagnostic_status(
+                f"⚠️ Tool-call budget spent without an answer "
+                f"({getattr(_nab_state, 'calls', 0)}/{getattr(_nab_state, 'budget', None)}) "
+                "— asking model to summarise"
+            )
+            _summary_start = time.time()
+            try:
+                final_response = agent._handle_no_answer_budget(messages, api_call_count)
+            except InterruptedError:
+                from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+                interrupted = True
+                _turn_exit_reason = interrupted_during_api_call_reason(agent)
+                final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
+            except Exception as _nab_err:
+                logger.warning("No-answer budget summary failed: %s", _nab_err)
+                from agent.turn_failure_copy import site_copy
+                final_response = site_copy(
+                    "no_answer_budget_no_summary", limit=getattr(_nab_state, "budget", None),
+                )
+            if final_response:
+                failed = False
+            else:
+                final_response = ""
+                failed = True
 
     # A non-interrupted turn that fell out of the loop after a tool result, with no
     # follow-up assistant text, is the Desktop/TUI "silent stop" (#55316, #54756): the

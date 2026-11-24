@@ -399,6 +399,11 @@ _ONE_OFF_COPY: dict[str, str] = {
         "I ran out of steps for this turn ({limit} tool calls) before finishing, and couldn't "
         "produce a summary. Send `continue` to keep going, or raise `max_iterations` in your config."
     ),
+    "no_answer_budget_no_summary": (
+        "I used this turn's tool-call budget ({limit} calls) without producing an answer, and "
+        "couldn't produce a summary either. Send `continue` to keep going, or raise "
+        "`tool_loop_guardrails.no_answer_budget` in your config."
+    ),
     "nous_rate_limit": (
         "Wait for the reset and send /retry, or switch models with /model. To avoid waits, add "
         "a backup provider with `hermes fallback add`."

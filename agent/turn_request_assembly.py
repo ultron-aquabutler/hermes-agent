@@ -18,6 +18,7 @@ from agent.usage_anchor import anchored_context_tokens
 from agent.prompt_caching import build_prompt_cache_plan, effective_cache_ttl
 from agent.turn_context import build_api_messages
 from agent.turn_empty_response import add_empty_response_retry_hint
+from agent.no_answer_budget import add_no_answer_budget_directive
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -200,6 +201,11 @@ def assemble_api_request(
     _sanitize_messages_surrogates(api_messages)
 
     _empty_retry_suffix = add_empty_response_retry_hint(agent, api_messages)
+    # The no-answer budget directive decorates the outgoing tail only. It fires once the
+    # turn has spent its tool-call budget without producing an answer, and it is
+    # re-asserted on every request so a model that ignores the first notice still cannot
+    # keep probing (#137500 family).
+    _no_answer_suffix = add_no_answer_budget_directive(agent, api_messages)
 
     # No send-time pad loop here: ``repair_empty_non_final_messages`` (inside
     # ``_sanitize_api_messages``) is the single owner of empty-turn repair.
