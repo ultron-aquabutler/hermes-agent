@@ -2440,7 +2440,7 @@ class ContextCompressor(
         self._load_durable("_fallback_compression_streak", "get_compression_fallback_streak", "compression fallback streak", int, 0)
 
     def _load_proactive_prune_rearm_tokens(self) -> None:
-        """Restore the cache-boundary runway for a resumed durable session."""
+        """Restore the cache-boundary runway and the cold-prune credit for a resumed durable session."""
         self._load_durable(
             "_proactive_prune_rearm_tokens", "get_session_model_config_value", "proactive prune runway",
             int, 0, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0,
@@ -5804,12 +5804,18 @@ Write only the summary body. Do not include any preamble or prefix."""
         # was already read, and the next agent re-reads it — the re-grounding loop.
         #
         # NOTE: this branch's compaction prune does NOT archive the dropped originals to disk (only the
-        # proactive reclaim path does), so the summary is the ONLY place the original survives. The view
-        # therefore replaces `messages` wholesale, not just the window: a stubbed head row would
-        # otherwise be assembled into the final transcript and the original lost for good.
+        # proactive reclaim path does), so the summary is the ONLY place the original survives FOR THE
+        # WINDOW rows. The view is therefore the summarizer's input: `turns_to_summarize` (and the
+        # handoff scan's rebuild of it) must read the ORIGINAL tool results, not the stubs.
+        #
+        # The view must NOT leak into the committed transcript. `messages` stays as the prune left it, so
+        # the window rows land in the transcript as the stubs they are: restoring originals there would
+        # undo the prune the compression just paid for, and a row that alone exceeds the input budget
+        # would put the transcript straight back over the context window (#61932). The head's and the
+        # tail's originals are recoverable from the session archive (archive_and_compact archives the
+        # pre-compaction rows), so nothing is lost by keeping the stubs.
         summary_rows = summary_view(messages, canonical_messages, compress_start, compress_end)
-        messages = summary_rows
-        turns_to_summarize = messages[compress_start:compress_end]
+        turns_to_summarize = summary_rows[compress_start:compress_end]
         # Lean mode demotes stale tail tool results before summary generation so stubs exist even if it aborts.
         if getattr(self, "tail_mode", "lean") == "lean":
             messages = self._demote_stale_tail_tools(messages, compress_end)

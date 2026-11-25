@@ -54,19 +54,32 @@ This branch has two separate pruning implementations:
 
 | Path | Module | Gated on | Writes the original? |
 |---|---|---|---|
-| **Compaction-window prune** | `ContextCompressor._prune_old_tool_results` (`agent/context_compressor.py:3546`) | unconditional (window planning) | **No** — stubs and discards |
-| **Proactive reclaim** | `ProactivePruneMixin.prune_tool_results_only` (`agent/context_compressor_prune.py:105`) | cold cache, or `proactive_prune_tokens` | **Yes** — `archive_pruned_originals` writes to `cache/pruned/` and the stub names the file |
+| **Compaction-window prune** | `ContextCompressor._prune_old_tool_results` (`agent/context_compressor.py`) | unconditional (window planning) | **No** — stubs and discards |
+| **Proactive reclaim** | `ProactivePruneMixin.prune_tool_results_only` (`agent/context_compressor_prune.py`) | cold cache, or `proactive_prune_tokens` | **Yes** — archives the original and the stub names the file |
 
-Only the proactive path archives. The compaction path has **nowhere** to put the
-dropped original, so before this fix the original existed in exactly one place:
-the transcript. Reading the stub instead of the original destroyed it.
+### Where the compaction prune's originals actually go
 
-### Why upstream's version is only *half* the fix
+The compaction-window prune does not write dropped originals to disk. They are
+still recoverable, by a different route: the compression commit calls
+`SessionDB.archive_and_compact()` (`agent/conversation_compression.py`), which
+archives the **pre-compaction** rows — the originals — and writes the compacted
+transcript as the new active rows.
+
+This is the same guarantee upstream gets from `cache/pruned/`, reached by a
+different mechanism, and it is what makes upstream's scope the correct one here.
+
+### Upstream's scope, and why it is the right one
 
 Upstream `NousResearch/hermes-agent` commit `d922b62d28` ("summarize the original
 tool results first, archive after the summary") restores the originals for the
-summary **window** only. Upstream can leave the head pruned because its
-`_commit_window` / `_assemble_with_archive_list` machinery **archives** every
+summary **window** only:
+
+```python
+return [*plan[:start], *window, *plan[end:]]
+```
+
+The head and the tail stay as the prune left them. Upstream can do that because
+its `_commit_window` / `_assemble_with_archive_list` machinery archives every
 dropped original to `cache/pruned/` and appends an archive list to the committed
 summary:
 
@@ -74,12 +87,17 @@ summary:
 Archived tool output (exact originals; read_file a path to recover one):
 ```
 
-This branch has **neither** the archive-list step nor `archive_compaction_drops`.
-So a stubbed head row would be assembled into the final transcript and the
-original lost for good. The port here therefore restores the original for
-**every** pruned tool row, matching upstream's own stated invariant:
+The head's original is recoverable either way, so restoring it into the
+transcript buys nothing and costs a great deal: it undoes the prune the
+compression just paid for, and a head row that alone exceeds the input budget
+puts the transcript straight back over the context window. That is issue
+**#61932**, and it is the reason the restoration scope here is the window alone.
 
-> results being summarized are never pointers, stubs or dedup references
+> An earlier revision of this fix restored the head as well, on the reasoning
+> that this branch had no archive. That reasoning was wrong: `archive_and_compact`
+> archives the pre-compaction rows, so the head's original is recoverable. The
+> wider scope broke `test_protected_tail_pressure.py` — the transcript no longer
+> shrank below the input budget — and was reverted.
 
 ### The three behaviours that were missing
 
@@ -111,35 +129,53 @@ no-answer tool-call budget, the runaway guard, the historical-snapshot fix).
 
 ```python
 def summary_view(plan, originals, start, end):
-    """*plan* with the ORIGINAL tool results put back: what the summarizer reads."""
+    """*plan* with the ORIGINAL tool results put back for the WINDOW only."""
     if len(originals) != len(plan):
         return plan
     calls = _tool_calls_by_id(originals)
-    return [
+    window = [
         original if (original.get("role") == "tool"
                      and calls.get(original.get("tool_call_id") or "", ("",))[0]
                      not in _SUMMARY_KEEPS_PRUNED_FORM)
         else pruned
-        for pruned, original in zip(plan, originals)
+        for pruned, original in zip(plan[start:end], originals[start:end])
     ]
+    return [*plan[:start], *window, *plan[end:]]
 ```
 
-`agent/context_compressor.py` — in `compress()`, the summary view replaces
-`messages` **wholesale**, before the stale-tail demotion and before the
-handoff scan:
+`agent/context_compressor.py` — in `compress()`, the view feeds the summarizer
+but does **not** replace `messages`:
 
 ```python
 summary_rows = summary_view(messages, canonical_messages, compress_start, compress_end)
-messages = summary_rows
-turns_to_summarize = messages[compress_start:compress_end]
+turns_to_summarize = summary_rows[compress_start:compress_end]
 ```
 
-Two ordering details are load-bearing:
+`messages` stays as the prune left it, so the committed transcript keeps the
+stubs. Three ordering details are load-bearing:
 
 - The view is taken **before** `_demote_stale_tail_tools`, otherwise the demotion
   would re-stub rows the view had just restored.
 - `_scan_window_handoffs` is given the summary view so its rebuild does not
   reintroduce stubs and silently undo the fix.
+- The view must **not** be written back into `messages`. Doing so leaks the
+  restored originals into the committed transcript and re-inflates it past the
+  context window — the #61932 failure mode.
+
+### The prune implementation was reverted, not upgraded
+
+Commit `2673197e76` also replaced this branch's proactive-prune implementation
+with upstream's newer one. That newer implementation is an architectural
+transplant: it depends on `tools.tool_result_storage.archive_pruned_originals` /
+`discard_archives`, `persistence.core.errors.HeldRowRewritten`,
+`agent.conversation_compression_archive.commit_compaction` and
+`ContextCompressor._store_interface()` — none of which exist on this branch.
+It also brought cold-cache credit state that nothing consumed.
+
+The branch-era prune implementation was restored, and only the three safe
+`4a45994971` helpers (`terminal_stub`, `delegate_stub`, `stub_arguments`) were
+kept on top of it. The newer upstream prune, the cold-cache gate and its
+archive subsystem were **not** ported — that is a separate, larger change.
 
 ## Configuration
 
@@ -165,19 +201,22 @@ Effective fleet ceiling: **120,000** tokens (see
 ```bash
 cd /home/serveradmin/.hermes/hermes-agent
 git log --oneline -3
-# expect 2673197e76 fix(compression): summarize the ORIGINAL tool results, not the pruned stubs
 
-grep -n "messages = summary_rows" agent/context_compressor.py
-grep -n "for pruned, original in zip(plan, originals)" agent/context_compressor_window.py
+grep -n "turns_to_summarize = summary_rows\[compress_start:compress_end\]" \
+  agent/context_compressor.py
+grep -n "zip(plan\[start:end\], originals\[start:end\])" \
+  agent/context_compressor_window.py
 ```
+
+If `messages = summary_rows` is present, the build predates the scope fix and
+will re-inflate the transcript past the context window.
 
 ### Run the invariant
 
 ```bash
-/home/serveradmin/.hermes/profiles/friday/cache/scratch/run_iso_tests.sh \
-  /tmp/summary_view.log tests/agent/test_compaction_summary_view.py
-tail -3 /tmp/summary_view.log
-# expect: 8 passed
+/home/serveradmin/.hermes/profiles/friday/cache/scratch/run_iso_pytest.sh \
+  tests/agent/test_compaction_summary_view.py
+# expect: 6 passed
 ```
 
 ### Run the surrounding compression suite
@@ -212,6 +251,18 @@ PY
 Check the order of operations in `compress()`. If `_demote_stale_tail_tools` runs
 **before** `summary_view`, the demotion re-stubs the restored rows and the fix
 is inert.
+
+### The transcript will not shrink below the input budget (#61932)
+
+The restoration scope has crept. It must cover the summary window **only**.
+If the head's originals are restored into `messages`, a head row that alone
+exceeds the input budget goes back into the transcript and the compression no
+longer reduces the context.
+
+```bash
+grep -n "messages = summary_rows" agent/context_compressor.py
+# must print nothing
+```
 
 ### The stub is back but the summary looks fine
 
@@ -250,6 +301,9 @@ same suite in ~25s.
   `d922b62d28` (ported).
 - `agent/context_compressor_prune.py` — upstream `terminal_stub`, `delegate_stub`
   and `stub_arguments` helpers from `4a45994971`.
+- `agent/conversation_compression.py` — `SessionDB.archive_and_compact()`, which
+  archives the pre-compaction rows and makes the head's dropped originals
+  recoverable.
 - `agent/context_compressor_summary.py` — copied from upstream at `1613885a4e`.
 - `tests/home_io_guard.py` — the guard that forces an isolated home for test runs.
 

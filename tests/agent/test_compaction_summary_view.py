@@ -154,11 +154,11 @@ def test_compressor_summarizer_receives_original_tool_results():
         "the stub must NOT carry the original content"
     )
 
-    # What compress() now does (the fix): the summary view replaces `messages` wholesale, so both the
-    # summarizer's window AND the head keep the ORIGINAL rows.
+    # What compress() now does (the fix): the summary view restores the ORIGINAL rows for the WINDOW —
+    # the rows the summarizer reads. The head and the tail stay as the prune left them.
     summary_rows = _summary_view()(working, canonical, cs, ce)
     turns = summary_rows[cs:ce]
-    scan = comp._scan_window_handoffs(summary_rows, cs, ce, turns, summary_rows)
+    scan = comp._scan_window_handoffs(working, cs, ce, turns, summary_rows)
     turns = scan.turns_to_summarize
 
     # The window the summarizer reads carries originals, never stubs.
@@ -169,23 +169,26 @@ def test_compressor_summarizer_receives_original_tool_results():
         f"the summarizer must never be handed a stub; it received: {summarizer_input[:200]!r}"
     )
 
-    # And the head — the part assembled into the final transcript — keeps its original too.
-    # Without this the pruned row is assembled as a stub and the original is gone for good:
-    # this branch's compaction prune does not archive dropped originals to disk.
-    assert "card ids A1 A2 A3" in summary_rows[1]["content"], (
-        f"the head must keep the original; got {summary_rows[1]['content'][:120]!r}"
+    # The head stays pruned, and that is CORRECT: the compression commit archives the pre-compaction
+    # rows (SessionDB.archive_and_compact), so the head's original is recoverable from the session
+    # archive. Restoring it into the transcript would undo the prune the compression just paid for and
+    # put a row that alone exceeds the input budget back over the context window (#61932). Upstream
+    # leaves the head pruned for the same reason — its dropped originals go to cache/pruned/ instead.
+    assert "chars result" in summary_rows[1]["content"], (
+        f"the head must stay pruned; got {summary_rows[1]['content'][:120]!r}"
     )
 
 
-def test_summary_view_restores_the_head_too():
-    """A pruned row OUTSIDE the window is restored too.
+def test_summary_view_restores_the_window_only():
+    """A pruned row OUTSIDE the window is NOT restored.
 
-    This branch's compaction prune does not archive the dropped original to disk
-    (only the proactive reclaim path does), so a stubbed head row is assembled
-    into the final transcript and the original is lost for good. Upstream can
-    leave the head pruned because its ``_commit_window`` archives the original to
-    ``cache/pruned/``; this branch has neither mechanism, so the original must
-    survive in the transcript the summarizer reads.
+    Upstream's ``summary_view`` restores the window alone (``[*plan[:start], *window, *plan[end:]]``):
+    the head and the tail stay as the prune left them. Upstream can leave the head pruned because its
+    ``_commit_window`` archives the dropped original to ``cache/pruned/``; this branch has the same
+    guarantee by a different route — the compression commit calls ``SessionDB.archive_and_compact()``,
+    which archives the pre-compaction rows. So the head's original is recoverable either way, and
+    restoring it into the transcript would only undo the prune and re-inflate the transcript past the
+    context window (#61932).
     """
     original = _tool_result("call_1", "THE ACTUAL FILE CONTENT — 62 card ids")
     pruned = {**_tool_result("call_1", "[read_file] path=/notes/sweep.md (2,048 chars result)")}
@@ -196,9 +199,9 @@ def test_summary_view_restores_the_head_too():
     # Window covers only the assistant row; the tool row is in the HEAD.
     view = _summary_view()(plan, originals, 1, 2)
 
-    assert view[0]["content"] == original["content"], (
-        "the head's pruned row must be restored: this branch has no archive to "
-        "recover it from, so the summary is the only place it can survive"
+    assert view[0]["content"] == pruned["content"], (
+        "the head's pruned row must stay pruned: its original is recoverable from the "
+        "session archive, and restoring it re-inflates the transcript"
     )
 
 

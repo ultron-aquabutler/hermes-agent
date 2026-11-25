@@ -36,28 +36,37 @@ def summary_view(
     examined. The next agent then re-reads it. That is the re-grounding loop: a compaction that loses the
     evidence it was supposed to preserve.
 
-    Scope difference from upstream, and why: upstream restores originals for the window only, because the
-    head's dropped results are recoverable from the archive on disk. Here there is no archive for the
-    compaction prune, so a stubbed head row is permanently lost. Upstream's own comment says the point is
-    that "results being summarized are never pointers, stubs or dedup references" — the head rows are
-    summarized too (they are part of the transcript the summary stands in for), so this restores the
-    original for every pruned tool row and leaves the window boundaries alone.
+    Scope difference from upstream, and why: upstream restores originals for the window only, and this
+    branch does the same. Upstream can leave the HEAD pruned because the head's dropped originals are
+    recoverable from the on-disk archive (``cache/pruned/``). This branch has no such file archive, but
+    it has the same guarantee by a different route: the compression commit calls
+    ``SessionDB.archive_and_compact()``, which archives the pre-compaction rows (the originals) and
+    writes the compacted transcript as the new active rows. A stubbed head row's original is therefore
+    still recoverable from the session archive, exactly as upstream recovers it from disk. Restoring it
+    into the transcript would be wrong twice over: it would undo the prune the compression just paid
+    for, and a head row that alone exceeds the input budget would put the transcript straight back over
+    the context window (#61932).
 
-    ``start``/``end`` are still honoured for the caller that needs the window alone, but the restoration
-    covers the whole list; passing them narrows nothing.
+    The TAIL is the third case, and it is left pruned for the same reason. The tail is what the agent is
+    still working on, and the Phase-1 pressure pass (#61932) demotes its oversized tool bodies on
+    purpose: a protected tail that alone exceeds the input budget must give way, or the transcript
+    cannot shrink at all.
+
+    So the restoration covers the window ``[start, end)`` alone — the rows the summarizer reads. Every
+    other row stays as the prune left it.
     """
     if len(originals) != len(plan):
         return plan
     from agent.context_compressor import _tool_calls_by_id
 
     calls = _tool_calls_by_id(originals)
-    restored = [
+    window = [
         original if (original.get("role") == "tool"
                      and calls.get(original.get("tool_call_id") or "", ("",))[0] not in _SUMMARY_KEEPS_PRUNED_FORM)
         else pruned
-        for pruned, original in zip(plan, originals)
+        for pruned, original in zip(plan[start:end], originals[start:end])
     ]
-    return restored
+    return [*plan[:start], *window, *plan[end:]]
 
 
 class CompactionWindowMixin:
