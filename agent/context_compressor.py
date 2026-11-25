@@ -31,7 +31,7 @@ from agent.auxiliary_client import (
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.context_compressor_prellm import PreLlmSkipMixin
-from agent.context_compressor_window import CompactionWindowMixin
+from agent.context_compressor_window import CompactionWindowMixin, summary_view
 from agent.context_compressor_prune import ProactivePruneMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
@@ -848,7 +848,7 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 def _is_summary_stub(content: str) -> bool:
     """True for a ``[tool] ... (N chars)`` summary (a prune-only one may carry the rule) or a lean-tail demotion stub."""
-    return (s := without_skill_safety_rule(content)).startswith("[") and " chars)" in s and len(s) < 400 or is_demoted_stub(s)
+    return (s := without_skill_safety_rule(content)).startswith("[") and (" chars)" in s or " chars result)" in s) and len(s) < 400 or is_demoted_stub(s)
 
 
 # Shared floor; the clarify summary cap must stay strictly BELOW it so a preserved
@@ -1670,10 +1670,8 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
 
 
 def _sum_terminal(name, args, content, content_len, line_count):
-    cmd = _str_arg(args, "command")
-    cmd = cmd if len(cmd) <= 80 else cmd[:77] + "..."
-    exit_code = m.group(1) if (m := re.search(r'"exit_code"\s*:\s*(-?\d+)', content)) else "?"
-    return f"[terminal] ran `{cmd}` -> exit {exit_code}, {line_count} lines output"
+    from agent.context_compressor_prune import terminal_stub
+    return terminal_stub(args, content, line_count)
 
 
 def _sum_write_file(name, args, content, content_len, line_count):
@@ -1714,9 +1712,8 @@ def _sum_web_extract(name, args, content, content_len, line_count):
 
 
 def _sum_delegate_task(name, args, content, content_len, line_count):
-    goal = _str_arg(args, "goal")
-    goal = goal if len(goal) <= 60 else goal[:57] + "..."
-    return f"[delegate_task] '{goal}' ({content_len:,} chars result)" + _result_failure_suffix(content)
+    from agent.context_compressor_prune import delegate_stub
+    return delegate_stub(args, content, content_len)
 
 
 def _sum_execute_code(name, args, content, content_len, line_count):
@@ -2028,7 +2025,8 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
     if summarizer is not None:
         return summarizer(tool_name, args, content, content_len, line_count)
-    first_arg = "".join(f" {k}={str(v)[:40]}" for k, v in list(args.items())[:2])
+    from agent.context_compressor_prune import stub_arguments
+    first_arg = stub_arguments(args)
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)" + _result_failure_suffix(content)
 
 
@@ -5413,11 +5411,18 @@ Write only the summary body. Do not include any preamble or prefix."""
     def _scan_window_handoffs(
         self, messages: list[dict[str, Any]], compress_start: int, compress_end: int,
         turns_to_summarize: list[dict[str, Any]],
+        summary_rows: list[dict[str, Any]] | None = None,
     ) -> _HandoffScan:
         """Rehydrate ``_previous_summary`` / user-turn provenance from in-transcript handoffs.
         Handoff rows are removed from the summarizer window (merged handoffs unwrap to their prior-tail
         content) and ``tail_start`` advances past a handoff beyond the window. The pre-scan state is
-        captured so an aborted attempt can roll the mutation back (#57835)."""
+        captured so an aborted attempt can roll the mutation back (#57835).
+
+        *summary_rows* is the summary VIEW of the transcript (the original tool results the summarizer
+        must read, per upstream d922b62d28). The scan rebuilds ``turns_to_summarize`` from the rows it
+        keeps, so it must rebuild from that view — rebuilding from *messages* would hand the summarizer
+        the pruned/stubbed rows again and lose the evidence the summary exists to preserve.
+        """
         scan = _HandoffScan(
             turns_to_summarize=turns_to_summarize, summary_indices=set(), tail_start=compress_end,
             # Snapshot so an aborted attempt can roll back the self-heal mutation (#57835).
@@ -5459,9 +5464,10 @@ Write only the summary body. Do not include any preamble or prefix."""
                 return msg
             return self._strip_context_summary_handoff_message(_fresh_compaction_message_copy(msg))
 
-        window = [_window_row(idx, msg) for idx, msg in enumerate(messages[compress_start:summary_idx], start=compress_start)]
-        window.append(_window_row(summary_idx, messages[summary_idx]))
-        scan.turns_to_summarize = [row for row in window if row is not None] + messages[summary_idx + 1:compress_end]
+        window_source = summary_rows if summary_rows is not None else messages
+        window = [_window_row(idx, msg) for idx, msg in enumerate(window_source[compress_start:summary_idx], start=compress_start)]
+        window.append(_window_row(summary_idx, window_source[summary_idx]))
+        scan.turns_to_summarize = [row for row in window if row is not None] + window_source[summary_idx + 1:compress_end]
         if summary_idx >= compress_end:
             scan.tail_start = summary_idx + 1
         return scan
@@ -5791,11 +5797,23 @@ Write only the summary body. Do not include any preamble or prefix."""
         )
         if prepared:
             compress_end = prepared.compress_end
+        # Summarize first, archive after: the summarizer reads the ORIGINAL window rows, so the summary
+        # can record what was actually examined. The pruned/stubbed rows are what the archive keeps.
+        # Ported from upstream d922b62d28 ("summarize the original tool results first, archive after
+        # the summary"). Without this the summarizer reads stubs, the summary cannot say which artifact
+        # was already read, and the next agent re-reads it — the re-grounding loop.
+        #
+        # NOTE: this branch's compaction prune does NOT archive the dropped originals to disk (only the
+        # proactive reclaim path does), so the summary is the ONLY place the original survives. The view
+        # therefore replaces `messages` wholesale, not just the window: a stubbed head row would
+        # otherwise be assembled into the final transcript and the original lost for good.
+        summary_rows = summary_view(messages, canonical_messages, compress_start, compress_end)
+        messages = summary_rows
         turns_to_summarize = messages[compress_start:compress_end]
         # Lean mode demotes stale tail tool results before summary generation so stubs exist even if it aborts.
         if getattr(self, "tail_mode", "lean") == "lean":
             messages = self._demote_stale_tail_tools(messages, compress_end)
-        scan = self._scan_window_handoffs(messages, compress_start, compress_end, turns_to_summarize)
+        scan = self._scan_window_handoffs(messages, compress_start, compress_end, turns_to_summarize, summary_rows)
         turns_to_summarize = scan.turns_to_summarize
         self._record_compression_regions(
             head_messages=messages[:compress_start], middle_messages=turns_to_summarize, tail_messages=messages[compress_end:],

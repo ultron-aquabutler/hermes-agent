@@ -9,6 +9,56 @@ from typing import Any, Optional
 from agent.context_compressor_tail import tail_cut_progress_floor
 from agent.prepared_compaction import PreparedCompaction, PreparedSummary
 
+#: Tools whose pruned form is a correctness filter, not a size cut: a clarify one-liner keeps only real user
+#: answers and drops legacy headless notices ("... using your own judgment") the summarizer would read as one.
+_SUMMARY_KEEPS_PRUNED_FORM = frozenset({"clarify"})
+
+
+def summary_view(
+    plan: list[dict[str, Any]], originals: list[dict[str, Any]], start: int, end: int,
+) -> list[dict[str, Any]]:
+    """*plan* with the ORIGINAL tool results put back: what the summarizer reads.
+
+    The pre-summary prune shapes only the boundaries and the kept head/tail; results being summarized
+    are never pointers, stubs or dedup references (the summarizer's own input budget bounds them).
+
+    Ported from upstream ``NousResearch/hermes-agent`` commit ``d922b62d28`` ("summarize the original tool
+    results first, archive after the summary"). Upstream built it against a different window architecture
+    (``_commit_window``/``_assemble_with_archive_list``) where the dropped originals are ARCHIVED to disk
+    (``cache/pruned/``) and the committed summary lists them. This branch has no archive-list step and its
+    compaction prune does not write the original anywhere, so the original exists in exactly one place:
+    the transcript. Reading the PRUNED rows instead means the summary is written from stubs and the
+    original is gone for good.
+
+    Why it matters: the summarizer is what records the compacted turns' facts for the next agent. Reading
+    the PRUNED tool results instead of the originals means it summarises stubs ("[read_file] path=...
+    (1,234 chars result)") rather than what was read, so the summary cannot say which artifact was already
+    examined. The next agent then re-reads it. That is the re-grounding loop: a compaction that loses the
+    evidence it was supposed to preserve.
+
+    Scope difference from upstream, and why: upstream restores originals for the window only, because the
+    head's dropped results are recoverable from the archive on disk. Here there is no archive for the
+    compaction prune, so a stubbed head row is permanently lost. Upstream's own comment says the point is
+    that "results being summarized are never pointers, stubs or dedup references" — the head rows are
+    summarized too (they are part of the transcript the summary stands in for), so this restores the
+    original for every pruned tool row and leaves the window boundaries alone.
+
+    ``start``/``end`` are still honoured for the caller that needs the window alone, but the restoration
+    covers the whole list; passing them narrows nothing.
+    """
+    if len(originals) != len(plan):
+        return plan
+    from agent.context_compressor import _tool_calls_by_id
+
+    calls = _tool_calls_by_id(originals)
+    restored = [
+        original if (original.get("role") == "tool"
+                     and calls.get(original.get("tool_call_id") or "", ("",))[0] not in _SUMMARY_KEEPS_PRUNED_FORM)
+        else pruned
+        for pruned, original in zip(plan, originals)
+    ]
+    return restored
+
 
 class CompactionWindowMixin:
     """Window planning shared by compress() and the background pass."""
