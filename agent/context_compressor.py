@@ -39,6 +39,7 @@ from agent.context_compressor_retry import retryable_user_text, typed_prompt_con
 from agent.context_compressor_tail import (
     demote_stale_tail_tools, lean_tail_budget, is_demoted_stub, skill_view_names_by_call_id, tail_cut_pricer,
     elide_keeping_skill_safety_rule, with_skill_safety_rule, without_skill_safety_rule, tail_cut_progress_floor,
+    SKILL_SAFETY_RULE,
 )
 from agent.context_compressor_telemetry import CompressionTelemetryMixin
 from agent.error_classifier import ClassifiedError, FailoverReason, classify_api_error
@@ -538,6 +539,49 @@ _INFLIGHT_TASK_REPLAY_HEADER = (
 
 _SALVAGE_SUMMARY_MAX_CHARS = 8_000
 _SALVAGE_KEEP_RECENT_TOOLS = 2
+
+# Published-summary budget (2026-11-26). The summarizer is TOLD to target
+# ``max_summary_tokens`` (10,000) but the budget is only a suggestion inside the
+# prompt. Live summaries on Vision (profile ``default``, session
+# 20261110_162723_dc65d8e8) reached 114,050 chars -- ~28,500 tokens, a 3x
+# overshoot -- and became 70.6% of the session's live transcript on their own.
+# Because the iterative update path feeds the previous summary back in with
+# "PRESERVE all existing information that is still relevant", the summary is
+# monotonically non-shrinking by construction, so an unbounded summary is a
+# feedback loop: summary -> dominates context -> compact again -> bigger summary.
+#
+# The salvage path has always capped a standalone handoff at 8,000 chars, but
+# only when a compaction GREW the transcript. A compaction that shrinks the
+# transcript never reached that cap, which is why the loop persisted: every
+# Vision compaction "succeeded" (ineffective_count stayed 0) and stayed huge.
+# The cap is therefore applied unconditionally at publication now, so a
+# successful compaction is bounded exactly like a growing one.
+#
+# The effective cap is ``max_summary_tokens * _SUMMARY_CHARS_PER_TOKEN`` (50,000
+# chars at the default 10,000-token budget), floored at the value below. It sits
+# well under the 114,050-char row that caused the incident, and it is still
+# generous enough that a well-behaved summary (which lands far under the
+# nominal budget) is never touched.
+_PUBLISHED_SUMMARY_MAX_CHARS = 40_000
+
+# chars per token used to express the token budget in the units a summary is
+# stored in. 4 is the usual English approximation; 5 leaves headroom for the
+# observed skew (a 10,000-token budget produced a 28,500-token / 114,050-char
+# summary, i.e. ~4 chars/token at the point of storage) without letting a 3x
+# overshoot back inside the budget.
+_SUMMARY_CHARS_PER_TOKEN = 5
+
+# The previous summary handed back to the summarizer on the iterative update
+# path. Same 160,000-char bound as the new-turns side would let a 135,803-char
+# summary back in and re-expand; bound it to the published budget so the
+# iterative base can never be larger than what we are willing to publish.
+_PREVIOUS_SUMMARY_INPUT_MAX_CHARS = 40_000
+
+# The summary share of the live transcript above which another compaction is
+# refused. Measured: a 12% share (60,000 of 500,000 chars) is a normal
+# large-context session; 70.6% (114,050 of 161,507) was the incident. 50%
+# sits well clear of the normal band and well below the pathology.
+_SUMMARY_DOMINANCE_MAX_SHARE = 0.50
 
 
 def _looks_like_compaction_summary(msg: dict[str, Any], content: str) -> bool:
@@ -2249,6 +2293,28 @@ class ContextCompressor(
     def max_summary_tokens(self, value: int) -> None:
         self._max_summary_tokens = value
 
+    @property
+    def max_summary_chars(self) -> int:
+        """The character budget a PUBLISHED summary may occupy.
+
+        Derived from ``max_summary_tokens`` so the two cannot drift: the token
+        budget is what the summarizer is told to target, and this is the same
+        budget expressed in the units the summary is actually stored in. The
+        multiplier absorbs the token->char skew seen in practice (a 10,000-token
+        budget produced a 28,500-token / 114,050-char summary).
+        """
+        return max(int(self.max_summary_tokens) * _SUMMARY_CHARS_PER_TOKEN, _PUBLISHED_SUMMARY_MAX_CHARS)
+
+    @property
+    def _previous_summary_max_chars(self) -> int:
+        """The cap on the previous summary fed back into the summarizer.
+
+        Bounded by the same published budget so the iterative base can never be
+        larger than what we are willing to publish -- otherwise a 135,803-char
+        summary is handed back in and re-expanded into the next one.
+        """
+        return min(_PREVIOUS_SUMMARY_INPUT_MAX_CHARS, self.max_summary_chars)
+
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         """Clear all per-session compaction state at a real session boundary.
         Session end (CLI exit, gateway expiry, id rotation) — NOT /new or /reset. Every per-session
@@ -2306,6 +2372,19 @@ class ContextCompressor(
         # Monotonic timestamp of the last COMPLETED compaction; 0.0 = none yet. Bounds the cadence
         # of compactions (see _MIN_COMPACTION_INTERVAL_SECONDS).
         self._last_compression_completed_at = 0.0
+        # Summary share of the live transcript after the last completed compaction:
+        # (summary chars) / (total live transcript chars). 0.0 = unknown.
+        #
+        # This is the signal that actually predicts the runaway loop. The transcript-size
+        # guard in gateway/runaway_session_guard.py measures the SAME thing as an absolute
+        # (live_chars >= 800,000), so a session whose live transcript is 161,507 chars
+        # because ONE 114,050-char summary row dominates it never trips that guard --
+        # which is exactly what happened on Vision. The SHARE is scale-free: it catches
+        # a summary that dominates a small transcript just as well as one that dominates
+        # a large one. Measured: 12% is a normal large-context session, 70.6% was the
+        # incident.
+        self._last_summary_chars = 0
+        self._last_live_chars = 0
         # Wall-clock probe deadline; 0.0 = unarmed (durable copy re-read via _load_anti_thrash_recovery_deadline).
         self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
         self._structural_no_op_len = 0
@@ -2564,13 +2643,42 @@ class ContextCompressor(
     # transcript cannot have grown enough to need it again, so a second pass buys nothing but latency
     # and tokens. This is the cheap first line of defence — it bounds the cadence of a loop even
     # before the loop is proven, and it applies to EVERY provider, usage-reporting or not.
+    #
+    # This is the FALLBACK floor only. The effective floor is
+    # ``self._min_interval_seconds``, which comes from
+    # ``compression.min_interval_seconds`` in the profile config (default 120,
+    # the historical value). A profile that shows the runaway loop raises it
+    # (600 on Vision) without a code change; the class constant is the
+    # built-in default used when no config value is supplied.
+    #
+    # The 120s floor did not bound the observed Vision loop: it compacted every
+    # 4.2-13.5 minutes, so the floor never bound it. The summary-dominance
+    # brake is what actually stopped that loop; a longer floor is the second,
+    # cheaper brake.
     _MIN_COMPACTION_INTERVAL_SECONDS = 120.0
+
+    def _effective_min_interval_seconds(self) -> float:
+        """The wall-clock floor between two automatic compactions, in seconds.
+
+        ``compression.min_interval_seconds`` when the profile sets it, else the
+        class default. 0 means "no floor" — compact as soon as the trigger fires.
+        """
+        floor = getattr(self, "_min_interval_seconds", None)
+        if floor is None:
+            floor = self._MIN_COMPACTION_INTERVAL_SECONDS
+        try:
+            return max(0.0, float(floor))
+        except (TypeError, ValueError):
+            return self._MIN_COMPACTION_INTERVAL_SECONDS
 
     def _compression_interval_elapsed(self) -> bool:
         """Whether enough wall-clock time has passed since the last completed compaction."""
+        floor = self._effective_min_interval_seconds()
+        if floor <= 0.0:
+            return True
         if self._last_compression_completed_at <= 0.0:
             return True
-        return (time.monotonic() - self._last_compression_completed_at) >= self._MIN_COMPACTION_INTERVAL_SECONDS
+        return (time.monotonic() - self._last_compression_completed_at) >= floor
 
     def _usage_less_loop_tripped(self) -> bool:
         """Whether the usage-independent loop detector is currently holding compaction back."""
@@ -3033,7 +3141,7 @@ class ContextCompressor(
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, min_interval_seconds: Any = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -3049,6 +3157,9 @@ class ContextCompressor(
         self.threshold_percent = self._base_threshold_percent
         # Effective trigger = min(ratio threshold, cap); re-applied in update_model().
         self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
+        # Wall-clock floor between two automatic compactions (compression.min_interval_seconds).
+        # None -> the class default; 0 -> no floor.
+        self._min_interval_seconds = min_interval_seconds
         # Aux summariser window installed by the feasibility probe; None until it runs.
         self._aux_context_ceiling: int | None = None
         self.protect_first_n, self.protect_last_n = protect_first_n, protect_last_n
@@ -3241,6 +3352,25 @@ class ContextCompressor(
             return False, self._compression_block_reason() or "blocked"
         return True, None
 
+    def _summary_dominates_transcript(self) -> bool:
+        """Whether the last summary already dominates the live transcript.
+
+        A compaction that replaces one oversized summary with another oversized
+        summary reclaims nothing and re-arms the loop. The share is scale-free,
+        so it catches the case the absolute-size guard misses: a small live
+        transcript (161,507 chars) that is 70.6% summary.
+
+        Returns False when the share is unknown (no completed compaction yet).
+        """
+        if self._last_live_chars <= 0 or self._last_summary_chars <= 0:
+            return False
+        return (self._last_summary_chars / self._last_live_chars) >= _SUMMARY_DOMINANCE_MAX_SHARE
+
+    def _record_transcript_shape(self, summary_chars: int, live_chars: int) -> None:
+        """Remember the post-compaction summary share of the live transcript."""
+        self._last_summary_chars = max(int(summary_chars), 0)
+        self._last_live_chars = max(int(live_chars), 0)
+
     def _compression_block_reason(self, *, ignore_cooldown: bool = False) -> str | None:
         """Block reason: ``"cooldown:<s>"``, ``"structural_backoff:<s>"``, ``"ineffective"``, or None (a cooldown the
         gate's ``ignore_cooldown`` bypassed is never the reason)."""
@@ -3252,8 +3382,13 @@ class ContextCompressor(
         if self._usage_less_loop_tripped():
             return "usage_less_loop"
         if not self._compression_interval_elapsed():
-            remaining = self._MIN_COMPACTION_INTERVAL_SECONDS - (time.monotonic() - self._last_compression_completed_at)
+            remaining = self._effective_min_interval_seconds() - (
+                time.monotonic() - self._last_compression_completed_at
+            )
             return f"min_interval:{max(0.0, remaining):.0f}"
+        if self._summary_dominates_transcript():
+            share = self._last_summary_chars / max(self._last_live_chars, 1)
+            return f"summary_dominant:{share:.0%}"
         return "ineffective" if self._tripped() else None
 
     def _tripped(self) -> bool:
@@ -3276,16 +3411,32 @@ class ContextCompressor(
             except Exception as exc:
                 logger.debug("compression %s refresh failed: %s", label, exc)
 
-    def _automatic_compression_blocked(self, *, ignore_cooldown: bool = False) -> bool:
+    def _automatic_compression_blocked(
+        self, *, ignore_cooldown: bool = False, exclude_summary_dominance: bool = False,
+    ) -> bool:
         """Whether auto-compaction is in cooldown or tripped; ``ignore_cooldown`` skips only the summary-failure cooldown."""
-        if not self._automatic_compression_blocked_locally(ignore_cooldown=ignore_cooldown):
+        if not self._automatic_compression_blocked_locally(
+            ignore_cooldown=ignore_cooldown, exclude_summary_dominance=exclude_summary_dominance,
+        ):
             return False
         # Blocked locally: durable rows may have been cleared by another agent, so refresh before honouring.
         self._refresh_durable_guards()
-        return self._automatic_compression_blocked_locally(ignore_cooldown=ignore_cooldown)
+        return self._automatic_compression_blocked_locally(
+            ignore_cooldown=ignore_cooldown, exclude_summary_dominance=exclude_summary_dominance,
+        )
 
-    def _automatic_compression_blocked_locally(self, *, ignore_cooldown: bool = False) -> bool:
-        """Evaluate the automatic-compaction gate on in-memory state only."""
+    def _automatic_compression_blocked_locally(
+        self, *, ignore_cooldown: bool = False, exclude_summary_dominance: bool = False,
+    ) -> bool:
+        """Evaluate the automatic-compaction gate on in-memory state only.
+
+        ``exclude_summary_dominance`` drops the summary-dominance brake from this
+        evaluation. The brake defers a compaction that would be pointless, but the
+        caller that runs BEFORE the lazy feasibility probe must still run the
+        probe: it is a diagnostic that warns the user their summariser window is
+        below the minimum, and its hard rejection has to propagate. The brake is
+        re-evaluated after the probe, where deferring is free.
+        """
         # Usage-independent loop detector: a proven compaction loop (no provider usage to judge it)
         # pauses AUTOMATIC compaction for a bounded window.
         #
@@ -3311,7 +3462,29 @@ class ContextCompressor(
             if not self.quiet_mode:
                 logger.debug(
                     "Compression deferred — minimum interval since the last compaction not elapsed (%.0fs)",
-                    self._MIN_COMPACTION_INTERVAL_SECONDS,
+                    self._effective_min_interval_seconds(),
+                )
+            return True
+        # Summary-dominance brake: refuse to compact a transcript that is ALREADY one big summary.
+        #
+        # Compacting again replaces one oversized summary with another oversized summary — it
+        # reclaims nothing and re-arms the feedback loop (the new summary is fed back into the
+        # next iteration with "PRESERVE all existing information"). Vision's live transcript was
+        # 161,507 chars of which 114,050 was a single summary row: 70.6%.
+        #
+        # The share is scale-free on purpose. The absolute-size guard in
+        # gateway/runaway_session_guard.py asks "is the transcript big?" and answered no (161,507
+        # << 800,000) precisely BECAUSE the summary had eaten it. Asking "what fraction of the
+        # transcript is the summary?" asks the question that predicts the failure.
+        #
+        # Skipped on the provider-PROVEN overflow path (ignore_cooldown): there the provider has
+        # already rejected the request for exceeding its context, so compaction must be allowed
+        # through or the turn fails.
+        if not ignore_cooldown and not exclude_summary_dominance and self._summary_dominates_transcript():
+            if not self.quiet_mode:
+                logger.debug(
+                    "Compression deferred — summary dominates the live transcript (%.0f%%)",
+                    100.0 * self._last_summary_chars / max(self._last_live_chars, 1),
                 )
             return True
         # Summary-LLM cooldown: without this every turn re-fires and re-inserts the fallback marker (#11529).
@@ -3860,9 +4033,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return summary
 
     @classmethod
-    def _bound_summary_input(cls, content: str) -> str:
+    def _bound_summary_input(cls, content: str, limit: int | None = None) -> str:
         """Cap total summarizer input, keeping head and tail and marking the omitted middle."""
-        if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
+        cap = cls._SUMMARY_INPUT_MAX_CHARS if limit is None else max(int(limit), 0)
+        if len(content) <= cap:
             return content
 
         marker_template = (
@@ -3873,12 +4047,55 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         omitted = len(content)
         for _ in range(2):
             marker = marker_template.format(omitted=omitted)
-            remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
+            remaining = max(cap - len(marker), 0)
             head_chars = int(remaining * 0.45)
             tail_chars = remaining - head_chars
             omitted = max(len(content) - head_chars - tail_chars, 0)
         tail = content[-tail_chars:].lstrip() if tail_chars else ""
         return content[:head_chars].rstrip() + marker + tail
+
+    def _cap_published_summary(self, summary: str) -> str:
+        """Bound a summary to the published budget before it is stored or re-fed.
+
+        The summarizer is told to target ``max_summary_tokens`` but that is a
+        suggestion in the prompt, not a contract: live summaries reached
+        114,050 chars against a 10,000-token budget. Because the iterative
+        update path hands the previous summary back in and instructs the model
+        to preserve it, an oversized summary is not merely large -- it is the
+        fuel for the next one.
+
+        The cut keeps the head AND the tail, because the tail carries "what to
+        do next" -- the most actionable part of a handoff. The skill-safety
+        rule is preserved explicitly by ``elide_keeping_skill_safety_rule``.
+
+        An elision marker is always appended so the next agent can tell a
+        bounded summary from a complete one; an unmarked truncation would read
+        as authoritative and silently lose the middle.
+        """
+        limit = self.max_summary_chars
+        if len(summary) <= limit:
+            return summary
+
+        # Reserve room for the elision marker so the capped result still fits.
+        marker_reserve = len(_elision_marker(len(summary), len(summary)))
+        if limit <= marker_reserve:
+            return elide_keeping_skill_safety_rule(summary, limit)
+
+        remaining = limit - marker_reserve
+        head_chars = int(remaining * 0.70)
+        tail_chars = remaining - head_chars
+        head = summary[:head_chars].rstrip()
+        tail = summary[-tail_chars:].lstrip() if tail_chars else ""
+        omitted = max(len(summary) - len(head) - len(tail), 0)
+        marker = _elision_marker(omitted, len(summary))
+        elided = head + marker + tail
+
+        # The head cut can sever an attached skill-safety rule. ``elide_keeping_skill_safety_rule``
+        # re-attaches it, but it elides head-only (no tail), so use it only as the
+        # rule-preserving fallback; the head+tail cut above is the preferred shape.
+        if SKILL_SAFETY_RULE in summary and SKILL_SAFETY_RULE not in elided:
+            return elide_keeping_skill_safety_rule(summary, limit)
+        return elided
 
     # Lean-mode sampling slice count: 8 keeps slices ~20K chars at the 160K cap.
     _SAMPLED_INPUT_SLICES = 8
@@ -4201,6 +4418,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             from agent.conversation_compression import _raise_if_stale_attempt
 
             _raise_if_stale_attempt(self)
+            # Bound the summary BEFORE it becomes the iterative base. The cap has
+            # to sit here, not after publication: ``_previous_summary`` is what
+            # the next update feeds back in, so an unbounded summary recorded
+            # there is what makes every subsequent summary larger than the last.
+            summary = self._cap_published_summary(summary)
             self._record_summary_success(summary)
             return self._with_summary_prefix(summary)
         except Exception as e:  # health: allow BLE001 -- unchanged summary boundary: every failure goes to _on_summary_failure
@@ -4251,7 +4473,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _template_sections = self._summary_template_sections(_section, summary_budget, _session_log_section)
         if self._previous_summary:
             # Iterative update. Bound the previous summary too: a rehydrated handoff can be huge.
-            _bounded_previous_summary = self._bound_summary_input(self._previous_summary)
+            #
+            # The 160,000-char bound (_SUMMARY_INPUT_MAX_CHARS) is the right cap
+            # for the NEW-TURNS side, but the previous-summary side needs a
+            # tighter one: it is the summary we are about to supersede, and
+            # feeding 135,803 chars of it back in is what re-expands it into
+            # the next summary. Bound it by the published budget so the
+            # iterative base can never exceed what we are willing to publish.
+            _bounded_previous_summary = self._bound_summary_input(
+                self._previous_summary, limit=self._previous_summary_max_chars
+            )
             prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.

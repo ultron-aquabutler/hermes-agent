@@ -1504,17 +1504,37 @@ def context_compression_timed_out(agent: Any) -> bool:
 
 def _automatic_compression_gate_blocks(
     agent: Any, bypass_cooldown: bool, *, include_cooldown: bool = True,
+    exclude_summary_dominance: bool = False,
 ) -> Optional[str]:
     """Refresh durable guards, then evaluate the automatic breaker gate; return its block reason or None. The gate and
     the reason both get ``ignore_cooldown`` when ``bypass_cooldown`` and they accept it (older engines get the no-arg
-    call), so a bypassed cooldown is never the reason. When blocked, the transient-block signal is published."""
+    call), so a bypassed cooldown is never the reason. When blocked, the transient-block signal is published.
+
+    ``exclude_summary_dominance`` drops the summary-dominance brake from the gate. The caller
+    that runs BEFORE the lazy feasibility probe passes it: the probe is a diagnostic whose
+    hard rejection must reach the user, so it must run even when the compaction it guards
+    is going to be deferred. The brake is re-evaluated after the probe.
+    """
     compressor = agent.context_compressor
     _refresh_persisted_compression_guards(compressor, include_cooldown=include_cooldown)
     blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
     if not callable(blocked):
         return None
     ignore = bypass_cooldown and _accepts_keyword_argument(blocked, "ignore_cooldown")
-    if not (blocked(compressor, ignore_cooldown=True) if ignore else blocked(compressor)):
+    exclude_dominance = (
+        exclude_summary_dominance
+        and _accepts_keyword_argument(blocked, "exclude_summary_dominance")
+    )
+
+    def _evaluate() -> bool:
+        kwargs: dict = {}
+        if ignore:
+            kwargs["ignore_cooldown"] = True
+        if exclude_dominance:
+            kwargs["exclude_summary_dominance"] = True
+        return bool(blocked(compressor, **kwargs))
+
+    if not _evaluate():
         return None
     reason, reason_fn = None, getattr(compressor, "_compression_block_reason", None)
     if callable(reason_fn):  # engines predating it name no reason
@@ -3417,6 +3437,33 @@ def _finish_compaction_boundary(
     compressor.last_compression_rough_tokens = _compressed_est
     compressor.last_prompt_tokens = -1
     compressor.last_completion_tokens = 0
+    # Record the post-compaction summary share of the live transcript.
+    #
+    # This is the signal that predicts a runaway compaction loop. The absolute-size
+    # guard in gateway/runaway_session_guard.py cannot see it: on Vision the live
+    # transcript was 161,507 chars -- under its 800,000 floor -- because ONE
+    # 114,050-char summary row made up 70.6% of it. Compacting again replaces one
+    # oversized summary with another and reclaims nothing, so the next compaction
+    # is refused until the summary shrinks.
+    _record_shape = getattr(type(compressor), "_record_transcript_shape", None)
+    if callable(_record_shape):
+        _summary_chars = 0
+        _live_chars = 0
+        try:
+            from agent.context_compressor import ContextCompressor as _CC
+
+            for _msg in compressed:
+                if not isinstance(_msg, dict):
+                    continue
+                _text = _msg.get("content")
+                if not isinstance(_text, str):
+                    continue
+                _live_chars += len(_text)
+                if _CC._is_context_summary_message(_msg):
+                    _summary_chars += len(_text)
+        except Exception:  # health: allow BLE001 -- diagnostics only; never fail a compaction for it
+            _summary_chars = _live_chars = 0
+        _record_shape(compressor, _summary_chars, _live_chars)
     compressor.awaiting_real_usage_after_compression = True
     # Transcript rewritten: invalidate the usage anchor's base snapshot explicitly
     # (its structural check would fail closed anyway); estimate until re-anchored.
@@ -4023,7 +4070,9 @@ def compress_context(
 
     # All automatic entrypoints honor compressor cooldown/breaker state; hygiene's
     # fresh AIAgent loads the persisted streak via bind_session_state() first.
-    if not force and (block_reason := _automatic_compression_gate_blocks(agent, bypass_cooldown)):
+    if not force and (block_reason := _automatic_compression_gate_blocks(
+        agent, bypass_cooldown, exclude_summary_dominance=True,
+    )):
         _emit_blocked_attempt_telemetry(agent, attempt.started_at, approx_tokens, attempt.seed, block_reason)
         return messages, _existing_system_prompt(agent, system_message)
 

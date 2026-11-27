@@ -26,11 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from gateway.runaway_session_guard import (
     DEFAULT_RUNAWAY_MAX_LIVE_CHARS,
     DEFAULT_RUNAWAY_MAX_SEGMENT_HOURS,
+    DEFAULT_RUNAWAY_MAX_SUMMARY_SHARE,
     RUNAWAY_RESET_REASON,
     RunawayLimits,
     check_route_runaway,
     evaluate_runaway,
     read_segment_stats,
+    read_summary_dominance,
 )
 
 HOUR = 3600.0
@@ -323,3 +325,121 @@ def test_check_route_runaway_on_a_broken_db_does_not_trip():
         db=_Broken(), session_id="s1", session_key="k", limits=RunawayLimits()
     )
     assert verdict.tripped is False
+
+
+# --- the summary-dominance backstop --------------------------------------------
+#
+# The absolute size limit cannot see this failure. On Vision (2026-11-26) the live
+# transcript was 161,507 chars -- comfortably under the 800,000 floor -- because ONE
+# 114,050-char summary row made up 70.6% of it. The transcript was small *because* the
+# summary had swallowed it.
+
+
+def test_a_summary_dominated_transcript_trips_even_though_it_is_small():
+    """The measured Vision shape: 70.6% summary share, 161,507 live chars.
+
+    161,507 chars is far below the 800,000 size floor and the segment is young, so
+    neither the size nor the age half of the rule fires. The share must.
+    """
+    verdict = evaluate_runaway(
+        segment_started_at=time.time() - 60,
+        message_count=17,
+        live_chars=161_507,
+        limits=RunawayLimits(),
+        summary_share=0.706,
+    )
+    assert verdict.tripped is True
+    assert "summary" in verdict.reason.lower()
+
+
+def test_a_normal_summary_share_does_not_trip():
+    """12% is a normal large-context session — the false-positive guard."""
+    verdict = evaluate_runaway(
+        segment_started_at=time.time() - 60,
+        message_count=17,
+        live_chars=161_507,
+        limits=RunawayLimits(),
+        summary_share=0.12,
+    )
+    assert verdict.tripped is False
+
+
+def test_an_unknown_summary_share_does_not_trip():
+    """0.0 means "could not measure", not "the summary is empty" — it must not trip."""
+    verdict = evaluate_runaway(
+        segment_started_at=time.time() - 60,
+        message_count=17,
+        live_chars=161_507,
+        limits=RunawayLimits(),
+        summary_share=0.0,
+    )
+    assert verdict.tripped is False
+
+
+def test_the_summary_share_limit_can_be_disabled():
+    limits = RunawayLimits.from_config({"compression": {"runaway_max_summary_share": 0}})
+    assert limits.max_summary_share == 0.0
+    verdict = evaluate_runaway(
+        segment_started_at=time.time() - 60,
+        message_count=17,
+        live_chars=161_507,
+        limits=limits,
+        summary_share=0.95,
+    )
+    assert verdict.tripped is False
+
+
+def test_the_summary_share_limit_is_read_from_config():
+    limits = RunawayLimits.from_config({"compression": {"runaway_max_summary_share": 0.25}})
+    assert limits.max_summary_share == 0.25
+
+
+def test_an_out_of_range_summary_share_limit_is_clamped():
+    assert RunawayLimits.from_config(
+        {"compression": {"runaway_max_summary_share": 5.0}}
+    ).max_summary_share == 1.0
+    assert RunawayLimits.from_config(
+        {"compression": {"runaway_max_summary_share": -1.0}}
+    ).max_summary_share == 0.0
+
+
+def test_the_share_is_measured_from_the_live_transcript(tmp_path):
+    """The measured share must come from the rows, not from a constant."""
+    now = time.time()
+    db = _make_db(tmp_path, "s1", [
+        ("[CONTEXT COMPACTION — REFERENCE ONLY] " + "z" * 114_000, now - 10, 1),
+        ("z" * 47_457, now - 5, 1),
+    ])
+    share = read_summary_dominance(db, "s1")
+    assert share == pytest.approx(114_050 / (114_050 + 47_457), rel=1e-3)
+    assert share > 0.70
+
+
+def test_a_transcript_with_no_summary_measures_zero(tmp_path):
+    now = time.time()
+    db = _make_db(tmp_path, "s1", [("z" * 1000, now - 5, 1)])
+    assert read_summary_dominance(db, "s1") == 0.0
+
+
+def test_the_dominance_measurement_survives_a_broken_db():
+    class _Broken:
+        @contextmanager
+        def _read_ctx(self):
+            raise sqlite3.DatabaseError("boom")
+            yield  # pragma: no cover - unreachable, keeps this a generator
+
+    assert read_summary_dominance(_Broken(), "s1") == 0.0
+
+
+def test_check_route_runaway_trips_on_a_summary_dominated_transcript(tmp_path):
+    """End-to-end through the guard: the measured share reaches the evaluator."""
+    now = time.time()
+    db = _make_db(tmp_path, "s1", [
+        ("[CONTEXT COMPACTION — REFERENCE ONLY] " + "z" * 114_000, now - 10, 1),
+        ("z" * 47_457, now - 5, 1),
+    ])
+    verdict = check_route_runaway(
+        db=db, session_id="s1", session_key="agent:test:telegram:dm:1", limits=RunawayLimits()
+    )
+    assert verdict.tripped is True
+    assert "summary" in verdict.reason.lower()

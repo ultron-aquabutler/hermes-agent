@@ -40,7 +40,57 @@ usage:
 | Guard | Code | Scope | Effect |
 |---|---|---|---|
 | Usage-less loop detector | `_record_usage_less_loop_verdict()` | Providers that omit usage | Pauses automatic compaction for **300 s** |
-| Minimum compaction interval | `_MIN_COMPACTION_INTERVAL_SECONDS = 120` | **Every** provider | Defers a repeat compaction for **120 s** |
+| Minimum compaction interval | `compression.min_interval_seconds` (default **120**) | **Every** provider | Defers a repeat compaction for the configured floor |
+| Published-summary cap | `_cap_published_summary()` | **Every** provider | Bounds the summary that is actually published |
+| Summary-dominance brake | `_summary_dominates_transcript()` | **Every** provider | Refuses to compact a transcript that is already one big summary |
+
+### The runaway loop this page now also covers (2026-11-27)
+
+The Vision/default profile ran a **second, different** pathology that the two
+guards above did not catch, because neither of them looks at *what* is being
+summarised:
+
+- the profile compacted every **4.2–13.5 minutes**;
+- the published summary grew monotonically **59,597 → 115,140 chars** across
+  19 consecutive boundaries;
+- one summary row reached **114,050 chars — 70.6 %** of the live transcript.
+
+That is a feedback loop, not a throttle problem. Each compaction is instructed
+to *preserve all existing information that is still relevant*, so the model
+re-expands the previous summary into the new one, and the next iteration is
+handed that inflated summary plus the new turns. The 120 s floor never bound
+it (the cycle was 4.2 minutes at its fastest).
+
+Two guards were added, plus the interval became a knob:
+
+| Control | Where | Effect |
+|---|---|---|
+| Published-summary cap | `agent/context_compressor.py::_cap_published_summary()` | The summary is bounded to `max_summary_tokens * 5` chars (floor 40,000) **before** it is published or recorded as `_previous_summary`. Head and tail are kept with an explicit elision marker; `elide_keeping_skill_safety_rule()` is the fallback when the head cut would sever the skill-safety rule. |
+| Previous-summary input bound | `_bound_summary_input(..., limit=...)` | The summary fed back into the next iteration is bounded separately, so a rehydrated 135,803-char summary cannot be re-fed. |
+| Summary-dominance brake | `_summary_dominates_transcript()` | Refuses to compact when the summary is **≥ 50 %** of the live transcript (summary chars ÷ live chars — scale-free, so it works on a small transcript where the absolute 800,000-char runaway guard cannot fire). Observed normal share is ~12 %; Vision's pathological share was 70.6 %. |
+| `compression.min_interval_seconds` | `hermes_cli/config_defaults.py` → `agent/agent_init.py` → `ContextCompressor` | The cadence floor becomes a **config knob**. The shipped default stays at the historical **120 s** so no profile's cadence changes at deploy time; Vision's own config raises it to **600**. |
+
+**Why the interval is a knob and not a constant.** A hardcoded 600 s changes
+every profile's compaction cadence at once. Every agent has its own
+`config.yaml` (`friday`, `ultron`, `shuri`, `curator`, `librarian`,
+`hermes-gateway`), while the `default` profile **is** the root
+`~/.hermes/config.yaml` — so raising the floor in the root config changes
+Vision's cadence alone. Friday's cadence is 20–85 minutes and Ultron's median
+is 124 minutes, so neither reaches 600 s in normal operation and the floor
+only binds on a session that is genuinely looping.
+
+**The dominance brake does not short-circuit the feasibility probe.** The lazy
+feasibility probe is a diagnostic: it warns the user that their summariser
+window is below the minimum, and a hard rejection has to reach them. The
+pre-probe gate therefore evaluates with `exclude_summary_dominance=True`, and
+the brake is re-evaluated **after** the probe — where deferring a compaction
+costs nothing. Excluding the brake there does not weaken the interval or the
+loop guard; both are still evaluated.
+
+**Deployment order.** The cap and the dominance brake are code-level and
+apply to every profile. The interval is staged: Vision first (`600` in
+`~/.hermes/config.yaml`), the rest of the fleet only once the measurement
+supports it.
 
 ## Architecture
 
@@ -88,7 +138,10 @@ incompressible floor that no amount of summarising can shrink.
 | `_USAGE_LESS_LOOP_TRIP_COUNT` | 2 | Consecutive no-progress boundaries before pausing |
 | `_USAGE_LESS_LOOP_MIN_SAVINGS_PCT` | 2.0 | Minimum message-token reclaim that counts as progress |
 | `_USAGE_LESS_LOOP_BLOCK_SECONDS` | 300.0 | How long automatic compaction stays paused |
-| `_MIN_COMPACTION_INTERVAL_SECONDS` | 120.0 | Floor on the gap between two compactions (all providers) |
+| `_MIN_COMPACTION_INTERVAL_SECONDS` | 120.0 | **Fallback** floor on the gap between two compactions (used when no config value is supplied) |
+| `_PUBLISHED_SUMMARY_MAX_CHARS` | 40,000 | Floor on the published-summary cap |
+| `_SUMMARY_CHARS_PER_TOKEN` | 5 | Character-per-token ratio used to turn the token budget into a character budget |
+| `_SUMMARY_DOMINANCE_MAX_SHARE` | 0.50 | Refuse to compact when the summary is ≥ 50 % of the live transcript |
 
 ### Why the 2 % savings floor
 
@@ -174,19 +227,79 @@ The block reason is surfaced through `_compression_block_reason()`:
 | Reason | Meaning | Duration |
 |---|---|---|
 | `usage_less_loop` | The usage-less detector proved a loop | ≤ 300 s, lifted early on progress |
-| `min_interval:<s>` | Too soon after the last completed compaction | ≤ 120 s |
+| `min_interval:<s>` | Too soon after the last completed compaction | the configured floor (default ≤ 120 s) |
+| `summary_dominant:<pct>` | The summary is ≥ 50 % of the live transcript | until the transcript changes shape |
 | `cooldown:<s>` | Summary-model failure cooldown | profile-defined |
 | `structural_backoff:<s>` | Structural no-op backoff | profile-defined |
 | `ineffective` | Provider-**confirmed** ineffective compaction | **permanent** |
 
-The first four are **transient**: they defer a pass without counting toward
+The first five are **transient**: they defer a pass without counting toward
 `compression_exhausted`. Only `ineffective` is permanent, and only the
 provider-confirmed path can produce it.
 
+### Confirm the new guards are in the running build
+
+```bash
+cd /home/serveradmin/.hermes/hermes-agent
+grep -n "_PUBLISHED_SUMMARY_MAX_CHARS\|_SUMMARY_DOMINANCE_MAX_SHARE\|_SUMMARY_CHARS_PER_TOKEN" \
+  agent/context_compressor.py
+grep -n "exclude_summary_dominance" agent/context_compressor.py agent/conversation_compression.py
+grep -n "min_interval_seconds" hermes_cli/config_defaults.py agent/agent_init.py
+```
+
+### Watch the new guards in the act
+
+```bash
+grep -E "summary dominates the live transcript|Compression deferred — minimum interval" \
+  ~/.hermes/profiles/<profile>/logs/agent.log
+```
+
+### Confirm the effective interval for a profile
+
+```bash
+cd /home/serveradmin/.hermes/hermes-agent
+.venv/bin/python -m hermes_cli.main --profile default config get compression.min_interval_seconds
+```
+
+Vision (`default`, i.e. the root `~/.hermes/config.yaml`) reads `600`;
+every other profile reads the shipped `120` until it opts in.
+
 ## Configuration
 
-No new configuration keys for the two guards. Both are unconditional, and their
-constants are class attributes on `ContextCompressor`.
+### `compression.min_interval_seconds` (added 2026-11-27)
+
+The floor on the wall-clock gap between two consecutive **automatic**
+compressions of the same session.
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `compression.min_interval_seconds` | int | `120` | Defers a repeat automatic compaction until this many seconds have passed since the last **completed** compaction. `0` disables the floor. Negative values are clamped to `0`. |
+
+Read from `hermes_cli/config_defaults.py` → `_parse_compression_config()` →
+`ContextCompressor(min_interval_seconds=...)`. The **effective** floor is
+`_effective_min_interval_seconds()`; the class constant
+`_MIN_COMPACTION_INTERVAL_SECONDS` is only the fallback used when no config
+value is supplied.
+
+The shipped default stays at the historical **120 s** on purpose: a hardcoded
+600 s would change every profile's compaction cadence at deploy time. Each
+profile opts in through its own `config.yaml`. The `default` profile **is**
+the root `~/.hermes/config.yaml`; every other agent (`friday`, `ultron`,
+`shuri`, `curator`, `librarian`, `hermes-gateway`) has its own file.
+
+Verify the effective value per profile:
+
+```bash
+cd /home/serveradmin/.hermes/hermes-agent
+.venv/bin/python -m hermes_cli.main --profile default  config get compression.min_interval_seconds
+.venv/bin/python -m hermes_cli.main --profile friday   config get compression.min_interval_seconds
+```
+
+### The published-summary cap and the dominance brake
+
+Neither is configurable — both are unconditional code-level guards that apply
+to every profile. They are described under *The runaway loop this page now also
+covers* above.
 
 The only related knob remains `compression.threshold_tokens` (the line the
 detector compares against) and `compression.enabled`.

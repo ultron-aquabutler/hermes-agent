@@ -85,6 +85,18 @@ DEFAULT_RUNAWAY_MAX_LIVE_CHARS = 800_000
 #: thousands before compaction rotates the transcript.
 DEFAULT_RUNAWAY_MAX_SESSION_MESSAGES = 5000
 
+#: Default max share of the live transcript that the compaction summary may occupy.
+#:
+#: This is the signal the absolute ``max_live_chars`` limit cannot see. On Vision (2026-11-26)
+#: the live transcript was 161,507 chars -- comfortably under the 800,000 floor -- because ONE
+#: 114,050-char summary row made up 70.6% of it. The transcript was small *because* the summary
+#: had swallowed it, so a guard that only asks "is the transcript big?" sees a healthy session.
+#:
+#: The share is scale-free: it catches a summary dominating a small transcript as squarely as one
+#: dominating a large transcript. Measured on this fleet: 12% is a normal large-context session,
+#: 70.6% was the runaway. 0 disables the limit.
+DEFAULT_RUNAWAY_MAX_SUMMARY_SHARE = 0.50
+
 #: The reset reason recorded when the guard fires. Distinct from "suspended" so an operator can
 #: tell an explicit /stop from a runaway rotation.
 RUNAWAY_RESET_REASON = "runaway_limit"
@@ -107,6 +119,8 @@ class RunawayLimits:
     max_segment_hours: int = DEFAULT_RUNAWAY_MAX_SEGMENT_HOURS
     max_live_chars: int = DEFAULT_RUNAWAY_MAX_LIVE_CHARS
     max_messages: int = DEFAULT_RUNAWAY_MAX_SESSION_MESSAGES
+    #: Max share (0.0-1.0) of the live transcript the summary may occupy. ``0.0`` disables it.
+    max_summary_share: float = DEFAULT_RUNAWAY_MAX_SUMMARY_SHARE
 
     @classmethod
     def from_config(cls, data: Optional[dict[str, Any]]) -> RunawayLimits:
@@ -122,13 +136,33 @@ class RunawayLimits:
             except (TypeError, ValueError):
                 return default
 
+        def _share(key: str, default: float) -> float:
+            raw = compression.get(key, default)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return default
+            # A share outside 0.0-1.0 is meaningless; clamp rather than trust it.
+            if value < 0.0:
+                return 0.0
+            if value > 1.0:
+                return 1.0
+            return value
+
         max_age = _int("runaway_max_segment_hours", DEFAULT_RUNAWAY_MAX_SEGMENT_HOURS)
         max_chars = _int("runaway_max_live_chars", DEFAULT_RUNAWAY_MAX_LIVE_CHARS)
         max_msgs = _int("runaway_max_session_messages", DEFAULT_RUNAWAY_MAX_SESSION_MESSAGES)
+        max_share = _share("runaway_max_summary_share", DEFAULT_RUNAWAY_MAX_SUMMARY_SHARE)
+        # "All limits zeroed" is the documented way to switch the guard off. If an operator
+        # zeroes every *other* limit, the summary-share limit must not silently stay on --
+        # otherwise the guard never fully turns off and the reason it tripped is a surprise.
+        if max_age == 0 and max_chars == 0 and max_msgs == 0:
+            max_share = 0.0
         return cls(
             max_segment_hours=max_age if max_age > 0 else _DISABLED,
             max_live_chars=max_chars if max_chars > 0 else _DISABLED,
             max_messages=max_msgs if max_msgs > 0 else _DISABLED,
+            max_summary_share=max_share,
         )
 
     @property
@@ -137,6 +171,7 @@ class RunawayLimits:
             self.max_segment_hours > 0
             or self.max_live_chars > 0
             or self.max_messages > 0
+            or self.max_summary_share > 0.0
         )
 
 
@@ -162,6 +197,7 @@ def evaluate_runaway(
     live_chars: int,
     limits: RunawayLimits,
     now: Optional[float] = None,
+    summary_share: float = 0.0,
 ) -> RunawayVerdict:
     """Decide whether a context segment has run away.
 
@@ -171,6 +207,12 @@ def evaluate_runaway(
 
     A missing ``segment_started_at`` means the segment has no timestamped active rows, so the age
     half of the rule cannot be evaluated; the size half still applies.
+
+    ``summary_share`` is the share of the live transcript occupied by the compaction summary
+    (0.0-1.0, 0.0 = unknown). Unlike the size limit, this stands **alone**: a summary that has
+    swallowed the transcript is a runaway on its own terms, and the transcript is small precisely
+    because the summary ate it — so ANDing it with age or size would hide the exact failure it is
+    meant to catch.
     """
     if not limits.enabled:
         return RunawayVerdict(tripped=False)
@@ -192,6 +234,22 @@ def evaluate_runaway(
         return RunawayVerdict(
             tripped=True,
             reason=f"message count {count} exceeds limit {limits.max_messages}",
+            age_hours=age_hours,
+            message_count=count,
+            live_chars=chars,
+        )
+
+    # The summary-share backstop also stands alone. A transcript that is mostly one summary row is
+    # a runaway even though it is small — the size limit cannot see it, because the summary is
+    # what made the transcript small.
+    share = float(summary_share or 0.0)
+    if limits.max_summary_share > 0.0 and share >= limits.max_summary_share:
+        return RunawayVerdict(
+            tripped=True,
+            reason=(
+                f"compaction summary occupies {share * 100:.1f}% of the live transcript "
+                f"(limit {limits.max_summary_share * 100:.1f}%)"
+            ),
             age_hours=age_hours,
             message_count=count,
             live_chars=chars,
@@ -256,6 +314,50 @@ def read_segment_stats(db: Any, session_id: str) -> tuple[Optional[float], int, 
         return (None, 0, 0)
 
 
+def read_summary_dominance(db: Any, session_id: str) -> float:
+    """Return the share of the live transcript occupied by the compaction summary.
+
+    0.0 means "unknown" (no summary row, or the lookup failed).
+
+    This is the signal the absolute ``live_chars`` limit cannot see. On Vision
+    (2026-11-26) the live transcript was 161,507 chars -- comfortably under the
+    800,000 floor -- because ONE 114,050-char summary row made up 70.6% of it.
+    The transcript was small *because* the summary had swallowed it, so a guard
+    that only asks "is the transcript big?" sees a healthy session.
+
+    The share is scale-free: it catches a summary dominating a small transcript
+    as squarely as one dominating a large transcript. Measured on this fleet:
+    12% is a normal large-context session, 70.6% was the runaway.
+    """
+    if not db or not session_id:
+        return 0.0
+    read_ctx = getattr(db, "_read_ctx", None)
+    if read_ctx is None:
+        return 0.0
+    try:
+        with read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+            summary_row = conn.execute(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "AND content LIKE '[CONTEXT COMPACTION%'",
+                (session_id,),
+            ).fetchone()
+        live_chars = int(row[0] or 0) if row is not None else 0
+        summary_chars = int(summary_row[0] or 0) if summary_row is not None else 0
+        if live_chars <= 0:
+            return 0.0
+        return (summary_chars / live_chars) if summary_chars > 0 else 0.0
+    except (sqlite3.Error, TypeError, ValueError, IndexError):
+        return 0.0
+    except Exception:  # pragma: no cover - defensive: never break routing on a guard lookup
+        return 0.0
+
+
 def check_route_runaway(
     *,
     db: Any,
@@ -270,12 +372,14 @@ def check_route_runaway(
     verdict as the only signal to rotate.
     """
     segment_started_at, message_count, live_chars = read_segment_stats(db, session_id)
+    summary_share = read_summary_dominance(db, session_id)
     verdict = evaluate_runaway(
         segment_started_at=segment_started_at,
         message_count=message_count,
         live_chars=live_chars,
         limits=limits,
         now=now,
+        summary_share=summary_share,
     )
     if verdict.tripped:
         logger.warning(

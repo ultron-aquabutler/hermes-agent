@@ -581,6 +581,14 @@ DEFAULT_CONFIG = {
         # in agent/compression_fleet_ceiling.py enforces the same bound, so this default
         # cannot be raised above it by config; set a LOWER value to compact earlier.
         "threshold_tokens": 120000,
+        # min_interval_seconds: floor on the wall-clock gap between two consecutive
+        # AUTOMATIC compactions of the same session. A compaction that repeats too soon
+        # re-reads the whole context again and burns cache-read for no reclaim.
+        # 120 s is the historical floor; Vision's runaway loop compacted every 4-14 min
+        # and the 120 s floor did not brake it, so the loop needed a second guard (the
+        # summary-dominance brake). Raise this to 600 on a profile that shows the loop.
+        # 0 = disable the floor (compact as soon as the trigger fires).
+        "min_interval_seconds": 120,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
